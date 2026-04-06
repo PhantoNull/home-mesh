@@ -31,6 +31,9 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 		id, events := bus.Subscribe()
 		defer bus.Unsubscribe(id)
 
+		fmt.Fprintf(w, ": connected\n\n")
+		flusher.Flush()
+
 		heartbeat := time.NewTicker(sseHeartbeatInterval)
 		defer heartbeat.Stop()
 

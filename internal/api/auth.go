@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -33,53 +34,60 @@ type authManager struct {
 const (
 	loginMaxAttempts  = 5
 	loginWindowPeriod = 15 * time.Minute
+	maxLoginTrackIPs  = 1024
 )
 
 type loginAttemptRecord struct {
-	attempts []time.Time
+	failures  int
+	windowEnd time.Time
 }
 
 type loginRateLimiter struct {
-	mu          sync.Mutex
-	attempts    map[string]*loginAttemptRecord
-	maxAttempts int
-	window      time.Duration
-	now         func() time.Time
+	mu       sync.Mutex
+	attempts map[string]*loginAttemptRecord
 }
 
 func newLoginRateLimiter() *loginRateLimiter {
-	return &loginRateLimiter{
-		attempts:    make(map[string]*loginAttemptRecord),
-		maxAttempts: loginMaxAttempts,
-		window:      loginWindowPeriod,
-		now:         time.Now,
-	}
+	return &loginRateLimiter{attempts: make(map[string]*loginAttemptRecord)}
 }
 
 func (l *loginRateLimiter) allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	record, ok := l.pruneLocked(ip, l.now())
-	if !ok {
+	l.pruneExpiredLocked(time.Now())
+	record, exists := l.attempts[ip]
+	if !exists {
 		return true
 	}
 
-	return len(record.attempts) < l.maxAttempts
+	if time.Now().After(record.windowEnd) {
+		delete(l.attempts, ip)
+		return true
+	}
+
+	return record.failures < loginMaxAttempts
 }
 
 func (l *loginRateLimiter) recordFailure(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	now := l.now()
-	record, ok := l.pruneLocked(ip, now)
-	if !ok {
-		record = &loginAttemptRecord{}
-		l.attempts[ip] = record
+	now := time.Now()
+	l.pruneExpiredLocked(now)
+	record, exists := l.attempts[ip]
+	if !exists || now.After(record.windowEnd) {
+		if len(l.attempts) >= maxLoginTrackIPs {
+			l.evictOldestLocked()
+		}
+		l.attempts[ip] = &loginAttemptRecord{
+			failures:  1,
+			windowEnd: now.Add(loginWindowPeriod),
+		}
+		return
 	}
 
-	record.attempts = append(record.attempts, now)
+	record.failures++
 }
 
 func (l *loginRateLimiter) reset(ip string) {
@@ -88,26 +96,31 @@ func (l *loginRateLimiter) reset(ip string) {
 	delete(l.attempts, ip)
 }
 
-func (l *loginRateLimiter) pruneLocked(ip string, now time.Time) (*loginAttemptRecord, bool) {
-	record, ok := l.attempts[ip]
-	if !ok {
-		return nil, false
-	}
-
-	cutoff := now.Add(-l.window)
-	kept := record.attempts[:0]
-	for _, attempt := range record.attempts {
-		if attempt.After(cutoff) {
-			kept = append(kept, attempt)
+func (l *loginRateLimiter) pruneExpiredLocked(now time.Time) {
+	for ip, record := range l.attempts {
+		if now.After(record.windowEnd) {
+			delete(l.attempts, ip)
 		}
 	}
-	record.attempts = kept
-	if len(record.attempts) == 0 {
-		delete(l.attempts, ip)
-		return nil, false
-	}
+}
 
-	return record, true
+func (l *loginRateLimiter) evictOldestLocked() {
+	var (
+		oldestIP  string
+		oldestSet bool
+		oldestEnd time.Time
+	)
+
+	for ip, record := range l.attempts {
+		if !oldestSet || record.windowEnd.Before(oldestEnd) {
+			oldestIP = ip
+			oldestEnd = record.windowEnd
+			oldestSet = true
+		}
+	}
+	if oldestSet {
+		delete(l.attempts, oldestIP)
+	}
 }
 
 type loginPayload struct {
@@ -362,6 +375,14 @@ func hashPassword(password string) (string, error) {
 		base64.RawStdEncoding.EncodeToString(salt),
 		base64.RawStdEncoding.EncodeToString(hash),
 	}, "$"), nil
+}
+
+func extractClientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func verifyPassword(password string, encoded string) bool {

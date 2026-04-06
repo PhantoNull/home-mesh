@@ -1521,7 +1521,15 @@ export default function App() {
     source.addEventListener('error', () => setSseStatus('disconnected'))
 
     source.addEventListener('scan', (e: MessageEvent<string>) => {
-      const event = JSON.parse(e.data) as { kind: string; data: unknown }
+      let event: { kind: string; data: unknown }
+
+      try {
+        event = JSON.parse(e.data) as { kind: string; data: unknown }
+      } catch (error) {
+        console.error('Failed to parse scan event payload', error, e.data)
+        return
+      }
+
       switch (event.kind) {
         case 'scan-started': {
           const payload = event.data as { deviceIds: string[]; nodeIds: string[] }

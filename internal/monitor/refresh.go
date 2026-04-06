@@ -102,7 +102,17 @@ func (r *Refresher) scanAndPublish(ctx context.Context) {
 	var summary RefreshSummary
 
 	if r.nmapPath != "" {
-		updatedDevices, updatedNodes, summary = r.batchScanWithNmap(ctx, devices, nodes)
+		var nmapErr error
+		updatedDevices, updatedNodes, summary, nmapErr = r.batchScanWithNmap(ctx, devices, nodes)
+		if nmapErr != nil {
+			result, err := r.RefreshAll(ctx)
+			if err != nil {
+				return
+			}
+			updatedDevices = result.Devices
+			updatedNodes = result.NetworkNodes
+			summary = result.Summary
+		}
 	} else {
 		result, _ := r.RefreshAll(ctx)
 		updatedDevices = result.Devices
@@ -117,18 +127,18 @@ func (r *Refresher) scanAndPublish(ctx context.Context) {
 		r.bus.publishJSON(EventNodeUpdate, n)
 	}
 	r.bus.publishJSON(EventScanComplete, map[string]any{
-		"checked":   summary.Checked,
-		"updated":   summary.Updated,
-		"online":    summary.Online,
-		"degraded":  summary.Degraded,
-		"offline":   summary.Offline,
-		"nmapUsed":  r.nmapPath != "",
+		"checked":  summary.Checked,
+		"updated":  summary.Updated,
+		"online":   summary.Online,
+		"degraded": summary.Degraded,
+		"offline":  summary.Offline,
+		"nmapUsed": r.nmapPath != "",
 	})
 }
 
 // batchScanWithNmap runs one nmap process over all known IPs and maps results
 // back to devices and network nodes.
-func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Device, nodes []store.NetworkNode) ([]store.Device, []store.NetworkNode, RefreshSummary) {
+func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Device, nodes []store.NetworkNode) ([]store.Device, []store.NetworkNode, RefreshSummary, error) {
 	// Collect all IPs that are actually scannable.
 	type ipEntry struct {
 		ip       string
@@ -159,13 +169,16 @@ func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Devic
 	}
 
 	if len(ips) == 0 {
-		return devices, nodes, RefreshSummary{}
+		return devices, nodes, RefreshSummary{}, nil
 	}
 
 	scanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	nmapResults, _ := nmapScan(scanCtx, r.nmapPath, ips, allCandidatePorts())
+	nmapResults, err := nmapScan(scanCtx, r.nmapPath, ips, allCandidatePorts())
+	if err != nil {
+		return devices, nodes, RefreshSummary{}, err
+	}
 	summary := RefreshSummary{Checked: len(entries)}
 
 	for _, entry := range entries {
@@ -176,13 +189,8 @@ func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Devic
 			updated := applyNmapToDevice(original, nm)
 			updated.IPAddress = entry.ip
 			devices[entry.index] = updated
-			if updated.Status != original.Status || updated.MACAddress != original.MACAddress {
+			if persistIfChanged(ctx, r.store, original, updated) {
 				summary.Updated++
-				toSave := updated
-				toSave.Status = original.Status
-				if _, err := r.store.UpdateDevice(ctx, toSave); err == nil {
-					devices[entry.index].Status = updated.Status
-				}
 			}
 			switch updated.Status {
 			case "online":
@@ -197,13 +205,8 @@ func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Devic
 			updated := applyNmapToNode(original, nm)
 			updated.ManagementIP = entry.ip
 			nodes[entry.index] = updated
-			if updated.Status != original.Status || updated.MACAddress != original.MACAddress {
+			if persistNodeIfChanged(ctx, r.store, original, updated) {
 				summary.Updated++
-				toSave := updated
-				toSave.Status = original.Status
-				if _, err := r.store.UpdateNetworkNode(ctx, toSave); err == nil {
-					nodes[entry.index].Status = updated.Status
-				}
 			}
 			switch updated.Status {
 			case "online":
@@ -216,7 +219,7 @@ func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Devic
 		}
 	}
 
-	return devices, nodes, summary
+	return devices, nodes, summary, nil
 }
 
 func applyNmapToDevice(device store.Device, nm nmapScanResult) store.Device {

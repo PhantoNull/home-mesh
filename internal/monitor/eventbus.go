@@ -55,8 +55,8 @@ func (b *EventBus) Unsubscribe(id uint64) {
 	}
 }
 
-// Publish sends an event to all current subscribers. Subscribers that are too
-// far behind (full channel buffer) are dropped silently.
+// Publish sends an event to all current subscribers. If a subscriber's channel
+// buffer is full, that event is dropped for that subscriber.
 func (b *EventBus) Publish(event ScanEvent) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
