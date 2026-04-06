@@ -1,5 +1,7 @@
 # Home Mesh
 
+![Home Mesh preview](assets/readme-preview.png)
+
 Home Mesh is a local-first network inventory and control panel for home labs and small networks.
 
 It is designed to discover, map, and manage:
