@@ -78,7 +78,7 @@ type discoverySegmentCandidate struct {
 func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, discoveryService *discovery.Service, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
 	mux := http.NewServeMux()
 	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		CheckOrigin: checkWebSocketOrigin,
 	}
 	auth, err := newAuthManager(cfg, inventory)
 	if err != nil {
@@ -931,9 +931,13 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		origin := r.Header.Get("Origin")
+		if origin != "" && isSameOrigin(r.Host, origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Vary", "Origin")
+		}
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -942,6 +946,30 @@ func withCORS(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isSameOrigin(host string, origin string) bool {
+	if host == "" || origin == "" {
+		return false
+	}
+
+	originHost := origin
+	for _, scheme := range []string{"https://", "http://"} {
+		if strings.HasPrefix(originHost, scheme) {
+			originHost = originHost[len(scheme):]
+			break
+		}
+	}
+
+	return strings.EqualFold(originHost, host)
+}
+
+func checkWebSocketOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	return isSameOrigin(r.Host, origin)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
