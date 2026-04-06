@@ -1,6 +1,9 @@
 package config
 
-import "os"
+import (
+	"os"
+	"time"
+)
 
 type Config struct {
 	HTTPAddr               string
@@ -14,6 +17,7 @@ type Config struct {
 	SessionSecret          string
 	BootstrapAdminUsername string
 	BootstrapAdminPassword string
+	ScanInterval           time.Duration
 }
 
 func Load() Config {
@@ -29,6 +33,7 @@ func Load() Config {
 		SessionSecret:          getEnv("HOME_MESH_SESSION_SECRET", ""),
 		BootstrapAdminUsername: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_USERNAME", "root"),
 		BootstrapAdminPassword: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD", ""),
+		ScanInterval:           parseDuration(getEnv("HOME_MESH_SCAN_INTERVAL", "30s")),
 	}
 }
 
@@ -62,4 +67,12 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func parseDuration(s string) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 5*time.Second {
+		return 30 * time.Second
+	}
+	return d
 }

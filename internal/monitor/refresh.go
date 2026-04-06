@@ -36,13 +36,235 @@ type RefreshResult struct {
 }
 
 type Refresher struct {
-	store *store.Store
+	store    *store.Store
+	bus      *EventBus
+	nmapPath string
 }
 
 const refreshConcurrency = 8
 
-func NewRefresher(inventory *store.Store) *Refresher {
-	return &Refresher{store: inventory}
+func NewRefresher(inventory *store.Store, bus *EventBus) *Refresher {
+	return &Refresher{
+		store:    inventory,
+		bus:      bus,
+		nmapPath: nmapDetect(),
+	}
+}
+
+// UsingNmap reports whether nmap was detected and will be used for scanning.
+func (r *Refresher) UsingNmap() bool { return r.nmapPath != "" }
+
+// RunBackground starts a scan loop that runs until ctx is cancelled.
+// Each iteration performs a full batch scan and publishes events.
+func (r *Refresher) RunBackground(ctx context.Context, interval time.Duration) {
+	// Immediate first scan.
+	r.scanAndPublish(ctx)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.scanAndPublish(ctx)
+		}
+	}
+}
+
+func (r *Refresher) scanAndPublish(ctx context.Context) {
+	devices, err := r.store.ListDevices(ctx)
+	if err != nil {
+		return
+	}
+	nodes, err := r.store.ListNetworkNodes(ctx)
+	if err != nil {
+		return
+	}
+
+	// Build the started event payload.
+	deviceIDs := make([]string, len(devices))
+	for i, d := range devices {
+		deviceIDs[i] = d.ID
+	}
+	nodeIDs := make([]string, len(nodes))
+	for i, n := range nodes {
+		nodeIDs[i] = n.ID
+	}
+	r.bus.publishJSON(EventScanStarted, map[string]any{
+		"deviceIds": deviceIDs,
+		"nodeIds":   nodeIDs,
+	})
+
+	var updatedDevices []store.Device
+	var updatedNodes []store.NetworkNode
+	var summary RefreshSummary
+
+	if r.nmapPath != "" {
+		updatedDevices, updatedNodes, summary = r.batchScanWithNmap(ctx, devices, nodes)
+	} else {
+		result, _ := r.RefreshAll(ctx)
+		updatedDevices = result.Devices
+		updatedNodes = result.NetworkNodes
+		summary = result.Summary
+	}
+
+	for _, d := range updatedDevices {
+		r.bus.publishJSON(EventDeviceUpdate, d)
+	}
+	for _, n := range updatedNodes {
+		r.bus.publishJSON(EventNodeUpdate, n)
+	}
+	r.bus.publishJSON(EventScanComplete, map[string]any{
+		"checked":   summary.Checked,
+		"updated":   summary.Updated,
+		"online":    summary.Online,
+		"degraded":  summary.Degraded,
+		"offline":   summary.Offline,
+		"nmapUsed":  r.nmapPath != "",
+	})
+}
+
+// batchScanWithNmap runs one nmap process over all known IPs and maps results
+// back to devices and network nodes.
+func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Device, nodes []store.NetworkNode) ([]store.Device, []store.NetworkNode, RefreshSummary) {
+	// Collect all IPs that are actually scannable.
+	type ipEntry struct {
+		ip       string
+		isDevice bool
+		index    int
+	}
+	var entries []ipEntry
+	var ips []string
+
+	for i, d := range devices {
+		ip := strings.TrimSpace(d.IPAddress)
+		if ip == "" && strings.TrimSpace(d.Hostname) != "" {
+			if resolved, err := resolveIPv4(d.Hostname); err == nil {
+				ip = resolved
+			}
+		}
+		if ip != "" {
+			entries = append(entries, ipEntry{ip: ip, isDevice: true, index: i})
+			ips = append(ips, ip)
+		}
+	}
+	for i, n := range nodes {
+		ip := strings.TrimSpace(n.ManagementIP)
+		if ip != "" {
+			entries = append(entries, ipEntry{ip: ip, isDevice: false, index: i})
+			ips = append(ips, ip)
+		}
+	}
+
+	if len(ips) == 0 {
+		return devices, nodes, RefreshSummary{}
+	}
+
+	scanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	nmapResults, _ := nmapScan(scanCtx, r.nmapPath, ips, allCandidatePorts())
+	summary := RefreshSummary{Checked: len(entries)}
+
+	for _, entry := range entries {
+		nm := nmapResults[entry.ip]
+
+		if entry.isDevice {
+			original := devices[entry.index]
+			updated := applyNmapToDevice(original, nm)
+			updated.IPAddress = entry.ip
+			devices[entry.index] = updated
+			if updated.Status != original.Status || updated.MACAddress != original.MACAddress {
+				summary.Updated++
+				toSave := updated
+				toSave.Status = original.Status
+				if _, err := r.store.UpdateDevice(ctx, toSave); err == nil {
+					devices[entry.index].Status = updated.Status
+				}
+			}
+			switch updated.Status {
+			case "online":
+				summary.Online++
+			case "degraded":
+				summary.Degraded++
+			default:
+				summary.Offline++
+			}
+		} else {
+			original := nodes[entry.index]
+			updated := applyNmapToNode(original, nm)
+			updated.ManagementIP = entry.ip
+			nodes[entry.index] = updated
+			if updated.Status != original.Status || updated.MACAddress != original.MACAddress {
+				summary.Updated++
+				toSave := updated
+				toSave.Status = original.Status
+				if _, err := r.store.UpdateNetworkNode(ctx, toSave); err == nil {
+					nodes[entry.index].Status = updated.Status
+				}
+			}
+			switch updated.Status {
+			case "online":
+				summary.Online++
+			case "degraded":
+				summary.Degraded++
+			default:
+				summary.Offline++
+			}
+		}
+	}
+
+	return devices, nodes, summary
+}
+
+func applyNmapToDevice(device store.Device, nm nmapScanResult) store.Device {
+	if nm.MAC != "" && nm.MAC != device.MACAddress {
+		device.MACAddress = nm.MAC
+	}
+	if nm.Hostname != "" && device.Hostname == "" {
+		device.Hostname = nm.Hostname
+	}
+	if len(nm.OpenPorts) > 0 {
+		if device.Metadata == nil {
+			device.Metadata = map[string]string{}
+		}
+		device.Metadata["lastReachablePorts"] = joinPorts(nm.OpenPorts)
+	}
+
+	switch {
+	case nm.Up && len(nm.OpenPorts) > 0:
+		device.Status = "online"
+	case nm.Up:
+		device.Status = "online"
+	case nm.MAC != "":
+		device.Status = "degraded"
+	default:
+		device.Status = "offline"
+	}
+	return device
+}
+
+func applyNmapToNode(node store.NetworkNode, nm nmapScanResult) store.NetworkNode {
+	if nm.MAC != "" && nm.MAC != node.MACAddress {
+		node.MACAddress = nm.MAC
+	}
+	if len(nm.OpenPorts) > 0 {
+		if node.Metadata == nil {
+			node.Metadata = map[string]string{}
+		}
+		node.Metadata["lastReachablePorts"] = joinPorts(nm.OpenPorts)
+	}
+	switch {
+	case nm.Up:
+		node.Status = "online"
+	case nm.MAC != "":
+		node.Status = "degraded"
+	default:
+		node.Status = "offline"
+	}
+	return node
 }
 
 func (r *Refresher) RefreshAll(ctx context.Context) (RefreshResult, error) {
@@ -243,6 +465,7 @@ func (r *Refresher) RefreshDeviceSnapshotByID(ctx context.Context, id string) (s
 		return store.Device{}, err
 	}
 
+	r.bus.publishJSON(EventDeviceUpdate, refreshed)
 	return refreshed, nil
 }
 
@@ -257,10 +480,41 @@ func (r *Refresher) RefreshNetworkNodeSnapshotByID(ctx context.Context, id strin
 		return store.NetworkNode{}, err
 	}
 
+	r.bus.publishJSON(EventNodeUpdate, refreshed)
 	return refreshed, nil
 }
 
 func (r *Refresher) refreshDevice(ctx context.Context, device store.Device) (store.Device, bool, string, bool, error) {
+	if r.nmapPath != "" {
+		return r.refreshDeviceWithNmap(ctx, device)
+	}
+	return r.refreshDeviceFallback(ctx, device)
+}
+
+func (r *Refresher) refreshDeviceWithNmap(ctx context.Context, device store.Device) (store.Device, bool, string, bool, error) {
+	original := device
+	targetIP := strings.TrimSpace(device.IPAddress)
+
+	if strings.TrimSpace(device.Hostname) != "" {
+		if resolved, err := resolveIPv4(device.Hostname); err == nil {
+			device.IPAddress = resolved
+			targetIP = resolved
+		}
+	}
+	if targetIP == "" {
+		device.Status = "unknown"
+		return device, persistIfChanged(ctx, r.store, original, device), "unknown", false, nil
+	}
+
+	nm := nmapScanOne(ctx, r.nmapPath, targetIP, candidatePorts(device))
+	device = applyNmapToDevice(device, nm)
+
+	macResolved := nm.MAC != "" && nm.MAC != original.MACAddress
+	updated := persistIfChanged(ctx, r.store, original, device)
+	return device, updated, device.Status, macResolved, nil
+}
+
+func (r *Refresher) refreshDeviceFallback(ctx context.Context, device store.Device) (store.Device, bool, string, bool, error) {
 	original := device
 	targetIP := strings.TrimSpace(device.IPAddress)
 	macResolved := false
@@ -335,6 +589,29 @@ func (r *Refresher) refreshDevice(ctx context.Context, device store.Device) (sto
 }
 
 func (r *Refresher) refreshNetworkNode(ctx context.Context, node store.NetworkNode) (store.NetworkNode, bool, string, bool, error) {
+	if r.nmapPath != "" {
+		return r.refreshNetworkNodeWithNmap(ctx, node)
+	}
+	return r.refreshNetworkNodeFallback(ctx, node)
+}
+
+func (r *Refresher) refreshNetworkNodeWithNmap(ctx context.Context, node store.NetworkNode) (store.NetworkNode, bool, string, bool, error) {
+	original := node
+	targetIP := strings.TrimSpace(node.ManagementIP)
+	if targetIP == "" {
+		node.Status = "unknown"
+		return node, persistNodeIfChanged(ctx, r.store, original, node), "unknown", false, nil
+	}
+
+	nm := nmapScanOne(ctx, r.nmapPath, targetIP, candidatePortsForNode(node))
+	node = applyNmapToNode(node, nm)
+
+	macResolved := nm.MAC != "" && nm.MAC != original.MACAddress
+	updated := persistNodeIfChanged(ctx, r.store, original, node)
+	return node, updated, node.Status, macResolved, nil
+}
+
+func (r *Refresher) refreshNetworkNodeFallback(ctx context.Context, node store.NetworkNode) (store.NetworkNode, bool, string, bool, error) {
 	original := node
 	targetIP := strings.TrimSpace(node.ManagementIP)
 	macResolved := false

@@ -30,7 +30,8 @@ func main() {
 		}
 	}()
 
-	refresher := monitor.NewRefresher(inventory)
+	bus := monitor.NewEventBus()
+	refresher := monitor.NewRefresher(inventory, bus)
 	discoveryService := discovery.NewService(cfg.NmapPath)
 	secretService, err := secrets.New(cfg.MasterKeyBase)
 	if err != nil && err != secrets.ErrUnavailable {
@@ -42,7 +43,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	router, err := api.NewRouter(cfg, inventory, refresher, discoveryService, secretService, hostKeyCallback)
+	router, err := api.NewRouter(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -57,6 +58,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	go refresher.RunBackground(ctx, cfg.ScanInterval)
 
 	go func() {
 		log.Printf("home-mesh server listening on %s", cfg.HTTPAddr)
