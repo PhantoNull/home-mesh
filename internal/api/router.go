@@ -56,12 +56,15 @@ type terminalServerMessage struct {
 	Data string `json:"data,omitempty"`
 }
 
-func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) http.Handler {
+func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
 	mux := http.NewServeMux()
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
-	auth := newAuthManager(cfg)
+	auth, err := newAuthManager(cfg, inventory)
+	if err != nil {
+		return nil, err
+	}
 
 	mux.HandleFunc("/api/auth/session", auth.handleSession)
 	mux.HandleFunc("/api/auth/login", auth.handleLogin)
@@ -859,7 +862,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		})
 	})
 
-	return withCORS(auth.middleware(mux))
+	return withCORS(auth.middleware(mux)), nil
 }
 
 func withCORS(next http.Handler) http.Handler {

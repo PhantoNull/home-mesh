@@ -84,6 +84,14 @@ func (s *Store) init(ctx context.Context) error {
 			updated_at TIMESTAMP NOT NULL,
 			FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
 		);
+
+		CREATE TABLE IF NOT EXISTS admin_account (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			username TEXT NOT NULL,
+			password_hash TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		);
 	`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}

@@ -3,30 +3,30 @@ package config
 import "os"
 
 type Config struct {
-	HTTPAddr       string
-	AppName        string
-	Env            string
-	DBPath         string
-	MasterKeyBase  string
-	SSHHostKeyMode string
-	KnownHostsPath string
-	AuthUsername   string
-	AuthPassword   string
-	SessionSecret  string
+	HTTPAddr               string
+	AppName                string
+	Env                    string
+	DBPath                 string
+	MasterKeyBase          string
+	SSHHostKeyMode         string
+	KnownHostsPath         string
+	SessionSecret          string
+	BootstrapAdminUsername string
+	BootstrapAdminPassword string
 }
 
 func Load() Config {
 	return Config{
-		HTTPAddr:       getEnv("HOME_MESH_HTTP_ADDR", ":8080"),
-		AppName:        getEnv("HOME_MESH_APP_NAME", "home-mesh"),
-		Env:            getEnv("HOME_MESH_ENV", "development"),
-		DBPath:         getEnv("HOME_MESH_DB_PATH", "data/home-mesh.db"),
-		MasterKeyBase:  getEnv("HOME_MESH_MASTER_KEY", ""),
-		SSHHostKeyMode: getEnv("HOME_MESH_SSH_HOST_KEY_MODE", defaultSSHHostKeyMode()),
-		KnownHostsPath: getEnv("HOME_MESH_SSH_KNOWN_HOSTS_PATH", defaultKnownHostsPath()),
-		AuthUsername:   getEnv("HOME_MESH_AUTH_USERNAME", ""),
-		AuthPassword:   getEnv("HOME_MESH_AUTH_PASSWORD", ""),
-		SessionSecret:  getEnv("HOME_MESH_SESSION_SECRET", ""),
+		HTTPAddr:               getEnv("HOME_MESH_HTTP_ADDR", ":8080"),
+		AppName:                getEnv("HOME_MESH_APP_NAME", "home-mesh"),
+		Env:                    getEnv("HOME_MESH_ENV", "development"),
+		DBPath:                 getEnv("HOME_MESH_DB_PATH", "data/home-mesh.db"),
+		MasterKeyBase:          getEnv("HOME_MESH_MASTER_KEY", ""),
+		SSHHostKeyMode:         getEnv("HOME_MESH_SSH_HOST_KEY_MODE", defaultSSHHostKeyMode()),
+		KnownHostsPath:         getEnv("HOME_MESH_SSH_KNOWN_HOSTS_PATH", defaultKnownHostsPath()),
+		SessionSecret:          getEnv("HOME_MESH_SESSION_SECRET", ""),
+		BootstrapAdminUsername: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_USERNAME", "root"),
+		BootstrapAdminPassword: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD", ""),
 	}
 }
 

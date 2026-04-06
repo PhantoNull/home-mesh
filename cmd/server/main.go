@@ -36,7 +36,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	router := api.NewRouter(cfg, inventory, refresher, secretService, hostKeyCallback)
+	router, err := api.NewRouter(cfg, inventory, refresher, secretService, hostKeyCallback)
+	if err != nil {
+		log.Fatal(err)
+	}
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           router,

@@ -97,9 +97,8 @@ Create a local `.env` from `.env.example`.
 Required values:
 
 - `HOME_MESH_MASTER_KEY`
-- `HOME_MESH_AUTH_USERNAME`
-- `HOME_MESH_AUTH_PASSWORD`
 - `HOME_MESH_SESSION_SECRET`
+- `HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD`
 - optionally `HOME_MESH_SSH_HOST_KEY_MODE`
 - optionally `HOME_MESH_WEB_PORT`
 
@@ -107,9 +106,9 @@ Example:
 
 ```dotenv
 HOME_MESH_MASTER_KEY=replace-with-a-base64-encoded-32-byte-key
-HOME_MESH_AUTH_USERNAME=admin
-HOME_MESH_AUTH_PASSWORD=replace-with-a-strong-password
 HOME_MESH_SESSION_SECRET=replace-with-a-long-random-session-secret
+HOME_MESH_BOOTSTRAP_ADMIN_USERNAME=root
+HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password-for-first-start-only
 HOME_MESH_SSH_HOST_KEY_MODE=insecure
 HOME_MESH_API_PORT=8080
 HOME_MESH_WEB_PORT=3000
@@ -203,13 +202,15 @@ They are encrypted server-side using the configured master key. Without `HOME_ME
 
 Home Mesh can protect all backend APIs with a single application-level login.
 
-When these variables are set:
+When `HOME_MESH_SESSION_SECRET` is set and an admin account exists in SQLite, the backend requires authentication for all protected `/api/*` routes.
 
-- `HOME_MESH_AUTH_USERNAME`
-- `HOME_MESH_AUTH_PASSWORD`
-- `HOME_MESH_SESSION_SECRET`
+First-start bootstrap:
 
-the backend requires authentication for all protected `/api/*` routes.
+- set `HOME_MESH_BOOTSTRAP_ADMIN_USERNAME`
+- set `HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD`
+- start the app once
+- the backend stores only an `Argon2id` password hash in SQLite
+- remove `HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD` from `.env` after bootstrap if you do not want it lingering on disk
 
 Behavior:
 

@@ -642,6 +642,57 @@ func (s *Store) UpsertSSHCredential(ctx context.Context, credential SSHCredentia
 	return credential, nil
 }
 
+func (s *Store) GetAdminAccount(ctx context.Context) (AdminAccount, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, username, password_hash, created_at, updated_at
+		FROM admin_account
+		WHERE id = 1
+	`)
+
+	var account AdminAccount
+	err := row.Scan(
+		&account.ID,
+		&account.Username,
+		&account.PasswordHash,
+		&account.CreatedAt,
+		&account.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AdminAccount{}, ErrNotFound
+	}
+
+	return account, err
+}
+
+func (s *Store) BootstrapAdminAccount(ctx context.Context, username string, passwordHash string) (AdminAccount, error) {
+	current, err := s.GetAdminAccount(ctx)
+	if err == nil {
+		return current, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return AdminAccount{}, err
+	}
+
+	now := time.Now().UTC()
+	account := AdminAccount{
+		ID:           1,
+		Username:     strings.TrimSpace(username),
+		PasswordHash: passwordHash,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO admin_account (id, username, password_hash, created_at, updated_at)
+		VALUES (1, ?, ?, ?, ?)
+	`, account.Username, account.PasswordHash, account.CreatedAt, account.UpdatedAt)
+	if err != nil {
+		return AdminAccount{}, err
+	}
+
+	return account, nil
+}
+
 func scanDevice(scanner interface {
 	Scan(dest ...any) error
 }) (Device, error) {

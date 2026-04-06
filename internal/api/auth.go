@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,20 +9,22 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/PhantoNull/home-mesh/internal/config"
+	"github.com/PhantoNull/home-mesh/internal/store"
+	"golang.org/x/crypto/argon2"
 )
 
 const sessionCookieName = "home_mesh_session"
 
 type authManager struct {
 	enabled       bool
-	username      string
-	password      string
+	account       store.AdminAccount
 	sessionSecret []byte
 }
 
@@ -36,17 +39,44 @@ type authSessionResponse struct {
 	Username      string `json:"username,omitempty"`
 }
 
-func newAuthManager(cfg config.Config) *authManager {
-	enabled := strings.TrimSpace(cfg.AuthUsername) != "" &&
-		cfg.AuthPassword != "" &&
-		strings.TrimSpace(cfg.SessionSecret) != ""
+const (
+	argon2Time    = 1
+	argon2Memory  = 64 * 1024
+	argon2Threads = 4
+	argon2KeyLen  = 32
+)
+
+func newAuthManager(cfg config.Config, inventory *store.Store) (*authManager, error) {
+	sessionSecret := strings.TrimSpace(cfg.SessionSecret)
+	if sessionSecret == "" {
+		return &authManager{enabled: false}, nil
+	}
+
+	account, err := inventory.GetAdminAccount(context.Background())
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrNotFound):
+		bootstrapPassword := cfg.BootstrapAdminPassword
+		if bootstrapPassword == "" {
+			return nil, errors.New("HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD is required until the first admin account is created")
+		}
+		hash, hashErr := hashPassword(bootstrapPassword)
+		if hashErr != nil {
+			return nil, hashErr
+		}
+		account, err = inventory.BootstrapAdminAccount(context.Background(), strings.TrimSpace(cfg.BootstrapAdminUsername), hash)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, err
+	}
 
 	return &authManager{
-		enabled:       enabled,
-		username:      strings.TrimSpace(cfg.AuthUsername),
-		password:      cfg.AuthPassword,
-		sessionSecret: []byte(strings.TrimSpace(cfg.SessionSecret)),
-	}
+		enabled:       true,
+		account:       account,
+		sessionSecret: []byte(sessionSecret),
+	}, nil
 }
 
 func (a *authManager) handleSession(w http.ResponseWriter, r *http.Request) {
@@ -90,13 +120,13 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(payload.Username)), []byte(a.username)) != 1 ||
-		subtle.ConstantTimeCompare([]byte(payload.Password), []byte(a.password)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(payload.Username)), []byte(a.account.Username)) != 1 ||
+		!verifyPassword(payload.Password, a.account.PasswordHash) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 		return
 	}
 
-	cookieValue, expiresAt, err := a.newSessionValue(a.username)
+	cookieValue, expiresAt, err := a.newSessionValue(a.account.Username)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create session"})
 		return
@@ -116,7 +146,7 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, authSessionResponse{
 		Enabled:       true,
 		Authenticated: true,
-		Username:      a.username,
+		Username:      a.account.Username,
 	})
 }
 
@@ -196,7 +226,7 @@ func (a *authManager) authenticatedUsername(r *http.Request) (string, bool) {
 	}
 
 	username := string(usernameBytes)
-	if subtle.ConstantTimeCompare([]byte(username), []byte(a.username)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(username), []byte(a.account.Username)) != 1 {
 		return "", false
 	}
 
@@ -223,4 +253,52 @@ func (a *authManager) signSession(userPart string, noncePart string, expiresPart
 	encoder := json.NewEncoder(mac)
 	_ = encoder.Encode([]string{userPart, noncePart, expiresPart, hex.EncodeToString(nonce)})
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func hashPassword(password string) (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+
+	hash := argon2.IDKey([]byte(password), salt, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
+	return strings.Join([]string{
+		"argon2id",
+		strconv.Itoa(argon2Time),
+		strconv.Itoa(argon2Memory),
+		strconv.Itoa(argon2Threads),
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(hash),
+	}, "$"), nil
+}
+
+func verifyPassword(password string, encoded string) bool {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[0] != "argon2id" {
+		return false
+	}
+
+	timeCost, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	memoryCost, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return false
+	}
+	threads, err := strconv.Atoi(parts[3])
+	if err != nil {
+		return false
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
+	if err != nil {
+		return false
+	}
+	expected, err := base64.RawStdEncoding.DecodeString(parts[5])
+	if err != nil {
+		return false
+	}
+
+	actual := argon2.IDKey([]byte(password), salt, uint32(timeCost), uint32(memoryCost), uint8(threads), uint32(len(expected)))
+	return subtle.ConstantTimeCompare(actual, expected) == 1
 }
