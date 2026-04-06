@@ -52,6 +52,7 @@ export type Action = {
   actionType: string
   status: string
   resultSummary: string
+  metadata?: Record<string, string>
   startedAt: string
 }
 

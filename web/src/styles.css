@@ -50,6 +50,44 @@ body {
   gap: 12px;
 }
 
+.hero-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.hero-user-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+}
+
+.hero-user-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(163, 184, 215, 0.16);
+  background: rgba(163, 184, 215, 0.08);
+  color: #d6dfef;
+  font-size: 0.92rem;
+}
+
+.hero-user-badge__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(163, 184, 215, 0.18);
+  color: #9ec1ff;
+  font-size: 0.8rem;
+}
+
 .hero-brand {
   display: flex;
   align-items: center;
@@ -142,6 +180,11 @@ body {
 .inventory-row__meta,
 .feedback-panel p {
   color: #b8c4d9;
+}
+
+.auth-panel {
+  max-width: 560px;
+  margin: 0 auto;
 }
 
 .hero-grid {
@@ -501,6 +544,11 @@ body {
   min-width: 34px;
 }
 
+.inventory-row__meta-value {
+  color: #9cb2d8;
+  font-size: 0.98rem;
+}
+
 .inventory-row__tags {
   display: flex;
   flex-wrap: wrap;
@@ -542,7 +590,19 @@ body {
   border-color: rgba(86, 189, 138, 0.25);
 }
 
+.status-pill--completed {
+  color: #8fe0a8;
+  border-color: rgba(86, 189, 138, 0.25);
+  background: rgba(31, 92, 54, 0.22);
+}
+
 .status-pill--offline {
+  color: #ff8e8e;
+  border-color: rgba(255, 96, 96, 0.34);
+  background: rgba(120, 18, 18, 0.22);
+}
+
+.status-pill--failed {
   color: #ff8e8e;
   border-color: rgba(255, 96, 96, 0.34);
   background: rgba(120, 18, 18, 0.22);
@@ -917,6 +977,10 @@ body {
   margin-bottom: 16px;
 }
 
+.action-history__header {
+  margin-bottom: 18px;
+}
+
 .modal-panel__header {
   display: flex;
   align-items: flex-start;
@@ -1033,6 +1097,7 @@ body {
   position: fixed;
   right: 20px;
   bottom: 20px;
+  z-index: 60;
   min-width: 280px;
   max-width: 420px;
   border-radius: 16px;

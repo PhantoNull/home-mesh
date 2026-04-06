@@ -10,6 +10,9 @@ type Config struct {
 	MasterKeyBase  string
 	SSHHostKeyMode string
 	KnownHostsPath string
+	AuthUsername   string
+	AuthPassword   string
+	SessionSecret  string
 }
 
 func Load() Config {
@@ -21,6 +24,9 @@ func Load() Config {
 		MasterKeyBase:  getEnv("HOME_MESH_MASTER_KEY", ""),
 		SSHHostKeyMode: getEnv("HOME_MESH_SSH_HOST_KEY_MODE", defaultSSHHostKeyMode()),
 		KnownHostsPath: getEnv("HOME_MESH_SSH_KNOWN_HOSTS_PATH", defaultKnownHostsPath()),
+		AuthUsername:   getEnv("HOME_MESH_AUTH_USERNAME", ""),
+		AuthPassword:   getEnv("HOME_MESH_AUTH_PASSWORD", ""),
+		SessionSecret:  getEnv("HOME_MESH_SESSION_SECRET", ""),
 	}
 }
 

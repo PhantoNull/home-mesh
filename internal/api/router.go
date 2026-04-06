@@ -61,6 +61,11 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
+	auth := newAuthManager(cfg)
+
+	mux.HandleFunc("/api/auth/session", auth.handleSession)
+	mux.HandleFunc("/api/auth/login", auth.handleLogin)
+	mux.HandleFunc("/api/auth/logout", auth.handleLogout)
 
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, healthResponse{
@@ -854,7 +859,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		})
 	})
 
-	return withCORS(mux)
+	return withCORS(auth.middleware(mux))
 }
 
 func withCORS(next http.Handler) http.Handler {

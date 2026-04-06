@@ -21,6 +21,8 @@ Current MVP capabilities include:
 - inventory CRUD for devices, network nodes, and network segments
 - topology relations and a visual topology graph
 - global live refresh for device and network-node status
+- sequential browser-driven auto-refresh without overlapping cycles
+- progressive per-item refresh updates in the UI
 - DNS-to-IP refresh when a hostname is configured
 - best-effort MAC address resolution
 - manual MAC address entry for devices
@@ -28,6 +30,7 @@ Current MVP capabilities include:
 - encrypted per-device SSH credential storage
 - interactive SSH terminal in the web UI
 - action history for operational events
+- application authentication with backend-protected APIs
 - Docker-based local deployment
 
 ## Architecture
@@ -94,6 +97,9 @@ Create a local `.env` from `.env.example`.
 Required values:
 
 - `HOME_MESH_MASTER_KEY`
+- `HOME_MESH_AUTH_USERNAME`
+- `HOME_MESH_AUTH_PASSWORD`
+- `HOME_MESH_SESSION_SECRET`
 - optionally `HOME_MESH_SSH_HOST_KEY_MODE`
 - optionally `HOME_MESH_WEB_PORT`
 
@@ -101,6 +107,9 @@ Example:
 
 ```dotenv
 HOME_MESH_MASTER_KEY=replace-with-a-base64-encoded-32-byte-key
+HOME_MESH_AUTH_USERNAME=admin
+HOME_MESH_AUTH_PASSWORD=replace-with-a-strong-password
+HOME_MESH_SESSION_SECRET=replace-with-a-long-random-session-secret
 HOME_MESH_SSH_HOST_KEY_MODE=insecure
 HOME_MESH_API_PORT=8080
 HOME_MESH_WEB_PORT=3000
@@ -190,6 +199,27 @@ SSH passwords are not stored in plaintext.
 
 They are encrypted server-side using the configured master key. Without `HOME_MESH_MASTER_KEY`, encrypted SSH credential storage and SSH execution will not work.
 
+### Application Authentication
+
+Home Mesh can protect all backend APIs with a single application-level login.
+
+When these variables are set:
+
+- `HOME_MESH_AUTH_USERNAME`
+- `HOME_MESH_AUTH_PASSWORD`
+- `HOME_MESH_SESSION_SECRET`
+
+the backend requires authentication for all protected `/api/*` routes.
+
+Behavior:
+
+- unauthenticated requests to protected API routes return `401`
+- the frontend shows a login form before loading the dashboard
+- successful login creates an `HttpOnly` session cookie
+- session lifetime is 1 hour
+
+This protection applies server-side, so direct requests to the backend API are also blocked without a valid session.
+
 ### SSH Host Key Mode
 
 Development default:
@@ -268,8 +298,9 @@ This is especially attractive when:
 - topology discovery is still mostly manual
 - MAC address resolution is best-effort and depends on network visibility
 - Wake-on-LAN reliability depends on deployment/network environment
+- scheduled refresh is still browser-driven, not backend-scheduled
 - floorplans and physical placement are not implemented yet
-- authentication/authorization is not implemented yet
+- application auth exists, but deeper hardening is still limited
 - router/switch-specific discovery integrations are not implemented yet
 
 ## Project Status
@@ -281,9 +312,11 @@ Core foundations already in place:
 - persistent inventory
 - visual dashboard
 - live refresh
+- progressive per-item live updates
 - topology graph
 - Wake-on-LAN
 - SSH credentials and SSH terminal
+- application authentication
 
 Next large product areas are likely to be:
 

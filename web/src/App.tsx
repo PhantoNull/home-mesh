@@ -105,6 +105,14 @@ type CollapsibleSectionProps = {
   children: ReactNode
 }
 
+type AuthPanelProps = {
+  submitState: 'idle' | 'submitting'
+  errorMessage: string | null
+  draft: { username: string; password: string }
+  onChange: (field: 'username' | 'password', value: string) => void
+  onSubmit: () => Promise<void>
+}
+
 function moveByIds<T extends { id: string }>(items: T[], fromId: string, toId: string): T[] {
   const fromIndex = items.findIndex((item) => item.id === fromId)
   const toIndex = items.findIndex((item) => item.id === toId)
@@ -160,6 +168,47 @@ function MetricCard({ title, value, description, accent }: MetricCardProps) {
       <strong className="metric-card__value">{value}</strong>
       <p className="metric-card__description">{description}</p>
     </article>
+  )
+}
+
+function AuthPanel({ submitState, errorMessage, draft, onChange, onSubmit }: AuthPanelProps) {
+  return (
+    <section className="feedback-panel auth-panel">
+      <p className="section-label">Authentication</p>
+      <h2>Sign in to Home Mesh</h2>
+      <p>This application requires a valid session before any inventory or control API can be accessed.</p>
+      <form
+        className="device-form"
+        autoComplete="off"
+        onSubmit={(event) => {
+          event.preventDefault()
+          void onSubmit()
+        }}
+      >
+        {errorMessage ? <div className="inline-error">{errorMessage}</div> : null}
+        <div className="form-grid">
+          <label className="form-field">
+            <span>Username</span>
+            <input value={draft.username} onChange={(event) => onChange('username', event.target.value)} autoComplete="off" name="home-mesh-login-user" />
+          </label>
+          <label className="form-field">
+            <span>Password</span>
+            <input
+              type="password"
+              value={draft.password}
+              onChange={(event) => onChange('password', event.target.value)}
+              autoComplete="new-password"
+              name="home-mesh-login-pass"
+            />
+          </label>
+        </div>
+        <div className="form-actions">
+          <button type="submit" className="action-button" disabled={submitState === 'submitting'}>
+            {submitState === 'submitting' ? 'Signing in...' : 'Sign in'}
+          </button>
+        </div>
+      </form>
+    </section>
   )
 }
 
@@ -761,15 +810,15 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
               </div>
               <p className="inventory-row__meta">
                 <span className="inventory-row__meta-label">DNS</span>
-                <span>{device.hostname || 'No hostname'}</span>
+                <span className="inventory-row__meta-value">{device.hostname || 'No hostname'}</span>
               </p>
               <p className="inventory-row__meta">
                 <span className="inventory-row__meta-label">IP</span>
-                <span>{device.ipAddress || 'No IP address'}</span>
+                <span className="inventory-row__meta-value">{device.ipAddress || 'No IP address'}</span>
               </p>
               <p className="inventory-row__meta">
                 <span className="inventory-row__meta-label">MAC</span>
-                <span>{device.macAddress || 'Mac not resolved yet'}</span>
+                <span className="inventory-row__meta-value">{device.macAddress || 'Mac not resolved yet'}</span>
               </p>
             </div>
             <div className="inventory-row__tags inventory-row__tags--device">
@@ -901,19 +950,19 @@ function InfrastructureList({
             </div>
             <p className="inventory-row__meta">
               <span className="inventory-row__meta-label">TYPE</span>
-              <span>{node.nodeType || 'Unknown type'}</span>
+              <span className="inventory-row__meta-value">{node.nodeType || 'Unknown type'}</span>
             </p>
             <p className="inventory-row__meta">
               <span className="inventory-row__meta-label">IP</span>
-              <span>{node.managementIp || 'No management IP'}</span>
+              <span className="inventory-row__meta-value">{node.managementIp || 'No management IP'}</span>
             </p>
             <p className="inventory-row__meta">
               <span className="inventory-row__meta-label">VENDOR</span>
-              <span>{node.vendor || 'Unknown vendor'}</span>
+              <span className="inventory-row__meta-value">{node.vendor || 'Unknown vendor'}</span>
             </p>
             <p className="inventory-row__meta">
               <span className="inventory-row__meta-label">MODEL</span>
-              <span>{node.model || 'Unknown model'}</span>
+              <span className="inventory-row__meta-value">{node.model || 'Unknown model'}</span>
             </p>
           </div>
           <div className="inventory-row__tags">
@@ -1015,23 +1064,23 @@ function SegmentList({
             </div>
             <p className="inventory-row__meta">
               <span className="inventory-row__meta-label">TYPE</span>
-              <span>{segment.segmentType || 'Unknown type'}</span>
+              <span className="inventory-row__meta-value">{segment.segmentType || 'Unknown type'}</span>
             </p>
             <p className="inventory-row__meta">
               <span className="inventory-row__meta-label">CIDR</span>
-              <span>{segment.cidr || 'No CIDR'}</span>
+              <span className="inventory-row__meta-value">{segment.cidr || 'No CIDR'}</span>
             </p>
             <p className="inventory-row__meta">
               <span className="inventory-row__meta-label">VLAN</span>
-              <span>{segment.vlanId || 'n/a'}</span>
+              <span className="inventory-row__meta-value">{segment.vlanId || 'n/a'}</span>
             </p>
             <p className="inventory-row__meta">
               <span className="inventory-row__meta-label">GW</span>
-              <span>{segment.gatewayIp || 'n/a'}</span>
+              <span className="inventory-row__meta-value">{segment.gatewayIp || 'n/a'}</span>
             </p>
             <p className="inventory-row__meta">
               <span className="inventory-row__meta-label">DNS</span>
-              <span>{segment.dnsDomain || 'n/a'}</span>
+              <span className="inventory-row__meta-value">{segment.dnsDomain || 'n/a'}</span>
             </p>
           </div>
         </article>
@@ -1232,7 +1281,7 @@ function ActionList({ actions }: { actions: Action[] }) {
               <span className={`status-pill status-pill--${action.status}`}>{action.status}</span>
             </div>
             <p className="inventory-row__meta">
-              device {action.deviceId} | {new Date(action.startedAt).toLocaleString()}
+              {(action.metadata?.deviceName || action.deviceId)} | {new Date(action.startedAt).toLocaleString()}
             </p>
             <p className="inventory-row__meta">{action.resultSummary}</p>
           </div>
@@ -1271,6 +1320,12 @@ export default function App() {
   const [sshSessionKey, setSSHSessionKey] = useState(0)
   const [sshConnectionState, setSSHConnectionState] = useState('Idle')
   const [toast, setToast] = useState<ToastState>(null)
+  const [authState, setAuthState] = useState<'checking' | 'authenticated' | 'unauthenticated'>('checking')
+  const [authEnabled, setAuthEnabled] = useState(true)
+  const [authUsername, setAuthUsername] = useState('')
+  const [loginDraft, setLoginDraft] = useState({ username: '', password: '' })
+  const [loginSubmitState, setLoginSubmitState] = useState<'idle' | 'submitting'>('idle')
+  const [loginError, setLoginError] = useState<string | null>(null)
   const [refreshMode, setRefreshMode] = useState<'idle' | 'running'>('idle')
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [refreshingItems, setRefreshingItems] = useState<Record<string, boolean>>({})
@@ -1282,6 +1337,16 @@ export default function App() {
     stateRef.current = state
   }, [state])
 
+  async function authFetch(input: RequestInfo | URL, init?: RequestInit) {
+    const response = await fetch(input, init)
+    if (response.status === 401) {
+      setAuthState('unauthenticated')
+      throw new Error('Session expired. Please sign in again.')
+    }
+
+    return response
+  }
+
   useEffect(() => {
     if (!toast) {
       return
@@ -1292,7 +1357,7 @@ export default function App() {
   }, [toast])
 
   useEffect(() => {
-    if (refreshMode !== 'running') {
+    if (refreshMode !== 'running' || authState !== 'authenticated') {
       return
     }
 
@@ -1320,11 +1385,11 @@ export default function App() {
         window.clearTimeout(timeoutId)
       }
     }
-  }, [refreshMode])
+  }, [refreshMode, authState])
 
   async function loadInventory() {
     try {
-      const response = await fetch('/api/inventory')
+      const response = await authFetch('/api/inventory')
       if (!response.ok) {
         throw new Error(`Inventory request failed with status ${response.status}`)
       }
@@ -1342,44 +1407,97 @@ export default function App() {
     }
   }
 
+  async function submitLogin() {
+    setLoginError(null)
+    if (!loginDraft.username.trim() || !loginDraft.password) {
+      setLoginError('Username and password are required.')
+      return
+    }
+
+    setLoginSubmitState('submitting')
+    try {
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: loginDraft.username.trim(),
+          password: loginDraft.password,
+        }),
+      })
+
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string }
+        throw new Error(payload.error ?? `Login failed with status ${response.status}`)
+      }
+
+      setAuthState('authenticated')
+      setAuthUsername(loginDraft.username.trim())
+      setLoginDraft({ username: loginDraft.username.trim(), password: '' })
+      setToast({ kind: 'success', message: 'Authenticated successfully.' })
+    } catch (error) {
+      setLoginError(error instanceof Error ? error.message : 'Login failed')
+    } finally {
+      setLoginSubmitState('idle')
+    }
+  }
+
+  async function logout() {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' })
+    } finally {
+      setAuthState('unauthenticated')
+      setAuthUsername('')
+      setLoginDraft({ username: '', password: '' })
+      setRefreshMode('idle')
+      setToast({ kind: 'success', message: 'Signed out.' })
+    }
+  }
+
   useEffect(() => {
     let cancelled = false
 
-    async function loadOnce() {
+    async function checkSession() {
       try {
-        const response = await fetch('/api/inventory')
-        if (!response.ok) {
-          throw new Error(`Inventory request failed with status ${response.status}`)
+        const response = await fetch('/api/auth/session')
+        const payload = (await response.json()) as {
+          enabled: boolean
+          authenticated: boolean
+          username?: string
         }
 
-        const data = (await response.json()) as InventorySnapshot
         if (!cancelled) {
-          setState((current) => ({
-            kind: 'ready',
-            data: mergeRuntimeStatuses(data, current.kind === 'ready' ? current.data : null),
-          }))
+          setAuthEnabled(payload.enabled)
+          setAuthUsername(payload.username ?? '')
+          setAuthState(!payload.enabled || payload.authenticated ? 'authenticated' : 'unauthenticated')
         }
       } catch (error) {
         if (!cancelled) {
-          setState({
-            kind: 'error',
-            message: error instanceof Error ? error.message : 'Unknown inventory error',
-          })
+          setAuthState('unauthenticated')
         }
       }
     }
 
-    void loadOnce()
-    void refreshDevices(false)
+    void checkSession()
 
     return () => {
       cancelled = true
     }
   }, [])
 
+  useEffect(() => {
+    if (authState !== 'authenticated') {
+      return
+    }
+
+    void (async () => {
+      await loadInventory()
+      await refreshDevices(false)
+    })()
+  }, [authState])
+
   async function persistDeviceOrder(items: Device[]) {
     for (const [index, item] of items.entries()) {
-      await fetch(`/api/devices/${item.id}`, {
+      await authFetch(`/api/devices/${item.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1392,7 +1510,7 @@ export default function App() {
 
   async function persistNodeOrder(items: NetworkNode[]) {
     for (const [index, item] of items.entries()) {
-      await fetch(`/api/network-nodes/${item.id}`, {
+      await authFetch(`/api/network-nodes/${item.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1405,7 +1523,7 @@ export default function App() {
 
   async function persistSegmentOrder(items: NetworkSegment[]) {
     for (const [index, item] of items.entries()) {
-      await fetch(`/api/network-segments/${item.id}`, {
+      await authFetch(`/api/network-segments/${item.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1417,6 +1535,9 @@ export default function App() {
   }
 
   async function refreshDevices(showSuccessToast: boolean) {
+    if (authState !== 'authenticated') {
+      return
+    }
     if (refreshInFlightRef.current) {
       return
     }
@@ -1439,7 +1560,7 @@ export default function App() {
       const requests = [
         ...currentState.data.devices.map(async (device) => {
           try {
-            const response = await fetch(`/api/devices/${device.id}/refresh`, { method: 'POST' })
+            const response = await authFetch(`/api/devices/${device.id}/refresh`, { method: 'POST' })
             if (!response.ok) {
               const payload = (await response.json()) as { error?: string }
               throw new Error(payload.error ?? `Refresh failed with status ${response.status}`)
@@ -1463,7 +1584,7 @@ export default function App() {
         }),
         ...currentState.data.networkNodes.map(async (node) => {
           try {
-            const response = await fetch(`/api/network-nodes/${node.id}/refresh`, { method: 'POST' })
+            const response = await authFetch(`/api/network-nodes/${node.id}/refresh`, { method: 'POST' })
             if (!response.ok) {
               const payload = (await response.json()) as { error?: string }
               throw new Error(payload.error ?? `Refresh failed with status ${response.status}`)
@@ -1565,7 +1686,7 @@ export default function App() {
     setSSHConnectionState('Loading credentials...')
 
     try {
-      const response = await fetch(`/api/devices/${device.id}/ssh-credential`)
+      const response = await authFetch(`/api/devices/${device.id}/ssh-credential`)
       if (!response.ok) {
         const payload = (await response.json()) as { error?: string }
         throw new Error(payload.error ?? `SSH credential request failed with status ${response.status}`)
@@ -1600,7 +1721,7 @@ export default function App() {
   async function triggerWake(device: Device) {
     setActionState((current) => ({ ...current, [device.id]: 'running' }))
     try {
-      const response = await fetch(`/api/devices/${device.id}/wake`, { method: 'POST' })
+      const response = await authFetch(`/api/devices/${device.id}/wake`, { method: 'POST' })
       if (!response.ok) {
         const payload = (await response.json()) as { resultSummary?: string; error?: string }
         throw new Error(payload.resultSummary ?? payload.error ?? `Wake failed with status ${response.status}`)
@@ -1628,7 +1749,7 @@ export default function App() {
 
     setDeviceSubmitState('saving')
     try {
-      const response = await fetch('/api/devices', {
+      const response = await authFetch('/api/devices', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1695,7 +1816,7 @@ export default function App() {
         const currentDevice =
           state.kind === 'ready' ? state.data.devices.find((device) => device.id === editingDeviceId) : null
 
-        const response = await fetch(`/api/devices/${editingDeviceId}`, {
+        const response = await authFetch(`/api/devices/${editingDeviceId}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1768,7 +1889,7 @@ export default function App() {
           ? state.data.networkNodes.find((node) => node.id === editingNodeId) ?? null
           : null
 
-      const response = await fetch(editingNodeId ? `/api/network-nodes/${editingNodeId}` : '/api/network-nodes', {
+      const response = await authFetch(editingNodeId ? `/api/network-nodes/${editingNodeId}` : '/api/network-nodes', {
         method: editingNodeId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1805,7 +1926,7 @@ export default function App() {
   async function deleteNode(node: NetworkNode) {
     setActionState((current) => ({ ...current, [node.id]: 'deleting' }))
     try {
-      const response = await fetch(`/api/network-nodes/${node.id}`, { method: 'DELETE' })
+      const response = await authFetch(`/api/network-nodes/${node.id}`, { method: 'DELETE' })
       if (!response.ok) {
         const payload = (await response.json()) as { error?: string }
         throw new Error(payload.error ?? `Delete failed with status ${response.status}`)
@@ -1859,7 +1980,7 @@ export default function App() {
           ? state.data.networkSegments.find((segment) => segment.id === editingSegmentId) ?? null
           : null
 
-      const response = await fetch(
+      const response = await authFetch(
         editingSegmentId ? `/api/network-segments/${editingSegmentId}` : '/api/network-segments',
         {
           method: editingSegmentId ? 'PUT' : 'POST',
@@ -1897,7 +2018,7 @@ export default function App() {
   async function deleteSegment(segment: NetworkSegment) {
     setActionState((current) => ({ ...current, [segment.id]: 'deleting' }))
     try {
-      const response = await fetch(`/api/network-segments/${segment.id}`, { method: 'DELETE' })
+      const response = await authFetch(`/api/network-segments/${segment.id}`, { method: 'DELETE' })
       if (!response.ok) {
         const payload = (await response.json()) as { error?: string }
         throw new Error(payload.error ?? `Delete failed with status ${response.status}`)
@@ -1934,7 +2055,7 @@ export default function App() {
 
     setSSHSubmitState('saving')
     try {
-      const response = await fetch(`/api/devices/${sshModalDevice.id}/ssh-credential`, {
+      const response = await authFetch(`/api/devices/${sshModalDevice.id}/ssh-credential`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1966,7 +2087,7 @@ export default function App() {
   async function deleteDevice(device: Device) {
     setActionState((current) => ({ ...current, [device.id]: 'deleting' }))
     try {
-      const response = await fetch(`/api/devices/${device.id}`, { method: 'DELETE' })
+      const response = await authFetch(`/api/devices/${device.id}`, { method: 'DELETE' })
       if (!response.ok) {
         const payload = (await response.json()) as { error?: string }
         throw new Error(payload.error ?? `Delete failed with status ${response.status}`)
@@ -1991,7 +2112,7 @@ export default function App() {
   async function clearActionHistory() {
     setActionsState('clearing')
     try {
-      const response = await fetch('/api/actions', { method: 'DELETE' })
+      const response = await authFetch('/api/actions', { method: 'DELETE' })
       if (!response.ok) {
         const payload = (await response.json()) as { error?: string }
         throw new Error(payload.error ?? `Clear action history failed with status ${response.status}`)
@@ -2010,7 +2131,21 @@ export default function App() {
   }
 
   const content =
-    state.kind === 'ready' ? (
+    authState === 'checking' ? (
+      <section className="feedback-panel">
+        <p className="section-label">Authentication</p>
+        <h2>Checking session.</h2>
+        <p>The dashboard is waiting for authentication state from the backend.</p>
+      </section>
+    ) : authState === 'unauthenticated' ? (
+      <AuthPanel
+        submitState={loginSubmitState}
+        errorMessage={loginError}
+        draft={loginDraft}
+        onChange={(field, value) => setLoginDraft((current) => ({ ...current, [field]: value }))}
+        onSubmit={submitLogin}
+      />
+    ) : state.kind === 'ready' ? (
       <>
         <div className="hero-grid">
           <MetricCard
@@ -2225,7 +2360,24 @@ export default function App() {
             </div>
             <p className="eyebrow">Home Mesh</p>
           </div>
-          <h1>Live network inventory for devices and infrastructure.</h1>
+          <div className="hero-title-row">
+            <h1>Live network inventory for devices and infrastructure.</h1>
+            {authState === 'authenticated' && authEnabled ? (
+              <div className="hero-user-actions">
+                {authUsername ? (
+                  <span className="hero-user-badge">
+                    <span className="hero-user-badge__icon" aria-hidden="true">
+                      {'\u25D4'}
+                    </span>
+                    <span>{authUsername}</span>
+                  </span>
+                ) : null}
+                <button type="button" className="secondary-button" onClick={() => void logout()}>
+                  Logout
+                </button>
+              </div>
+            ) : null}
+          </div>
         </div>
 
         {content}
@@ -2409,7 +2561,7 @@ export default function App() {
           widthClassName="modal-panel--wide"
           onClose={() => setIsActionHistoryOpen(false)}
         >
-          <div className="panel-title-row">
+          <div className="panel-title-row action-history__header">
             <div className="form-note">Wake-on-LAN and SSH activity recorded by the backend.</div>
             <button
               type="button"
