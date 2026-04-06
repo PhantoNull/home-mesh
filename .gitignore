@@ -9,6 +9,7 @@ coverage/
 .DS_Store
 bin/
 .tmp/
+.gocache/
 data/*.db
 data/
 web/tsconfig.tsbuildinfo

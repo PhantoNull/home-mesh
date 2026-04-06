@@ -1,6 +1,9 @@
 import { type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   type Action,
+  type DiscoveryCapabilities,
+  type DiscoveryHostMatch,
+  type DiscoveryScanResult,
   type Device,
   type DeviceDraft,
   type InventorySnapshot,
@@ -86,7 +89,7 @@ type EndpointListProps = {
   onOpenSSH: (device: Device) => Promise<void>
   onWake: (device: Device) => Promise<void>
   onDelete: (device: Device) => Promise<void>
-  onReorder: (items: Device[], fromId: string, toId: string) => Promise<void>
+  onReorder: (items: Device[]) => Promise<void>
 }
 
 type DraggableModalProps = {
@@ -124,6 +127,38 @@ function moveByIds<T extends { id: string }>(items: T[], fromId: string, toId: s
   const [moved] = next.splice(fromIndex, 1)
   next.splice(toIndex, 0, moved)
   return next
+}
+
+function getPanelLink(metadata?: Record<string, string>): string {
+  return metadata?.panelLink?.trim() ?? ''
+}
+
+function writeDragID(dataTransfer: DataTransfer, kind: string, id: string) {
+  dataTransfer.effectAllowed = 'move'
+  dataTransfer.setData('text/plain', id)
+  dataTransfer.setData(`text/home-mesh-${kind}`, id)
+}
+
+function readDragID(dataTransfer: DataTransfer, kind: string): string {
+  return dataTransfer.getData(`text/home-mesh-${kind}`) || dataTransfer.getData('text/plain')
+}
+
+function isValidCIDR(value: string): boolean {
+  const trimmed = value.trim()
+  const match = /^(\d{1,3})(\.\d{1,3}){3}\/(\d{1,2})$/.exec(trimmed)
+  if (!match) {
+    return false
+  }
+
+  const [address, prefixText] = trimmed.split('/')
+  const octets = address.split('.').map((part) => Number.parseInt(part, 10))
+  const prefix = Number.parseInt(prefixText, 10)
+
+  if (octets.length !== 4 || octets.some((octet) => Number.isNaN(octet) || octet < 0 || octet > 255)) {
+    return false
+  }
+
+  return !(Number.isNaN(prefix) || prefix < 0 || prefix > 32)
 }
 
 function mergeRuntimeStatuses(snapshot: InventorySnapshot, previous: InventorySnapshot | null): InventorySnapshot {
@@ -372,6 +407,10 @@ function DeviceForm({ draft, submitState, errorMessage, submitLabel, onChange, o
           <span>MAC address</span>
           <input value={draft.macAddress} onChange={(event) => onChange('macAddress', event.target.value)} />
         </label>
+        <label className="form-field form-field--wide">
+          <span>Panel link</span>
+          <input value={draft.panelLink} onChange={(event) => onChange('panelLink', event.target.value)} placeholder="https://device.local" />
+        </label>
         <label className="form-field">
           <span>Segment id</span>
           <input value={draft.networkSegment} onChange={(event) => onChange('networkSegment', event.target.value)} />
@@ -396,7 +435,7 @@ function DeviceForm({ draft, submitState, errorMessage, submitLabel, onChange, o
           </div>
         </label>
       </div>
-      <div className="form-note">MAC address can be entered manually and is also refreshed automatically when it can be resolved.</div>
+      <div className="form-note">MAC address can be entered manually. Panel link can be set manually and is auto-populated from HTTPS or HTTP when a management panel is detected.</div>
       <div className="form-actions">
         <button type="button" className="secondary-button" onClick={onCancel}>
           Cancel
@@ -447,6 +486,10 @@ function NetworkNodeForm({ draft, submitState, errorMessage, submitLabel, onChan
         <label className="form-field">
           <span>Model</span>
           <input value={draft.model} onChange={(event) => onChange('model', event.target.value)} />
+        </label>
+        <label className="form-field form-field--wide">
+          <span>Panel link</span>
+          <input value={draft.panelLink} onChange={(event) => onChange('panelLink', event.target.value)} placeholder="https://router.local" />
         </label>
       </div>
       <div className="form-actions">
@@ -731,9 +774,11 @@ function SSHTerminalPane({ deviceId, enabled, sessionKey, onConnectionState, onR
 function EndpointList({ devices, actionState, sshConfigured, refreshingItems, onEdit, onOpenSSH, onWake, onDelete, onReorder }: EndpointListProps) {
   const [previewDevices, setPreviewDevices] = useState<Device[]>(devices ?? [])
   const dragDeviceIdRef = useRef<string | null>(null)
+  const previewDevicesRef = useRef<Device[]>(devices ?? [])
 
   useEffect(() => {
     setPreviewDevices(devices ?? [])
+    previewDevicesRef.current = devices ?? []
   }, [devices])
 
   if (!devices || devices.length === 0) {
@@ -748,6 +793,7 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
           actionState[device.id] === 'running' ||
           actionState[device.id] === 'deleting' ||
           actionState[device.id] === 'ssh'
+        const panelLink = getPanelLink(device.metadata)
 
         return (
           <article
@@ -756,7 +802,7 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
             draggable
             onDragStart={(event) => {
               dragDeviceIdRef.current = device.id
-              event.dataTransfer.setData('text/home-mesh-device', device.id)
+              writeDragID(event.dataTransfer, 'device', device.id)
             }}
             onDragEnd={() => {
               dragDeviceIdRef.current = null
@@ -769,14 +815,20 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
                 return
               }
 
-              setPreviewDevices((current) => moveByIds(current, fromId, device.id))
+              setPreviewDevices((current) => {
+                const next = moveByIds(current, fromId, device.id)
+                previewDevicesRef.current = next
+                return next
+              })
             }}
             onDrop={(event) => {
               event.preventDefault()
-              const fromId = event.dataTransfer.getData('text/home-mesh-device')
-              if (fromId && fromId !== device.id) {
+              const fromId = readDragID(event.dataTransfer, 'device')
+              if (fromId) {
                 dragDeviceIdRef.current = null
-                void onReorder(previewDevices, fromId, device.id)
+                if (JSON.stringify(previewDevicesRef.current.map((item) => item.id)) !== JSON.stringify((devices ?? []).map((item) => item.id))) {
+                  void onReorder(previewDevicesRef.current)
+                }
               }
             }}
           >
@@ -821,14 +873,15 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
                 <span className="inventory-row__meta-value">{device.macAddress || 'Mac not resolved yet'}</span>
               </p>
             </div>
-            <div className="inventory-row__tags inventory-row__tags--device">
-              {(device.tags ?? []).map((tag) => (
-                <span key={tag} className="tag-pill">
-                  {tag}
-                </span>
-              ))}
-            </div>
             <div className="inventory-row__actions inventory-row__actions--device">
+              {panelLink ? (
+                <a className="action-button panel-button" href={panelLink} target="_blank" rel="noreferrer">
+                  <span className="panel-button__icon" aria-hidden="true">
+                    {'\u{1F310}'}
+                  </span>
+                  <span>Panel</span>
+                </a>
+              ) : null}
               <button
                 type="button"
                 className={sshConfigured[device.id] ? 'action-button ssh-button ssh-button--configured' : 'action-button ssh-button'}
@@ -850,9 +903,16 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
                   <span className="wake-button__icon" aria-hidden="true">
                     {'\u23F0'}
                   </span>
-                  <span>{actionState[device.id] === 'running' ? 'Sending...' : 'Wake'}</span>
+                  <span>{actionState[device.id] === 'running' ? 'Sending...' : 'WoL'}</span>
                 </button>
               ) : null}
+            </div>
+            <div className="inventory-row__tags inventory-row__tags--device">
+              {(device.tags ?? []).map((tag) => (
+                <span key={tag} className="tag-pill">
+                  {tag}
+                </span>
+              ))}
             </div>
           </article>
         )
@@ -874,13 +934,15 @@ function InfrastructureList({
   onDelete: (node: NetworkNode) => Promise<void>
   actionState: Record<string, string>
   refreshingItems: Record<string, boolean>
-  onReorder: (items: NetworkNode[], fromId: string, toId: string) => Promise<void>
+  onReorder: (items: NetworkNode[]) => Promise<void>
 }) {
   const [previewNodes, setPreviewNodes] = useState<NetworkNode[]>(nodes ?? [])
   const dragNodeIdRef = useRef<string | null>(null)
+  const previewNodesRef = useRef<NetworkNode[]>(nodes ?? [])
 
   useEffect(() => {
     setPreviewNodes(nodes ?? [])
+    previewNodesRef.current = nodes ?? []
   }, [nodes])
 
   if (!nodes || nodes.length === 0) {
@@ -889,14 +951,17 @@ function InfrastructureList({
 
   return (
     <div className="inventory-list inventory-list--cards">
-      {(previewNodes ?? []).map((node) => (
-        <article
+      {(previewNodes ?? []).map((node) => {
+        const panelLink = getPanelLink(node.metadata)
+
+        return (
+          <article
           key={node.id}
           className="inventory-row inventory-row--draggable"
           draggable
           onDragStart={(event) => {
             dragNodeIdRef.current = node.id
-            event.dataTransfer.setData('text/home-mesh-node', node.id)
+            writeDragID(event.dataTransfer, 'node', node.id)
           }}
           onDragEnd={() => {
             dragNodeIdRef.current = null
@@ -909,14 +974,20 @@ function InfrastructureList({
               return
             }
 
-            setPreviewNodes((current) => moveByIds(current, fromId, node.id))
+            setPreviewNodes((current) => {
+              const next = moveByIds(current, fromId, node.id)
+              previewNodesRef.current = next
+              return next
+            })
           }}
           onDrop={(event) => {
             event.preventDefault()
-            const fromId = event.dataTransfer.getData('text/home-mesh-node')
-            if (fromId && fromId !== node.id) {
+            const fromId = readDragID(event.dataTransfer, 'node')
+            if (fromId) {
               dragNodeIdRef.current = null
-              void onReorder(previewNodes, fromId, node.id)
+              if (JSON.stringify(previewNodesRef.current.map((item) => item.id)) !== JSON.stringify((nodes ?? []).map((item) => item.id))) {
+                void onReorder(previewNodesRef.current)
+              }
             }
           }}
         >
@@ -965,6 +1036,16 @@ function InfrastructureList({
               <span className="inventory-row__meta-value">{node.model || 'Unknown model'}</span>
             </p>
           </div>
+          {panelLink ? (
+            <div className="inventory-row__actions inventory-row__actions--device">
+              <a className="action-button panel-button" href={panelLink} target="_blank" rel="noreferrer">
+                <span className="panel-button__icon" aria-hidden="true">
+                  {'\u{1F310}'}
+                </span>
+                <span>Panel</span>
+              </a>
+            </div>
+          ) : null}
           <div className="inventory-row__tags">
             {(node.tags ?? []).map((tag) => (
               <span key={tag} className="tag-pill">
@@ -973,7 +1054,8 @@ function InfrastructureList({
             ))}
           </div>
         </article>
-      ))}
+        )
+      })}
     </div>
   )
 }
@@ -989,13 +1071,15 @@ function SegmentList({
   onEdit: (segment: NetworkSegment) => void
   onDelete: (segment: NetworkSegment) => Promise<void>
   actionState: Record<string, string>
-  onReorder: (items: NetworkSegment[], fromId: string, toId: string) => Promise<void>
+  onReorder: (items: NetworkSegment[]) => Promise<void>
 }) {
   const [previewSegments, setPreviewSegments] = useState<NetworkSegment[]>(segments ?? [])
   const dragSegmentIdRef = useRef<string | null>(null)
+  const previewSegmentsRef = useRef<NetworkSegment[]>(segments ?? [])
 
   useEffect(() => {
     setPreviewSegments(segments ?? [])
+    previewSegmentsRef.current = segments ?? []
   }, [segments])
 
   if (!segments || segments.length === 0) {
@@ -1011,7 +1095,7 @@ function SegmentList({
           draggable
           onDragStart={(event) => {
             dragSegmentIdRef.current = segment.id
-            event.dataTransfer.setData('text/home-mesh-segment', segment.id)
+            writeDragID(event.dataTransfer, 'segment', segment.id)
           }}
           onDragEnd={() => {
             dragSegmentIdRef.current = null
@@ -1024,14 +1108,20 @@ function SegmentList({
               return
             }
 
-            setPreviewSegments((current) => moveByIds(current, fromId, segment.id))
+            setPreviewSegments((current) => {
+              const next = moveByIds(current, fromId, segment.id)
+              previewSegmentsRef.current = next
+              return next
+            })
           }}
           onDrop={(event) => {
             event.preventDefault()
-            const fromId = event.dataTransfer.getData('text/home-mesh-segment')
-            if (fromId && fromId !== segment.id) {
+            const fromId = readDragID(event.dataTransfer, 'segment')
+            if (fromId) {
               dragSegmentIdRef.current = null
-              void onReorder(previewSegments, fromId, segment.id)
+              if (JSON.stringify(previewSegmentsRef.current.map((item) => item.id)) !== JSON.stringify((segments ?? []).map((item) => item.id))) {
+                void onReorder(previewSegmentsRef.current)
+              }
             }
           }}
         >
@@ -1291,6 +1381,76 @@ function ActionList({ actions }: { actions: Action[] }) {
   )
 }
 
+function DiscoveryResults({
+  result,
+  onCreateDevice,
+  onCreateNode,
+  onCreateSegment,
+}: {
+  result: DiscoveryScanResult
+  onCreateDevice: (host: DiscoveryHostMatch) => void
+  onCreateNode: (host: DiscoveryHostMatch) => void
+  onCreateSegment: (candidate: { cidr: string; name: string }) => void
+}) {
+  return (
+    <div className="discovery-results">
+      <div className="form-note">
+        Scanned networks: {result.scannedCidrs.length > 0 ? result.scannedCidrs.join(', ') : result.cidr}
+      </div>
+      {result.segmentCandidates.map((candidate) => (
+        <article key={candidate.cidr} className="inventory-row">
+          <div className="inventory-row__body">
+            <div className="inventory-row__header">
+              <strong>{candidate.name}</strong>
+            </div>
+            <p className="inventory-row__meta">
+              <span className="inventory-row__meta-label">CIDR</span>
+              <span className="inventory-row__meta-value">{candidate.cidr}</span>
+            </p>
+          </div>
+          <div className="inventory-row__actions inventory-row__actions--device">
+            <button type="button" className="action-button" onClick={() => onCreateSegment(candidate)}>
+              Create segment
+            </button>
+          </div>
+        </article>
+      ))}
+
+      {result.hosts.length === 0 && result.segmentCandidates.length === 0 ? <div className="empty-state">Empty</div> : null}
+
+      {result.hosts.map((host) => (
+        <article key={`${host.ipAddress}-${host.macAddress ?? ''}`} className="inventory-row">
+          <div className="inventory-row__body">
+            <div className="inventory-row__header">
+              <strong>{host.hostname || host.ipAddress}</strong>
+            </div>
+            <p className="inventory-row__meta">
+              <span className="inventory-row__meta-label">IP</span>
+              <span className="inventory-row__meta-value">{host.ipAddress}</span>
+            </p>
+            <p className="inventory-row__meta">
+              <span className="inventory-row__meta-label">MAC</span>
+              <span className="inventory-row__meta-value">{host.macAddress || 'Not resolved'}</span>
+            </p>
+            <p className="inventory-row__meta">
+              <span className="inventory-row__meta-label">VENDOR</span>
+              <span className="inventory-row__meta-value">{host.vendor || 'Unknown vendor'}</span>
+            </p>
+          </div>
+          <div className="inventory-row__actions inventory-row__actions--device">
+            <button type="button" className="action-button" onClick={() => onCreateDevice(host)}>
+              Create device
+            </button>
+            <button type="button" className="action-button" onClick={() => onCreateNode(host)}>
+              Create node
+            </button>
+          </div>
+        </article>
+      ))}
+    </div>
+  )
+}
+
 export default function App() {
   const [state, setState] = useState<LoadState>({ kind: 'loading' })
   const stateRef = useRef<LoadState>({ kind: 'loading' })
@@ -1331,6 +1491,12 @@ export default function App() {
   const [refreshingItems, setRefreshingItems] = useState<Record<string, boolean>>({})
   const [actionsState, setActionsState] = useState<'idle' | 'clearing'>('idle')
   const [isActionHistoryOpen, setIsActionHistoryOpen] = useState(false)
+  const [isDiscoveryOpen, setIsDiscoveryOpen] = useState(false)
+  const [discoveryCapabilities, setDiscoveryCapabilities] = useState<DiscoveryCapabilities | null>(null)
+  const [discoveryCIDR, setDiscoveryCIDR] = useState('')
+  const [discoveryState, setDiscoveryState] = useState<'idle' | 'loading'>('idle')
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null)
+  const [discoveryResult, setDiscoveryResult] = useState<DiscoveryScanResult | null>(null)
   const refreshInFlightRef = useRef(false)
 
   useEffect(() => {
@@ -1404,6 +1570,54 @@ export default function App() {
         kind: 'error',
         message: error instanceof Error ? error.message : 'Unknown inventory error',
       })
+    }
+  }
+
+  async function openDiscoveryModal() {
+    setIsDiscoveryOpen(true)
+    setDiscoveryError(null)
+    setDiscoveryResult(null)
+    setDiscoveryState('loading')
+    try {
+      const response = await authFetch('/api/discovery/capabilities')
+      if (!response.ok) {
+        throw new Error(`Discovery capabilities request failed with status ${response.status}`)
+      }
+      const capabilities = (await response.json()) as DiscoveryCapabilities
+      setDiscoveryCapabilities(capabilities)
+      setDiscoveryCIDR('')
+    } catch (error) {
+      setDiscoveryError(error instanceof Error ? error.message : 'Failed to load discovery capabilities')
+    } finally {
+      setDiscoveryState('idle')
+    }
+  }
+
+  async function scanNetwork() {
+    if (discoveryCIDR.trim() && !isValidCIDR(discoveryCIDR)) {
+      setDiscoveryError('CIDR must look like 192.168.1.0/24.')
+      return
+    }
+
+    setDiscoveryState('loading')
+    setDiscoveryError(null)
+    setDiscoveryResult(null)
+    try {
+      const response = await authFetch('/api/discovery/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cidr: discoveryCIDR.trim() }),
+      })
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string }
+        throw new Error(payload.error ?? `Discovery scan failed with status ${response.status}`)
+      }
+      const result = (await response.json()) as DiscoveryScanResult
+      setDiscoveryResult(result)
+    } catch (error) {
+      setDiscoveryError(error instanceof Error ? error.message : 'Discovery scan failed')
+    } finally {
+      setDiscoveryState('idle')
     }
   }
 
@@ -1497,7 +1711,7 @@ export default function App() {
 
   async function persistDeviceOrder(items: Device[]) {
     for (const [index, item] of items.entries()) {
-      await authFetch(`/api/devices/${item.id}`, {
+      const response = await authFetch(`/api/devices/${item.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1505,12 +1719,16 @@ export default function App() {
           metadata: { ...(item.metadata ?? {}), displayOrder: String(index) },
         }),
       })
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string }
+        throw new Error(payload.error ?? `Failed to persist device order for ${item.name}`)
+      }
     }
   }
 
   async function persistNodeOrder(items: NetworkNode[]) {
     for (const [index, item] of items.entries()) {
-      await authFetch(`/api/network-nodes/${item.id}`, {
+      const response = await authFetch(`/api/network-nodes/${item.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1518,12 +1736,16 @@ export default function App() {
           metadata: { ...(item.metadata ?? {}), displayOrder: String(index) },
         }),
       })
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string }
+        throw new Error(payload.error ?? `Failed to persist network node order for ${item.name}`)
+      }
     }
   }
 
   async function persistSegmentOrder(items: NetworkSegment[]) {
     for (const [index, item] of items.entries()) {
-      await authFetch(`/api/network-segments/${item.id}`, {
+      const response = await authFetch(`/api/network-segments/${item.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1531,6 +1753,10 @@ export default function App() {
           metadata: { ...(item.metadata ?? {}), displayOrder: String(index) },
         }),
       })
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string }
+        throw new Error(payload.error ?? `Failed to persist network segment order for ${item.name}`)
+      }
     }
   }
 
@@ -1623,13 +1849,16 @@ export default function App() {
     }
   }
 
-  async function reorderDevices(items: Device[], fromId: string, toId: string) {
-    if (state.kind !== 'ready') {
+  async function reorderDevices(items: Device[]) {
+    const current = stateRef.current
+    if (current.kind !== 'ready') {
       return
     }
 
-    const nextDevices = moveByIds(items, fromId, toId)
-    setState({ kind: 'ready', data: { ...state.data, devices: nextDevices } })
+    const nextDevices = items
+    setState((existing) =>
+      existing.kind === 'ready' ? { kind: 'ready', data: { ...existing.data, devices: nextDevices } } : existing,
+    )
 
     try {
       await persistDeviceOrder(nextDevices)
@@ -1640,13 +1869,16 @@ export default function App() {
     }
   }
 
-  async function reorderNodes(items: NetworkNode[], fromId: string, toId: string) {
-    if (state.kind !== 'ready') {
+  async function reorderNodes(items: NetworkNode[]) {
+    const current = stateRef.current
+    if (current.kind !== 'ready') {
       return
     }
 
-    const nextNodes = moveByIds(items, fromId, toId)
-    setState({ kind: 'ready', data: { ...state.data, networkNodes: nextNodes } })
+    const nextNodes = items
+    setState((existing) =>
+      existing.kind === 'ready' ? { kind: 'ready', data: { ...existing.data, networkNodes: nextNodes } } : existing,
+    )
 
     try {
       await persistNodeOrder(nextNodes)
@@ -1657,13 +1889,16 @@ export default function App() {
     }
   }
 
-  async function reorderSegments(items: NetworkSegment[], fromId: string, toId: string) {
-    if (state.kind !== 'ready') {
+  async function reorderSegments(items: NetworkSegment[]) {
+    const current = stateRef.current
+    if (current.kind !== 'ready') {
       return
     }
 
-    const nextSegments = moveByIds(items, fromId, toId)
-    setState({ kind: 'ready', data: { ...state.data, networkSegments: nextSegments } })
+    const nextSegments = items
+    setState((existing) =>
+      existing.kind === 'ready' ? { kind: 'ready', data: { ...existing.data, networkSegments: nextSegments } } : existing,
+    )
 
     try {
       await persistSegmentOrder(nextSegments)
@@ -1761,6 +1996,9 @@ export default function App() {
           macAddress: deviceDraft.macAddress.trim(),
           networkSegment: deviceDraft.networkSegment.trim(),
           tags: deviceDraft.tags.map((tag) => tag.trim()).filter(Boolean),
+          metadata: deviceDraft.panelLink.trim()
+            ? { panelLink: deviceDraft.panelLink.trim(), panelLinkSource: 'manual' }
+            : {},
         }),
       })
 
@@ -1787,6 +2025,20 @@ export default function App() {
     setIsCreateDeviceOpen(true)
   }
 
+  function openCreateDeviceFromDiscovery(host: DiscoveryHostMatch) {
+    setModalError(null)
+    setEditingDeviceId(null)
+    setDeviceDraft({
+      ...initialDeviceDraft,
+      name: host.hostname || host.ipAddress,
+      hostname: host.hostname || '',
+      ipAddress: host.ipAddress,
+      macAddress: host.macAddress || '',
+    })
+    setIsDiscoveryOpen(false)
+    setIsCreateDeviceOpen(true)
+  }
+
   function openEditDeviceModal(device: Device) {
     setModalError(null)
     setEditingDeviceId(device.id)
@@ -1797,6 +2049,7 @@ export default function App() {
       deviceType: device.deviceType ?? '',
       ipAddress: device.ipAddress ?? '',
       macAddress: device.macAddress ?? '',
+      panelLink: getPanelLink(device.metadata),
       networkSegment: device.networkSegment ?? '',
       tags: device.tags ?? [],
     })
@@ -1830,7 +2083,12 @@ export default function App() {
             networkSegment: deviceDraft.networkSegment.trim(),
             status: currentDevice?.status ?? 'unknown',
             tags: deviceDraft.tags.map((tag) => tag.trim()).filter(Boolean),
-            metadata: currentDevice?.metadata ?? {},
+            metadata: {
+              ...(currentDevice?.metadata ?? {}),
+              ...(deviceDraft.panelLink.trim()
+                ? { panelLink: deviceDraft.panelLink.trim(), panelLinkSource: 'manual' }
+                : { panelLink: '', panelLinkSource: '' }),
+            },
           }),
         })
 
@@ -1862,6 +2120,19 @@ export default function App() {
     setIsNodeModalOpen(true)
   }
 
+  function openCreateNodeFromDiscovery(host: DiscoveryHostMatch) {
+    setModalError(null)
+    setEditingNodeId(null)
+    setNodeDraft({
+      ...initialNetworkNodeDraft,
+      name: host.hostname || host.ipAddress,
+      managementIp: host.ipAddress,
+      vendor: host.vendor || '',
+    })
+    setIsDiscoveryOpen(false)
+    setIsNodeModalOpen(true)
+  }
+
   function openEditNodeModal(node: NetworkNode) {
     setModalError(null)
     setEditingNodeId(node.id)
@@ -1871,6 +2142,7 @@ export default function App() {
       managementIp: node.managementIp ?? '',
       vendor: node.vendor ?? '',
       model: node.model ?? '',
+      panelLink: getPanelLink(node.metadata),
     })
     setIsNodeModalOpen(true)
   }
@@ -1902,7 +2174,12 @@ export default function App() {
           status: currentNode?.status ?? 'unknown',
           macAddress: currentNode?.macAddress ?? '',
           tags: currentNode?.tags ?? [],
-          metadata: currentNode?.metadata ?? {},
+          metadata: {
+            ...(currentNode?.metadata ?? {}),
+            ...(nodeDraft.panelLink.trim()
+              ? { panelLink: nodeDraft.panelLink.trim(), panelLinkSource: 'manual' }
+              : { panelLink: '', panelLinkSource: '' }),
+          },
         }),
       })
 
@@ -1949,6 +2226,19 @@ export default function App() {
     setModalError(null)
     setEditingSegmentId(null)
     setSegmentDraft(initialNetworkSegmentDraft)
+    setIsSegmentModalOpen(true)
+  }
+
+  function openCreateSegmentFromDiscovery(candidate: { cidr: string; name: string }) {
+    setModalError(null)
+    setEditingSegmentId(null)
+    setSegmentDraft({
+      ...initialNetworkSegmentDraft,
+      name: candidate.name,
+      segmentType: 'lan',
+      cidr: candidate.cidr,
+    })
+    setIsDiscoveryOpen(false)
     setIsSegmentModalOpen(true)
   }
 
@@ -2173,6 +2463,9 @@ export default function App() {
             <div className="toolbar-panel__group">
               <button type="button" className="action-button" onClick={() => void refreshDevices(true)} disabled={isRefreshing}>
                 {isRefreshing ? 'Refreshing...' : 'Refresh now'}
+              </button>
+              <button type="button" className="action-button" onClick={() => void openDiscoveryModal()}>
+                Scan Network
               </button>
               <button
                 type="button"
@@ -2575,6 +2868,58 @@ export default function App() {
             </button>
           </div>
           <ActionList actions={state.data.actions} />
+        </DraggableModal>
+      ) : null}
+
+      {isDiscoveryOpen ? (
+        <DraggableModal label="Discovery" title="Scan network" widthClassName="modal-panel--wide" onClose={() => setIsDiscoveryOpen(false)}>
+          <div className="device-form">
+            {discoveryError ? <div className="inline-error">{discoveryError}</div> : null}
+            <div className="form-grid">
+              <label className="form-field">
+                <span>Provider</span>
+                <input value={discoveryCapabilities?.nmapAvailable ? 'nmap' : 'Unavailable'} readOnly />
+              </label>
+              <label className="form-field">
+                <span>Custom CIDR override</span>
+                <input
+                  list="discovery-cidrs"
+                  value={discoveryCIDR}
+                  onChange={(event) => setDiscoveryCIDR(event.target.value)}
+                  placeholder="Leave empty to scan local networks automatically"
+                />
+                <datalist id="discovery-cidrs">
+                  {(discoveryCapabilities?.suggestedCidrs ?? discoveryCapabilities?.localCidrs ?? []).map((cidr) => (
+                    <option key={cidr} value={cidr} />
+                  ))}
+                </datalist>
+              </label>
+            </div>
+            <div className="form-note">
+              By default, Home Mesh scans the local networks detected on the host. Provide a custom CIDR only if you want to override that target. Results exclude devices, network nodes, and network segments already present in the inventory.
+            </div>
+            <div className="form-actions">
+              <button type="button" className="secondary-button" onClick={() => setIsDiscoveryOpen(false)}>
+                Close
+              </button>
+              <button
+                type="button"
+                className="action-button"
+                onClick={() => void scanNetwork()}
+                disabled={discoveryState === 'loading' || !discoveryCapabilities?.nmapAvailable}
+              >
+                {discoveryState === 'loading' ? 'Scanning...' : 'Run scan'}
+              </button>
+            </div>
+          </div>
+          {discoveryResult ? (
+            <DiscoveryResults
+              result={discoveryResult}
+              onCreateDevice={openCreateDeviceFromDiscovery}
+              onCreateNode={openCreateNodeFromDiscovery}
+              onCreateSegment={openCreateSegmentFromDiscovery}
+            />
+          ) : null}
         </DraggableModal>
       ) : null}
 

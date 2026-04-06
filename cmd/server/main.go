@@ -7,6 +7,7 @@ import (
 
 	"github.com/PhantoNull/home-mesh/internal/api"
 	"github.com/PhantoNull/home-mesh/internal/config"
+	"github.com/PhantoNull/home-mesh/internal/discovery"
 	"github.com/PhantoNull/home-mesh/internal/monitor"
 	"github.com/PhantoNull/home-mesh/internal/secrets"
 	"github.com/PhantoNull/home-mesh/internal/sshclient"
@@ -26,6 +27,7 @@ func main() {
 	}()
 
 	refresher := monitor.NewRefresher(inventory)
+	discoveryService := discovery.NewService(cfg.NmapPath)
 	secretService, err := secrets.New(cfg.MasterKeyBase)
 	if err != nil && err != secrets.ErrUnavailable {
 		log.Fatal(err)
@@ -36,7 +38,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	router, err := api.NewRouter(cfg, inventory, refresher, secretService, hostKeyCallback)
+	router, err := api.NewRouter(cfg, inventory, refresher, discoveryService, secretService, hostKeyCallback)
 	if err != nil {
 		log.Fatal(err)
 	}

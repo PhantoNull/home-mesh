@@ -100,6 +100,7 @@ Required values:
 - `HOME_MESH_SESSION_SECRET`
 - `HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD`
 - optionally `HOME_MESH_SSH_HOST_KEY_MODE`
+- optionally `HOME_MESH_NMAP_PATH`
 - optionally `HOME_MESH_WEB_PORT`
 
 Example:
@@ -110,6 +111,7 @@ HOME_MESH_SESSION_SECRET=replace-with-a-long-random-session-secret
 HOME_MESH_BOOTSTRAP_ADMIN_USERNAME=root
 HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password-for-first-start-only
 HOME_MESH_SSH_HOST_KEY_MODE=insecure
+HOME_MESH_NMAP_PATH=nmap
 HOME_MESH_API_PORT=8080
 HOME_MESH_WEB_PORT=3000
 ```
@@ -169,6 +171,7 @@ Current Docker layout:
   - Go backend
   - currently configured with `network_mode: host`
   - this is useful for LAN operations such as Wake-on-LAN and reachability checks
+  - includes `nmap` in the container image for optional discovery scans
 - `web`
   - frontend served by Nginx
   - proxies `/api` to the backend via `host.docker.internal:8080`
@@ -242,6 +245,22 @@ SQLite data is stored in:
 - `data/home-mesh.db`
 
 That directory should be treated as local state, not source code.
+
+### Optional `nmap` Discovery
+
+Home Mesh can use `nmap` as an optional LAN discovery provider.
+
+Current shape:
+
+- Docker Compose API image includes `nmap`
+- native non-Docker runs require you to install `nmap` separately if you want to use it
+- the backend exposes:
+  - `GET /api/discovery/capabilities`
+  - `POST /api/discovery/scan`
+
+You can override the binary path with:
+
+- `HOME_MESH_NMAP_PATH`
 
 ## Deployment
 

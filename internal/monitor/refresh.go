@@ -259,6 +259,9 @@ func (r *Refresher) refreshDevice(ctx context.Context, device store.Device) (sto
 	original := device
 	targetIP := strings.TrimSpace(device.IPAddress)
 	macResolved := false
+	if device.Metadata == nil {
+		device.Metadata = map[string]string{}
+	}
 
 	if strings.TrimSpace(device.Hostname) != "" {
 		if resolvedIP, err := resolveIPv4(device.Hostname); err == nil {
@@ -279,6 +282,7 @@ func (r *Refresher) refreshDevice(ctx context.Context, device store.Device) (sto
 	if !pingOK {
 		tcpOpen, tcpRefused, openPorts = probeTCPPorts(targetIP, candidatePorts(device))
 	}
+	openPorts = mergeOpenPorts(openPorts, probeSelectedPorts(targetIP, 443, 80))
 	hasARP := false
 
 	if pingOK || tcpOpen {
@@ -306,10 +310,11 @@ func (r *Refresher) refreshDevice(ctx context.Context, device store.Device) (sto
 	}
 
 	if len(openPorts) > 0 {
-		if device.Metadata == nil {
-			device.Metadata = map[string]string{}
-		}
 		device.Metadata["lastReachablePorts"] = strings.Join(openPorts, ",")
+	}
+	if panelLink, source, ok := derivePanelLink(device.Metadata, coalesce(strings.TrimSpace(device.Hostname), targetIP), openPorts); ok {
+		device.Metadata["panelLink"] = panelLink
+		device.Metadata["panelLinkSource"] = source
 	}
 
 	switch {
@@ -328,6 +333,9 @@ func (r *Refresher) refreshNetworkNode(ctx context.Context, node store.NetworkNo
 	original := node
 	targetIP := strings.TrimSpace(node.ManagementIP)
 	macResolved := false
+	if node.Metadata == nil {
+		node.Metadata = map[string]string{}
+	}
 
 	if targetIP == "" {
 		node.Status = "unknown"
@@ -341,6 +349,7 @@ func (r *Refresher) refreshNetworkNode(ctx context.Context, node store.NetworkNo
 	if !pingOK {
 		tcpOpen, tcpRefused, openPorts = probeTCPPorts(targetIP, candidatePortsForNode(node))
 	}
+	openPorts = mergeOpenPorts(openPorts, probeSelectedPorts(targetIP, 443, 80))
 	hasARP := false
 
 	if pingOK || tcpOpen {
@@ -360,10 +369,11 @@ func (r *Refresher) refreshNetworkNode(ctx context.Context, node store.NetworkNo
 	}
 
 	if len(openPorts) > 0 {
-		if node.Metadata == nil {
-			node.Metadata = map[string]string{}
-		}
 		node.Metadata["lastReachablePorts"] = strings.Join(openPorts, ",")
+	}
+	if panelLink, source, ok := derivePanelLink(node.Metadata, targetIP, openPorts); ok {
+		node.Metadata["panelLink"] = panelLink
+		node.Metadata["panelLinkSource"] = source
 	}
 
 	switch {
@@ -533,7 +543,7 @@ func candidatePorts(device store.Device) []int {
 		}
 	}
 
-	add(22, 80, 443, 445)
+	add(443, 80, 22, 445)
 
 	deviceType := strings.ToLower(device.DeviceType)
 	role := strings.ToLower(device.Role)
@@ -568,7 +578,7 @@ func candidatePortsForNode(node store.NetworkNode) []int {
 		}
 	}
 
-	add(22, 80, 443, 53, 161)
+	add(443, 80, 22, 53, 161)
 
 	nodeType := strings.ToLower(node.NodeType)
 	if strings.Contains(nodeType, "switch") {
@@ -601,4 +611,88 @@ func probeTCPPorts(ipAddress string, ports []int) (bool, bool, []string) {
 	}
 
 	return false, false, nil
+}
+
+func probeSelectedPorts(ipAddress string, ports ...int) []string {
+	var openPorts []string
+	for _, port := range ports {
+		address := net.JoinHostPort(ipAddress, strconv.Itoa(port))
+		conn, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			openPorts = append(openPorts, strconv.Itoa(port))
+		}
+	}
+
+	return openPorts
+}
+
+func mergeOpenPorts(base []string, extras []string) []string {
+	if len(extras) == 0 {
+		return base
+	}
+
+	seen := make(map[string]bool, len(base)+len(extras))
+	merged := make([]string, 0, len(base)+len(extras))
+	for _, value := range base {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		merged = append(merged, value)
+	}
+	for _, value := range extras {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		merged = append(merged, value)
+	}
+
+	return merged
+}
+
+func derivePanelLink(metadata map[string]string, host string, openPorts []string) (string, string, bool) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", "", false
+	}
+
+	existing := strings.TrimSpace(metadata["panelLink"])
+	source := strings.TrimSpace(metadata["panelLinkSource"])
+	if existing != "" && source != "auto" {
+		return "", "", false
+	}
+
+	has443 := false
+	has80 := false
+	for _, port := range openPorts {
+		switch strings.TrimSpace(port) {
+		case "443":
+			has443 = true
+		case "80":
+			has80 = true
+		}
+	}
+
+	switch {
+	case has443:
+		return "https://" + host, "auto", true
+	case has80:
+		return "http://" + host, "auto", true
+	case existing != "" && source == "auto":
+		return "", "", true
+	default:
+		return "", "", false
+	}
+}
+
+func coalesce(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+
+	return ""
 }

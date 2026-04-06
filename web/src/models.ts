@@ -84,6 +84,7 @@ export type DeviceDraft = {
   deviceType: string
   ipAddress: string
   macAddress: string
+  panelLink: string
   networkSegment: string
   tags: string[]
 }
@@ -94,6 +95,7 @@ export type NetworkNodeDraft = {
   managementIp: string
   vendor: string
   model: string
+  panelLink: string
 }
 
 export type NetworkSegmentDraft = {
@@ -116,6 +118,33 @@ export type ToastState = {
   message: string
 } | null
 
+export type DiscoveryCapabilities = {
+  nmapAvailable: boolean
+  nmapPath?: string
+  localCidrs: string[]
+  suggestedCidrs: string[]
+}
+
+export type DiscoveryHostMatch = {
+  ipAddress: string
+  hostname?: string
+  macAddress?: string
+  vendor?: string
+}
+
+export type DiscoverySegmentCandidate = {
+  cidr: string
+  name: string
+}
+
+export type DiscoveryScanResult = {
+  provider: string
+  cidr: string
+  scannedCidrs: string[]
+  hosts: DiscoveryHostMatch[]
+  segmentCandidates: DiscoverySegmentCandidate[]
+}
+
 export const initialDeviceDraft: DeviceDraft = {
   name: '',
   hostname: '',
@@ -123,6 +152,7 @@ export const initialDeviceDraft: DeviceDraft = {
   deviceType: '',
   ipAddress: '',
   macAddress: '',
+  panelLink: '',
   networkSegment: '',
   tags: [],
 }
@@ -139,6 +169,7 @@ export const initialNetworkNodeDraft: NetworkNodeDraft = {
   managementIp: '',
   vendor: '',
   model: '',
+  panelLink: '',
 }
 
 export const initialNetworkSegmentDraft: NetworkSegmentDraft = {

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/PhantoNull/home-mesh/internal/actions"
 	"github.com/PhantoNull/home-mesh/internal/config"
+	"github.com/PhantoNull/home-mesh/internal/discovery"
 	"github.com/PhantoNull/home-mesh/internal/monitor"
 	"github.com/PhantoNull/home-mesh/internal/secrets"
 	"github.com/PhantoNull/home-mesh/internal/sshclient"
@@ -56,7 +58,24 @@ type terminalServerMessage struct {
 	Data string `json:"data,omitempty"`
 }
 
-func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
+type discoveryScanPayload struct {
+	CIDR string `json:"cidr"`
+}
+
+type discoveryScanResponse struct {
+	Provider          string                      `json:"provider"`
+	CIDR              string                      `json:"cidr"`
+	ScannedCIDRs      []string                    `json:"scannedCidrs"`
+	Hosts             []discovery.HostMatch       `json:"hosts"`
+	SegmentCandidates []discoverySegmentCandidate `json:"segmentCandidates,omitempty"`
+}
+
+type discoverySegmentCandidate struct {
+	CIDR string `json:"cidr"`
+	Name string `json:"name"`
+}
+
+func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, discoveryService *discovery.Service, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
 	mux := http.NewServeMux()
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
@@ -120,6 +139,51 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodDelete)
 		}
+	})
+
+	mux.HandleFunc("/api/discovery/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, discoveryService.Capabilities())
+	})
+
+	mux.HandleFunc("/api/discovery/scan", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+
+		var payload discoveryScanPayload
+		if err := decodeJSON(r, &payload); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid discovery payload"})
+			return
+		}
+		result, err := discoveryService.ScanCIDR(r.Context(), payload.CIDR)
+		if errors.Is(err, discovery.ErrNmapUnavailable) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "nmap is not available in the current runtime"})
+			return
+		}
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+
+		filteredHosts, segmentCandidates, err := filterDiscoveryResults(r.Context(), inventory, result)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to compare discovery results with inventory"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, discoveryScanResponse{
+			Provider:          result.Provider,
+			CIDR:              result.CIDR,
+			ScannedCIDRs:      result.ScannedCIDRs,
+			Hosts:             filteredHosts,
+			SegmentCandidates: segmentCandidates,
+		})
 	})
 
 	mux.HandleFunc("/api/devices/refresh", func(w http.ResponseWriter, r *http.Request) {
@@ -989,4 +1053,62 @@ func joinMethods(methods []string) string {
 	}
 
 	return result
+}
+
+func filterDiscoveryResults(ctx context.Context, inventory *store.Store, result discovery.ScanResult) ([]discovery.HostMatch, []discoverySegmentCandidate, error) {
+	devices, err := inventory.ListDevices(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	nodes, err := inventory.ListNetworkNodes(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	segments, err := inventory.ListNetworkSegments(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	knownIPs := map[string]bool{}
+	knownMACs := map[string]bool{}
+	for _, device := range devices {
+		knownIPs[strings.TrimSpace(device.IPAddress)] = true
+		knownMACs[strings.ToUpper(strings.TrimSpace(device.MACAddress))] = true
+	}
+	for _, node := range nodes {
+		knownIPs[strings.TrimSpace(node.ManagementIP)] = true
+		knownMACs[strings.ToUpper(strings.TrimSpace(node.MACAddress))] = true
+	}
+
+	filteredHosts := make([]discovery.HostMatch, 0, len(result.Hosts))
+	for _, host := range result.Hosts {
+		ip := strings.TrimSpace(host.IPAddress)
+		mac := strings.ToUpper(strings.TrimSpace(host.MACAddress))
+		if knownIPs[ip] {
+			continue
+		}
+		if mac != "" && knownMACs[mac] {
+			continue
+		}
+		filteredHosts = append(filteredHosts, host)
+	}
+
+	knownCIDRs := map[string]bool{}
+	for _, segment := range segments {
+		knownCIDRs[strings.TrimSpace(segment.CIDR)] = true
+	}
+
+	segmentCandidates := make([]discoverySegmentCandidate, 0, len(result.ScannedCIDRs))
+	for _, cidr := range result.ScannedCIDRs {
+		trimmed := strings.TrimSpace(cidr)
+		if trimmed == "" || knownCIDRs[trimmed] {
+			continue
+		}
+		segmentCandidates = append(segmentCandidates, discoverySegmentCandidate{
+			CIDR: trimmed,
+			Name: "Discovered " + trimmed,
+		})
+	}
+
+	return filteredHosts, segmentCandidates, nil
 }

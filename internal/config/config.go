@@ -7,6 +7,7 @@ type Config struct {
 	AppName                string
 	Env                    string
 	DBPath                 string
+	NmapPath               string
 	MasterKeyBase          string
 	SSHHostKeyMode         string
 	KnownHostsPath         string
@@ -21,6 +22,7 @@ func Load() Config {
 		AppName:                getEnv("HOME_MESH_APP_NAME", "home-mesh"),
 		Env:                    getEnv("HOME_MESH_ENV", "development"),
 		DBPath:                 getEnv("HOME_MESH_DB_PATH", "data/home-mesh.db"),
+		NmapPath:               getEnv("HOME_MESH_NMAP_PATH", defaultNmapPath()),
 		MasterKeyBase:          getEnv("HOME_MESH_MASTER_KEY", ""),
 		SSHHostKeyMode:         getEnv("HOME_MESH_SSH_HOST_KEY_MODE", defaultSSHHostKeyMode()),
 		KnownHostsPath:         getEnv("HOME_MESH_SSH_KNOWN_HOSTS_PATH", defaultKnownHostsPath()),
@@ -28,6 +30,14 @@ func Load() Config {
 		BootstrapAdminUsername: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_USERNAME", "root"),
 		BootstrapAdminPassword: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD", ""),
 	}
+}
+
+func defaultNmapPath() string {
+	if os.PathSeparator == '\\' {
+		return "nmap.exe"
+	}
+
+	return "nmap"
 }
 
 func defaultSSHHostKeyMode() string {
