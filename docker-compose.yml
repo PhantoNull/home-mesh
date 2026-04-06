@@ -1,0 +1,22 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    network_mode: host
+    environment:
+      HOME_MESH_HTTP_ADDR: ":8080"
+      HOME_MESH_DB_PATH: /data/home-mesh.db
+      HOME_MESH_MASTER_KEY: "${HOME_MESH_MASTER_KEY}"
+      HOME_MESH_SSH_HOST_KEY_MODE: "${HOME_MESH_SSH_HOST_KEY_MODE:-insecure}"
+    volumes:
+      - ./data:/data
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    depends_on:
+      - api
+    ports:
+      - "${HOME_MESH_WEB_PORT:-3000}:80"
