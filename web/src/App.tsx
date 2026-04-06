@@ -81,7 +81,7 @@ type EndpointListProps = {
   devices: Device[]
   actionState: Record<string, string>
   sshConfigured: Record<string, boolean>
-  isRefreshing: boolean
+  refreshingItems: Record<string, boolean>
   onEdit: (device: Device) => void
   onOpenSSH: (device: Device) => Promise<void>
   onWake: (device: Device) => Promise<void>
@@ -136,6 +136,20 @@ function mergeRuntimeStatuses(snapshot: InventorySnapshot, previous: InventorySn
       ...node,
       status: nodeStatusByID.get(node.id) ?? node.status,
     })),
+  }
+}
+
+function updateDeviceInSnapshot(snapshot: InventorySnapshot, device: Device): InventorySnapshot {
+  return {
+    ...snapshot,
+    devices: snapshot.devices.map((current) => (current.id === device.id ? device : current)),
+  }
+}
+
+function updateNetworkNodeInSnapshot(snapshot: InventorySnapshot, node: NetworkNode): InventorySnapshot {
+  return {
+    ...snapshot,
+    networkNodes: snapshot.networkNodes.map((current) => (current.id === node.id ? node : current)),
   }
 }
 
@@ -665,7 +679,7 @@ function SSHTerminalPane({ deviceId, enabled, sessionKey, onConnectionState, onR
   )
 }
 
-function EndpointList({ devices, actionState, sshConfigured, isRefreshing, onEdit, onOpenSSH, onWake, onDelete, onReorder }: EndpointListProps) {
+function EndpointList({ devices, actionState, sshConfigured, refreshingItems, onEdit, onOpenSSH, onWake, onDelete, onReorder }: EndpointListProps) {
   const [previewDevices, setPreviewDevices] = useState<Device[]>(devices ?? [])
   const dragDeviceIdRef = useRef<string | null>(null)
 
@@ -741,7 +755,7 @@ function EndpointList({ devices, actionState, sshConfigured, isRefreshing, onEdi
                   >
                     {actionState[device.id] === 'deleting' ? '...' : 'X'}
                   </button>
-                  {isRefreshing ? <span className="refresh-spinner" aria-label="Refreshing" title="Refreshing" /> : null}
+                  {refreshingItems[device.id] ? <span className="refresh-spinner" aria-label="Refreshing" title="Refreshing" /> : null}
                   <span className={`status-pill status-pill--${device.status}`}>{device.status}</span>
                 </div>
               </div>
@@ -803,14 +817,14 @@ function InfrastructureList({
   onEdit,
   onDelete,
   actionState,
-  isRefreshing,
+  refreshingItems,
   onReorder,
 }: {
   nodes: NetworkNode[]
   onEdit: (node: NetworkNode) => void
   onDelete: (node: NetworkNode) => Promise<void>
   actionState: Record<string, string>
-  isRefreshing: boolean
+  refreshingItems: Record<string, boolean>
   onReorder: (items: NetworkNode[], fromId: string, toId: string) => Promise<void>
 }) {
   const [previewNodes, setPreviewNodes] = useState<NetworkNode[]>(nodes ?? [])
@@ -881,7 +895,7 @@ function InfrastructureList({
                 >
                   {actionState[node.id] === 'deleting' ? '...' : 'X'}
                 </button>
-                {isRefreshing ? <span className="refresh-spinner" aria-label="Refreshing" title="Refreshing" /> : null}
+                {refreshingItems[node.id] ? <span className="refresh-spinner" aria-label="Refreshing" title="Refreshing" /> : null}
                 <span className={`status-pill status-pill--${node.status}`}>{node.status}</span>
               </div>
             </div>
@@ -1230,6 +1244,7 @@ function ActionList({ actions }: { actions: Action[] }) {
 
 export default function App() {
   const [state, setState] = useState<LoadState>({ kind: 'loading' })
+  const stateRef = useRef<LoadState>({ kind: 'loading' })
   const [actionState, setActionState] = useState<Record<string, string>>({})
   const [sshConfigured, setSSHConfigured] = useState<Record<string, boolean>>({})
   const [inventoryLayoutMode, setInventoryLayoutMode] = useState<'columns' | 'tabs'>('columns')
@@ -1258,8 +1273,14 @@ export default function App() {
   const [toast, setToast] = useState<ToastState>(null)
   const [refreshMode, setRefreshMode] = useState<'idle' | 'running'>('idle')
   const [isRefreshing, setIsRefreshing] = useState(false)
+  const [refreshingItems, setRefreshingItems] = useState<Record<string, boolean>>({})
   const [actionsState, setActionsState] = useState<'idle' | 'clearing'>('idle')
   const [isActionHistoryOpen, setIsActionHistoryOpen] = useState(false)
+  const refreshInFlightRef = useRef(false)
+
+  useEffect(() => {
+    stateRef.current = state
+  }, [state])
 
   useEffect(() => {
     if (!toast) {
@@ -1275,11 +1296,30 @@ export default function App() {
       return
     }
 
-    const interval = window.setInterval(() => {
-      void refreshDevices(false)
-    }, 3000)
+    let cancelled = false
+    let timeoutId: number | null = null
 
-    return () => window.clearInterval(interval)
+    const runLoop = async () => {
+      while (!cancelled) {
+        await refreshDevices(false)
+        if (cancelled) {
+          return
+        }
+
+        await new Promise<void>((resolve) => {
+          timeoutId = window.setTimeout(() => resolve(), 3000)
+        })
+      }
+    }
+
+    void runLoop()
+
+    return () => {
+      cancelled = true
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId)
+      }
+    }
   }, [refreshMode])
 
   async function loadInventory() {
@@ -1377,29 +1417,88 @@ export default function App() {
   }
 
   async function refreshDevices(showSuccessToast: boolean) {
-    setIsRefreshing(true)
-    try {
-      const response = await fetch('/api/devices/refresh', { method: 'POST' })
-      if (!response.ok) {
-        const payload = (await response.json()) as { error?: string }
-        throw new Error(payload.error ?? `Refresh failed with status ${response.status}`)
-      }
-      const payload = (await response.json()) as { snapshot?: InventorySnapshot }
-      if (!payload.snapshot) {
-        throw new Error('Refresh response did not include a snapshot')
-      }
+    if (refreshInFlightRef.current) {
+      return
+    }
+    const currentState = stateRef.current
+    if (currentState.kind !== 'ready') {
+      return
+    }
 
-      setState({ kind: 'ready', data: payload.snapshot })
+    refreshInFlightRef.current = true
+    const deviceIDs = currentState.data.devices.map((device) => device.id)
+    const nodeIDs = currentState.data.networkNodes.map((node) => node.id)
+    const itemIDs = [...deviceIDs, ...nodeIDs]
+
+    setIsRefreshing(true)
+    setRefreshingItems(Object.fromEntries(itemIDs.map((id) => [id, true])))
+
+    let failed = false
+
+    try {
+      const requests = [
+        ...currentState.data.devices.map(async (device) => {
+          try {
+            const response = await fetch(`/api/devices/${device.id}/refresh`, { method: 'POST' })
+            if (!response.ok) {
+              const payload = (await response.json()) as { error?: string }
+              throw new Error(payload.error ?? `Refresh failed with status ${response.status}`)
+            }
+
+            const refreshed = (await response.json()) as Device
+            setState((current) =>
+              current.kind === 'ready'
+                ? { kind: 'ready', data: updateDeviceInSnapshot(current.data, refreshed) }
+                : current,
+            )
+          } catch {
+            failed = true
+          } finally {
+            setRefreshingItems((current) => {
+              const next = { ...current }
+              delete next[device.id]
+              return next
+            })
+          }
+        }),
+        ...currentState.data.networkNodes.map(async (node) => {
+          try {
+            const response = await fetch(`/api/network-nodes/${node.id}/refresh`, { method: 'POST' })
+            if (!response.ok) {
+              const payload = (await response.json()) as { error?: string }
+              throw new Error(payload.error ?? `Refresh failed with status ${response.status}`)
+            }
+
+            const refreshed = (await response.json()) as NetworkNode
+            setState((current) =>
+              current.kind === 'ready'
+                ? { kind: 'ready', data: updateNetworkNodeInSnapshot(current.data, refreshed) }
+                : current,
+            )
+          } catch {
+            failed = true
+          } finally {
+            setRefreshingItems((current) => {
+              const next = { ...current }
+              delete next[node.id]
+              return next
+            })
+          }
+        }),
+      ]
+
+      await Promise.all(requests)
+
       if (showSuccessToast) {
-        setToast({ kind: 'success', message: 'Live status refresh completed.' })
+        setToast({
+          kind: failed ? 'error' : 'success',
+          message: failed ? 'Live refresh completed with some failed probes.' : 'Live status refresh completed.',
+        })
       }
-    } catch (error) {
-      setToast({
-        kind: 'error',
-        message: error instanceof Error ? error.message : 'Live status refresh failed',
-      })
     } finally {
+      refreshInFlightRef.current = false
       setIsRefreshing(false)
+      setRefreshingItems({})
     }
   }
 
@@ -1937,8 +2036,8 @@ export default function App() {
         <section className="toolbar-panel">
           <div className="toolbar-panel__row">
             <div className="toolbar-panel__group">
-              <button type="button" className="action-button" onClick={() => void refreshDevices(true)}>
-                Refresh now
+              <button type="button" className="action-button" onClick={() => void refreshDevices(true)} disabled={isRefreshing}>
+                {isRefreshing ? 'Refreshing...' : 'Refresh now'}
               </button>
               <button
                 type="button"
@@ -1955,7 +2054,7 @@ export default function App() {
             </div>
           </div>
           <span className="toolbar-panel__hint">
-            Auto refresh updates status for devices and network nodes, refreshes device IP addresses from DNS, and resolves MAC addresses when possible every 3 seconds.
+            Auto refresh starts the next cycle 3 seconds after the previous sync finishes, updates devices and network nodes progressively, refreshes device IP addresses from DNS, and resolves MAC addresses when possible.
           </span>
         </section>
 
@@ -2030,7 +2129,7 @@ export default function App() {
               devices={state.data.devices}
               actionState={actionState}
               sshConfigured={sshConfigured}
-              isRefreshing={isRefreshing}
+              refreshingItems={refreshingItems}
               onEdit={openEditDeviceModal}
               onOpenSSH={openSSHModal}
               onWake={triggerWake}
@@ -2056,7 +2155,7 @@ export default function App() {
               onEdit={openEditNodeModal}
               onDelete={deleteNode}
               actionState={actionState}
-              isRefreshing={isRefreshing}
+              refreshingItems={refreshingItems}
               onReorder={reorderNodes}
             />
           </article>

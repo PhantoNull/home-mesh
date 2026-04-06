@@ -215,6 +215,20 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			methodNotAllowed(w, http.MethodGet, http.MethodPut, http.MethodDelete)
 		}
 	})
+	mux.HandleFunc("/api/devices/{id}/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+
+		id := r.PathValue("id")
+		device, err := refresher.RefreshDeviceSnapshotByID(r.Context(), id)
+		if handleStoreError(w, err, "failed to refresh device") {
+			return
+		}
+
+		writeJSON(w, http.StatusOK, device)
+	})
 	mux.HandleFunc("/api/devices/{id}/wake", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -676,6 +690,20 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodPut, http.MethodDelete)
 		}
+	})
+	mux.HandleFunc("/api/network-nodes/{id}/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+
+		id := r.PathValue("id")
+		node, err := refresher.RefreshNetworkNodeSnapshotByID(r.Context(), id)
+		if handleStoreError(w, err, "failed to refresh network node") {
+			return
+		}
+
+		writeJSON(w, http.StatusOK, node)
 	})
 
 	mux.HandleFunc("/api/network-segments", func(w http.ResponseWriter, r *http.Request) {

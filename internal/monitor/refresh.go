@@ -227,6 +227,34 @@ func (r *Refresher) RefreshDeviceByID(ctx context.Context, id string) error {
 	return err
 }
 
+func (r *Refresher) RefreshDeviceSnapshotByID(ctx context.Context, id string) (store.Device, error) {
+	device, err := r.store.GetDevice(ctx, id)
+	if err != nil {
+		return store.Device{}, err
+	}
+
+	refreshed, _, _, _, err := r.refreshDevice(ctx, device)
+	if err != nil {
+		return store.Device{}, err
+	}
+
+	return refreshed, nil
+}
+
+func (r *Refresher) RefreshNetworkNodeSnapshotByID(ctx context.Context, id string) (store.NetworkNode, error) {
+	node, err := r.store.GetNetworkNode(ctx, id)
+	if err != nil {
+		return store.NetworkNode{}, err
+	}
+
+	refreshed, _, _, _, err := r.refreshNetworkNode(ctx, node)
+	if err != nil {
+		return store.NetworkNode{}, err
+	}
+
+	return refreshed, nil
+}
+
 func (r *Refresher) refreshDevice(ctx context.Context, device store.Device) (store.Device, bool, string, bool, error) {
 	original := device
 	targetIP := strings.TrimSpace(device.IPAddress)
