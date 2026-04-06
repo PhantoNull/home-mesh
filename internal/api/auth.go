@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -37,56 +36,78 @@ const (
 )
 
 type loginAttemptRecord struct {
-	failures  int
-	windowEnd time.Time
+	attempts []time.Time
 }
 
 type loginRateLimiter struct {
-	mu       sync.Mutex
-	attempts map[string]*loginAttemptRecord
+	mu          sync.Mutex
+	attempts    map[string]*loginAttemptRecord
+	maxAttempts int
+	window      time.Duration
+	now         func() time.Time
 }
 
 func newLoginRateLimiter() *loginRateLimiter {
-	return &loginRateLimiter{attempts: make(map[string]*loginAttemptRecord)}
+	return &loginRateLimiter{
+		attempts:    make(map[string]*loginAttemptRecord),
+		maxAttempts: loginMaxAttempts,
+		window:      loginWindowPeriod,
+		now:         time.Now,
+	}
 }
 
 func (l *loginRateLimiter) allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	record, exists := l.attempts[ip]
-	if !exists {
+	record, ok := l.pruneLocked(ip, l.now())
+	if !ok {
 		return true
 	}
 
-	if time.Now().After(record.windowEnd) {
-		delete(l.attempts, ip)
-		return true
-	}
-
-	return record.failures < loginMaxAttempts
+	return len(record.attempts) < l.maxAttempts
 }
 
 func (l *loginRateLimiter) recordFailure(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	record, exists := l.attempts[ip]
-	if !exists || time.Now().After(record.windowEnd) {
-		l.attempts[ip] = &loginAttemptRecord{
-			failures:  1,
-			windowEnd: time.Now().Add(loginWindowPeriod),
-		}
-		return
+	now := l.now()
+	record, ok := l.pruneLocked(ip, now)
+	if !ok {
+		record = &loginAttemptRecord{}
+		l.attempts[ip] = record
 	}
 
-	record.failures++
+	record.attempts = append(record.attempts, now)
 }
 
 func (l *loginRateLimiter) reset(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.attempts, ip)
+}
+
+func (l *loginRateLimiter) pruneLocked(ip string, now time.Time) (*loginAttemptRecord, bool) {
+	record, ok := l.attempts[ip]
+	if !ok {
+		return nil, false
+	}
+
+	cutoff := now.Add(-l.window)
+	kept := record.attempts[:0]
+	for _, attempt := range record.attempts {
+		if attempt.After(cutoff) {
+			kept = append(kept, attempt)
+		}
+	}
+	record.attempts = kept
+	if len(record.attempts) == 0 {
+		delete(l.attempts, ip)
+		return nil, false
+	}
+
+	return record, true
 }
 
 type loginPayload struct {
@@ -341,14 +362,6 @@ func hashPassword(password string) (string, error) {
 		base64.RawStdEncoding.EncodeToString(salt),
 		base64.RawStdEncoding.EncodeToString(hash),
 	}, "$"), nil
-}
-
-func extractClientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 func verifyPassword(password string, encoded string) bool {

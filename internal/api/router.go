@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -932,11 +933,11 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin != "" && isSameOrigin(r.Host, origin) {
+		if origin != "" && isSameOrigin(effectiveRequestHost(r), origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-			w.Header().Set("Vary", "Origin")
+			w.Header().Add("Vary", "Origin")
 		}
 
 		if r.Method == http.MethodOptions {
@@ -953,15 +954,29 @@ func isSameOrigin(host string, origin string) bool {
 		return false
 	}
 
-	originHost := origin
-	for _, scheme := range []string{"https://", "http://"} {
-		if strings.HasPrefix(originHost, scheme) {
-			originHost = originHost[len(scheme):]
-			break
-		}
+	parsedOrigin, err := url.Parse(origin)
+	if err != nil || parsedOrigin.Host == "" {
+		return false
 	}
 
-	return strings.EqualFold(originHost, host)
+	requestHost, requestPort, ok := splitHostPort(host)
+	if !ok {
+		return false
+	}
+
+	originHost, originPort, ok := splitHostPort(parsedOrigin.Host)
+	if !ok {
+		return false
+	}
+
+	if requestPort == "" {
+		requestPort = defaultOriginPort(parsedOrigin.Scheme)
+	}
+	if originPort == "" {
+		originPort = defaultOriginPort(parsedOrigin.Scheme)
+	}
+
+	return strings.EqualFold(requestHost, originHost) && requestPort == originPort
 }
 
 func checkWebSocketOrigin(r *http.Request) bool {
@@ -969,7 +984,46 @@ func checkWebSocketOrigin(r *http.Request) bool {
 	if origin == "" {
 		return true
 	}
-	return isSameOrigin(r.Host, origin)
+	return isSameOrigin(effectiveRequestHost(r), origin)
+}
+
+func splitHostPort(hostport string) (string, string, bool) {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return "", "", false
+	}
+
+	if host, port, err := net.SplitHostPort(hostport); err == nil {
+		return normalizeHost(host), port, true
+	}
+	if ip := net.ParseIP(hostport); ip != nil {
+		return ip.String(), "", true
+	}
+	if strings.Contains(hostport, ":") {
+		return "", "", false
+	}
+
+	return normalizeHost(hostport), "", true
+}
+
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+func defaultOriginPort(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
