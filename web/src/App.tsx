@@ -39,7 +39,6 @@ type DeviceFormProps = {
   onChange: (field: Exclude<keyof DeviceDraft, 'tags'>, value: string) => void
   onToggleTag: (tag: string) => void
   onSubmit: () => Promise<void>
-  onCancel: () => void
 }
 
 type NetworkNodeFormProps = {
@@ -49,7 +48,6 @@ type NetworkNodeFormProps = {
   submitLabel: string
   onChange: (field: keyof NetworkNodeDraft, value: string) => void
   onSubmit: () => Promise<void>
-  onCancel: () => void
 }
 
 type NetworkSegmentFormProps = {
@@ -59,7 +57,6 @@ type NetworkSegmentFormProps = {
   submitLabel: string
   onChange: (field: keyof NetworkSegmentDraft, value: string) => void
   onSubmit: () => Promise<void>
-  onCancel: () => void
 }
 
 type SSHCredentialFormProps = {
@@ -371,7 +368,7 @@ function CollapsibleSection({ label, title, defaultCollapsed = false, children }
   )
 }
 
-function DeviceForm({ draft, submitState, errorMessage, submitLabel, onChange, onToggleTag, onSubmit, onCancel }: DeviceFormProps) {
+function DeviceForm({ draft, submitState, errorMessage, submitLabel, onChange, onToggleTag, onSubmit }: DeviceFormProps) {
   return (
     <form
       className="device-form"
@@ -437,9 +434,6 @@ function DeviceForm({ draft, submitState, errorMessage, submitLabel, onChange, o
       </div>
       <div className="form-note">MAC address can be entered manually. Panel link can be set manually and is auto-populated from HTTPS or HTTP when a management panel is detected.</div>
       <div className="form-actions">
-        <button type="button" className="secondary-button" onClick={onCancel}>
-          Cancel
-        </button>
         <button type="submit" className="action-button" disabled={submitState === 'saving'}>
           {submitState === 'saving' ? 'Saving...' : submitLabel}
         </button>
@@ -448,7 +442,7 @@ function DeviceForm({ draft, submitState, errorMessage, submitLabel, onChange, o
   )
 }
 
-function NetworkNodeForm({ draft, submitState, errorMessage, submitLabel, onChange, onSubmit, onCancel }: NetworkNodeFormProps) {
+function NetworkNodeForm({ draft, submitState, errorMessage, submitLabel, onChange, onSubmit }: NetworkNodeFormProps) {
   return (
     <form
       className="device-form"
@@ -493,9 +487,6 @@ function NetworkNodeForm({ draft, submitState, errorMessage, submitLabel, onChan
         </label>
       </div>
       <div className="form-actions">
-        <button type="button" className="secondary-button" onClick={onCancel}>
-          Cancel
-        </button>
         <button type="submit" className="action-button" disabled={submitState === 'saving'}>
           {submitState === 'saving' ? 'Saving...' : submitLabel}
         </button>
@@ -504,7 +495,7 @@ function NetworkNodeForm({ draft, submitState, errorMessage, submitLabel, onChan
   )
 }
 
-function NetworkSegmentForm({ draft, submitState, errorMessage, submitLabel, onChange, onSubmit, onCancel }: NetworkSegmentFormProps) {
+function NetworkSegmentForm({ draft, submitState, errorMessage, submitLabel, onChange, onSubmit }: NetworkSegmentFormProps) {
   return (
     <form
       className="device-form"
@@ -542,9 +533,6 @@ function NetworkSegmentForm({ draft, submitState, errorMessage, submitLabel, onC
         </label>
       </div>
       <div className="form-actions">
-        <button type="button" className="secondary-button" onClick={onCancel}>
-          Cancel
-        </button>
         <button type="submit" className="action-button" disabled={submitState === 'saving'}>
           {submitState === 'saving' ? 'Saving...' : submitLabel}
         </button>
@@ -2701,11 +2689,6 @@ export default function App() {
               }))
             }
             onSubmit={saveDevice}
-            onCancel={() => {
-              setModalError(null)
-              setIsCreateDeviceOpen(false)
-              setEditingDeviceId(null)
-            }}
           />
         </DraggableModal>
       ) : null}
@@ -2727,11 +2710,6 @@ export default function App() {
             submitLabel={editingNodeId ? 'Save node' : 'Create node'}
             onChange={(field, value) => setNodeDraft((current) => ({ ...current, [field]: value }))}
             onSubmit={saveNode}
-            onCancel={() => {
-              setModalError(null)
-              setIsNodeModalOpen(false)
-              setEditingNodeId(null)
-            }}
           />
         </DraggableModal>
       ) : null}
@@ -2753,11 +2731,6 @@ export default function App() {
             submitLabel={editingSegmentId ? 'Save segment' : 'Create segment'}
             onChange={(field, value) => setSegmentDraft((current) => ({ ...current, [field]: value }))}
             onSubmit={saveSegment}
-            onCancel={() => {
-              setModalError(null)
-              setIsSegmentModalOpen(false)
-              setEditingSegmentId(null)
-            }}
           />
         </DraggableModal>
       ) : null}
@@ -2872,54 +2845,59 @@ export default function App() {
       ) : null}
 
       {isDiscoveryOpen ? (
-        <DraggableModal label="Discovery" title="Scan network" widthClassName="modal-panel--wide" onClose={() => setIsDiscoveryOpen(false)}>
-          <div className="device-form">
-            {discoveryError ? <div className="inline-error">{discoveryError}</div> : null}
-            <div className="form-grid">
-              <label className="form-field">
-                <span>Provider</span>
-                <input value={discoveryCapabilities?.nmapAvailable ? 'nmap' : 'Unavailable'} readOnly />
-              </label>
-              <label className="form-field">
-                <span>Custom CIDR override</span>
-                <input
-                  list="discovery-cidrs"
-                  value={discoveryCIDR}
-                  onChange={(event) => setDiscoveryCIDR(event.target.value)}
-                  placeholder="Leave empty to scan local networks automatically"
+        <DraggableModal label="Discovery" title="Scan network" widthClassName="modal-panel--wide modal-panel--discovery" onClose={() => setIsDiscoveryOpen(false)}>
+          <div className="discovery-modal">
+            <div className="discovery-modal__controls">
+              <div className="device-form">
+                {discoveryError ? <div className="inline-error">{discoveryError}</div> : null}
+                <div className="form-grid">
+                  <label className="form-field">
+                    <span>Provider</span>
+                    <input value={discoveryCapabilities?.nmapAvailable ? 'nmap' : 'Unavailable'} readOnly />
+                  </label>
+                  <label className="form-field">
+                    <span>Custom CIDR override</span>
+                    <input
+                      list="discovery-cidrs"
+                      value={discoveryCIDR}
+                      onChange={(event) => setDiscoveryCIDR(event.target.value)}
+                      placeholder="Leave empty to scan local networks automatically"
+                    />
+                    <datalist id="discovery-cidrs">
+                      {(discoveryCapabilities?.suggestedCidrs ?? discoveryCapabilities?.localCidrs ?? []).map((cidr) => (
+                        <option key={cidr} value={cidr} />
+                      ))}
+                    </datalist>
+                  </label>
+                </div>
+                <div className="form-note">
+                  By default, Home Mesh scans the local networks detected on the host. Provide a custom CIDR only if you want to override that target. Results exclude devices, network nodes, and network segments already present in the inventory.
+                </div>
+                <div className="form-actions">
+                  <button
+                    type="button"
+                    className="action-button"
+                    onClick={() => void scanNetwork()}
+                    disabled={discoveryState === 'loading' || !discoveryCapabilities?.nmapAvailable}
+                  >
+                    {discoveryState === 'loading' ? 'Scanning...' : 'Run scan'}
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div className="discovery-modal__results">
+              {discoveryResult ? (
+                <DiscoveryResults
+                  result={discoveryResult}
+                  onCreateDevice={openCreateDeviceFromDiscovery}
+                  onCreateNode={openCreateNodeFromDiscovery}
+                  onCreateSegment={openCreateSegmentFromDiscovery}
                 />
-                <datalist id="discovery-cidrs">
-                  {(discoveryCapabilities?.suggestedCidrs ?? discoveryCapabilities?.localCidrs ?? []).map((cidr) => (
-                    <option key={cidr} value={cidr} />
-                  ))}
-                </datalist>
-              </label>
-            </div>
-            <div className="form-note">
-              By default, Home Mesh scans the local networks detected on the host. Provide a custom CIDR only if you want to override that target. Results exclude devices, network nodes, and network segments already present in the inventory.
-            </div>
-            <div className="form-actions">
-              <button type="button" className="secondary-button" onClick={() => setIsDiscoveryOpen(false)}>
-                Close
-              </button>
-              <button
-                type="button"
-                className="action-button"
-                onClick={() => void scanNetwork()}
-                disabled={discoveryState === 'loading' || !discoveryCapabilities?.nmapAvailable}
-              >
-                {discoveryState === 'loading' ? 'Scanning...' : 'Run scan'}
-              </button>
+              ) : (
+                <div className="empty-state">Empty</div>
+              )}
             </div>
           </div>
-          {discoveryResult ? (
-            <DiscoveryResults
-              result={discoveryResult}
-              onCreateDevice={openCreateDeviceFromDiscovery}
-              onCreateNode={openCreateNodeFromDiscovery}
-              onCreateSegment={openCreateSegmentFromDiscovery}
-            />
-          ) : null}
         </DraggableModal>
       ) : null}
 
