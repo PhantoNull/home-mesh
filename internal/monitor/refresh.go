@@ -15,6 +15,11 @@ import (
 	"github.com/PhantoNull/home-mesh/internal/store"
 )
 
+var (
+	macAddressColonRegex = regexp.MustCompile(`([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}`)
+	macAddressDashRegex  = regexp.MustCompile(`([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}`)
+)
+
 type RefreshSummary struct {
 	Checked     int `json:"checked"`
 	Updated     int `json:"updated"`
@@ -506,8 +511,7 @@ func lookupMAC(ipAddress string) (string, error) {
 			return "", err
 		}
 
-		re := regexp.MustCompile(`([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}`)
-		match := re.FindString(string(output))
+		match := macAddressDashRegex.FindString(string(output))
 		if match == "" {
 			return "", fmt.Errorf("no mac address found")
 		}
@@ -520,8 +524,7 @@ func lookupMAC(ipAddress string) (string, error) {
 		return "", err
 	}
 
-	re := regexp.MustCompile(`([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}`)
-	match := re.FindString(string(output))
+	match := macAddressColonRegex.FindString(string(output))
 	if match == "" {
 		return "", fmt.Errorf("no mac address found")
 	}

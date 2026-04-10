@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PhantoNull/home-mesh/internal/config"
@@ -26,6 +27,87 @@ type authManager struct {
 	enabled       bool
 	account       store.AdminAccount
 	sessionSecret []byte
+	loginLimiter  *loginRateLimiter
+}
+
+const (
+	loginMaxAttempts  = 5
+	loginWindowPeriod = 15 * time.Minute
+)
+
+type loginAttemptRecord struct {
+	attempts []time.Time
+}
+
+type loginRateLimiter struct {
+	mu          sync.Mutex
+	attempts    map[string]*loginAttemptRecord
+	maxAttempts int
+	window      time.Duration
+	now         func() time.Time
+}
+
+func newLoginRateLimiter() *loginRateLimiter {
+	return &loginRateLimiter{
+		attempts:    make(map[string]*loginAttemptRecord),
+		maxAttempts: loginMaxAttempts,
+		window:      loginWindowPeriod,
+		now:         time.Now,
+	}
+}
+
+func (l *loginRateLimiter) allow(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	record, ok := l.pruneLocked(ip, l.now())
+	if !ok {
+		return true
+	}
+
+	return len(record.attempts) < l.maxAttempts
+}
+
+func (l *loginRateLimiter) recordFailure(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := l.now()
+	record, ok := l.pruneLocked(ip, now)
+	if !ok {
+		record = &loginAttemptRecord{}
+		l.attempts[ip] = record
+	}
+
+	record.attempts = append(record.attempts, now)
+}
+
+func (l *loginRateLimiter) reset(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.attempts, ip)
+}
+
+func (l *loginRateLimiter) pruneLocked(ip string, now time.Time) (*loginAttemptRecord, bool) {
+	record, ok := l.attempts[ip]
+	if !ok {
+		return nil, false
+	}
+
+	cutoff := now.Add(-l.window)
+	kept := record.attempts[:0]
+	for _, attempt := range record.attempts {
+		if attempt.After(cutoff) {
+			kept = append(kept, attempt)
+		}
+	}
+	record.attempts = kept
+	if len(record.attempts) == 0 {
+		delete(l.attempts, ip)
+		return nil, false
+	}
+
+	return record, true
 }
 
 type loginPayload struct {
@@ -76,6 +158,7 @@ func newAuthManager(cfg config.Config, inventory *store.Store) (*authManager, er
 		enabled:       true,
 		account:       account,
 		sessionSecret: []byte(sessionSecret),
+		loginLimiter:  newLoginRateLimiter(),
 	}, nil
 }
 
@@ -114,6 +197,12 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientIP := extractClientIP(r)
+	if !a.loginLimiter.allow(clientIP) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many login attempts, try again later"})
+		return
+	}
+
 	var payload loginPayload
 	if err := decodeJSON(r, &payload); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid login payload"})
@@ -122,9 +211,12 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(payload.Username)), []byte(a.account.Username)) != 1 ||
 		!verifyPassword(payload.Password, a.account.PasswordHash) {
+		a.loginLimiter.recordFailure(clientIP)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 		return
 	}
+
+	a.loginLimiter.reset(clientIP)
 
 	cookieValue, expiresAt, err := a.newSessionValue(a.account.Username)
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -78,7 +79,7 @@ type discoverySegmentCandidate struct {
 func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, discoveryService *discovery.Service, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
 	mux := http.NewServeMux()
 	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		CheckOrigin: checkWebSocketOrigin,
 	}
 	auth, err := newAuthManager(cfg, inventory)
 	if err != nil {
@@ -931,9 +932,13 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		origin := r.Header.Get("Origin")
+		if origin != "" && isSameOrigin(effectiveRequestHost(r), origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Add("Vary", "Origin")
+		}
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -942,6 +947,83 @@ func withCORS(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isSameOrigin(host string, origin string) bool {
+	if host == "" || origin == "" {
+		return false
+	}
+
+	parsedOrigin, err := url.Parse(origin)
+	if err != nil || parsedOrigin.Host == "" {
+		return false
+	}
+
+	requestHost, requestPort, ok := splitHostPort(host)
+	if !ok {
+		return false
+	}
+
+	originHost, originPort, ok := splitHostPort(parsedOrigin.Host)
+	if !ok {
+		return false
+	}
+
+	if requestPort == "" {
+		requestPort = defaultOriginPort(parsedOrigin.Scheme)
+	}
+	if originPort == "" {
+		originPort = defaultOriginPort(parsedOrigin.Scheme)
+	}
+
+	return strings.EqualFold(requestHost, originHost) && requestPort == originPort
+}
+
+func checkWebSocketOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	return isSameOrigin(effectiveRequestHost(r), origin)
+}
+
+func splitHostPort(hostport string) (string, string, bool) {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return "", "", false
+	}
+
+	if host, port, err := net.SplitHostPort(hostport); err == nil {
+		return normalizeHost(host), port, true
+	}
+	if ip := net.ParseIP(hostport); ip != nil {
+		return ip.String(), "", true
+	}
+	if strings.Contains(hostport, ":") {
+		return "", "", false
+	}
+
+	return normalizeHost(hostport), "", true
+}
+
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+func defaultOriginPort(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
