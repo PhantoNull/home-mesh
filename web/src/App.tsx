@@ -1474,7 +1474,7 @@ export default function App() {
   const [loginDraft, setLoginDraft] = useState({ username: '', password: '' })
   const [loginSubmitState, setLoginSubmitState] = useState<'idle' | 'submitting'>('idle')
   const [loginError, setLoginError] = useState<string | null>(null)
-  const [refreshMode, setRefreshMode] = useState<'idle' | 'running'>('idle')
+  const [sseStatus, setSseStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting')
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [refreshingItems, setRefreshingItems] = useState<Record<string, boolean>>({})
   const [actionsState, setActionsState] = useState<'idle' | 'clearing'>('idle')
@@ -1485,7 +1485,6 @@ export default function App() {
   const [discoveryState, setDiscoveryState] = useState<'idle' | 'loading'>('idle')
   const [discoveryError, setDiscoveryError] = useState<string | null>(null)
   const [discoveryResult, setDiscoveryResult] = useState<DiscoveryScanResult | null>(null)
-  const refreshInFlightRef = useRef(false)
 
   useEffect(() => {
     stateRef.current = state
@@ -1511,35 +1510,71 @@ export default function App() {
   }, [toast])
 
   useEffect(() => {
-    if (refreshMode !== 'running' || authState !== 'authenticated') {
+    if (authState !== 'authenticated') {
       return
     }
 
-    let cancelled = false
-    let timeoutId: number | null = null
+    setSseStatus('connecting')
+    const source = new EventSource('/api/events')
 
-    const runLoop = async () => {
-      while (!cancelled) {
-        await refreshDevices(false)
-        if (cancelled) {
-          return
+    source.addEventListener('open', () => setSseStatus('connected'))
+    source.addEventListener('error', () => setSseStatus('disconnected'))
+
+    source.addEventListener('scan', (e: MessageEvent<string>) => {
+      let event: { kind: string; data: unknown }
+
+      try {
+        event = JSON.parse(e.data) as { kind: string; data: unknown }
+      } catch (error) {
+        console.error('Failed to parse scan event payload', error, e.data)
+        return
+      }
+
+      switch (event.kind) {
+        case 'scan-started': {
+          const payload = event.data as { deviceIds: string[]; nodeIds: string[] }
+          const ids = [...(payload.deviceIds ?? []), ...(payload.nodeIds ?? [])]
+          setIsRefreshing(true)
+          setRefreshingItems(Object.fromEntries(ids.map((id) => [id, true])))
+          break
         }
-
-        await new Promise<void>((resolve) => {
-          timeoutId = window.setTimeout(() => resolve(), 3000)
-        })
+        case 'device-updated': {
+          const device = event.data as Device
+          setState((current) =>
+            current.kind === 'ready'
+              ? { kind: 'ready', data: updateDeviceInSnapshot(current.data, device) }
+              : current,
+          )
+          setRefreshingItems((current) => {
+            const next = { ...current }
+            delete next[device.id]
+            return next
+          })
+          break
+        }
+        case 'node-updated': {
+          const node = event.data as NetworkNode
+          setState((current) =>
+            current.kind === 'ready'
+              ? { kind: 'ready', data: updateNetworkNodeInSnapshot(current.data, node) }
+              : current,
+          )
+          setRefreshingItems((current) => {
+            const next = { ...current }
+            delete next[node.id]
+            return next
+          })
+          break
+        }
+        case 'scan-complete':
+          setIsRefreshing(false)
+          setRefreshingItems({})
+          break
       }
-    }
+    })
 
-    void runLoop()
-
-    return () => {
-      cancelled = true
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId)
-      }
-    }
-  }, [refreshMode, authState])
+    return () => source.close()
+  }, [authState])
 
   async function loadInventory() {
     try {
@@ -1650,7 +1685,6 @@ export default function App() {
       setAuthState('unauthenticated')
       setAuthUsername('')
       setLoginDraft({ username: '', password: '' })
-      setRefreshMode('idle')
       setToast({ kind: 'success', message: 'Signed out.' })
     }
   }
@@ -1691,10 +1725,7 @@ export default function App() {
       return
     }
 
-    void (async () => {
-      await loadInventory()
-      await refreshDevices(false)
-    })()
+    void loadInventory()
   }, [authState])
 
   async function persistDeviceOrder(items: Device[]) {
@@ -1748,38 +1779,27 @@ export default function App() {
     }
   }
 
-  async function refreshDevices(showSuccessToast: boolean) {
+  async function refreshDevices() {
     if (authState !== 'authenticated') {
       return
     }
-    if (refreshInFlightRef.current) {
-      return
-    }
     const currentState = stateRef.current
-    if (currentState.kind !== 'ready') {
+    if (currentState.kind !== 'ready' || isRefreshing) {
       return
     }
 
-    refreshInFlightRef.current = true
     const deviceIDs = currentState.data.devices.map((device) => device.id)
     const nodeIDs = currentState.data.networkNodes.map((node) => node.id)
-    const itemIDs = [...deviceIDs, ...nodeIDs]
-
     setIsRefreshing(true)
-    setRefreshingItems(Object.fromEntries(itemIDs.map((id) => [id, true])))
+    setRefreshingItems(Object.fromEntries([...deviceIDs, ...nodeIDs].map((id) => [id, true])))
 
     let failed = false
-
     try {
-      const requests = [
+      await Promise.all([
         ...currentState.data.devices.map(async (device) => {
           try {
             const response = await authFetch(`/api/devices/${device.id}/refresh`, { method: 'POST' })
-            if (!response.ok) {
-              const payload = (await response.json()) as { error?: string }
-              throw new Error(payload.error ?? `Refresh failed with status ${response.status}`)
-            }
-
+            if (!response.ok) throw new Error(`status ${response.status}`)
             const refreshed = (await response.json()) as Device
             setState((current) =>
               current.kind === 'ready'
@@ -1789,21 +1809,13 @@ export default function App() {
           } catch {
             failed = true
           } finally {
-            setRefreshingItems((current) => {
-              const next = { ...current }
-              delete next[device.id]
-              return next
-            })
+            setRefreshingItems((current) => { const next = { ...current }; delete next[device.id]; return next })
           }
         }),
         ...currentState.data.networkNodes.map(async (node) => {
           try {
             const response = await authFetch(`/api/network-nodes/${node.id}/refresh`, { method: 'POST' })
-            if (!response.ok) {
-              const payload = (await response.json()) as { error?: string }
-              throw new Error(payload.error ?? `Refresh failed with status ${response.status}`)
-            }
-
+            if (!response.ok) throw new Error(`status ${response.status}`)
             const refreshed = (await response.json()) as NetworkNode
             setState((current) =>
               current.kind === 'ready'
@@ -1813,25 +1825,15 @@ export default function App() {
           } catch {
             failed = true
           } finally {
-            setRefreshingItems((current) => {
-              const next = { ...current }
-              delete next[node.id]
-              return next
-            })
+            setRefreshingItems((current) => { const next = { ...current }; delete next[node.id]; return next })
           }
         }),
-      ]
-
-      await Promise.all(requests)
-
-      if (showSuccessToast) {
-        setToast({
-          kind: failed ? 'error' : 'success',
-          message: failed ? 'Live refresh completed with some failed probes.' : 'Live status refresh completed.',
-        })
-      }
+      ])
+      setToast({
+        kind: failed ? 'error' : 'success',
+        message: failed ? 'Refresh completed with some failed probes.' : 'Live status refresh completed.',
+      })
     } finally {
-      refreshInFlightRef.current = false
       setIsRefreshing(false)
       setRefreshingItems({})
     }
@@ -2449,19 +2451,15 @@ export default function App() {
         <section className="toolbar-panel">
           <div className="toolbar-panel__row">
             <div className="toolbar-panel__group">
-              <button type="button" className="action-button" onClick={() => void refreshDevices(true)} disabled={isRefreshing}>
+              <button type="button" className="action-button" onClick={() => void refreshDevices()} disabled={isRefreshing}>
                 {isRefreshing ? 'Refreshing...' : 'Refresh now'}
               </button>
               <button type="button" className="action-button" onClick={() => void openDiscoveryModal()}>
                 Scan Network
               </button>
-              <button
-                type="button"
-                className={refreshMode === 'running' ? 'secondary-button secondary-button--active' : 'secondary-button'}
-                onClick={() => setRefreshMode((current) => (current === 'running' ? 'idle' : 'running'))}
-              >
-                {refreshMode === 'running' ? 'Auto refresh: on' : 'Auto refresh: off'}
-              </button>
+              <span className={`secondary-button secondary-button--active secondary-button--status secondary-button--status-${sseStatus}`} aria-live="polite">
+                {sseStatus === 'connected' ? 'Live: on' : sseStatus === 'connecting' ? 'Connecting…' : 'Live: off'}
+              </span>
             </div>
             <div className="toolbar-panel__group toolbar-panel__group--right">
               <button type="button" className="action-button" onClick={() => setIsActionHistoryOpen(true)}>
@@ -2470,7 +2468,7 @@ export default function App() {
             </div>
           </div>
           <span className="toolbar-panel__hint">
-            Auto refresh starts the next cycle 3 seconds after the previous sync finishes, updates devices and network nodes progressively, refreshes device IP addresses from DNS, and resolves MAC addresses when possible.
+            Live refresh is server-driven. The server scans all devices on a background timer and pushes updates instantly via a persistent connection.
           </span>
         </section>
 

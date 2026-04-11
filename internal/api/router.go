@@ -27,6 +27,7 @@ type healthResponse struct {
 	Status    string `json:"status"`
 	Timestamp string `json:"timestamp"`
 	Env       string `json:"env"`
+	NmapAvail bool   `json:"nmapAvailable"`
 }
 
 type sshCredentialPayload struct {
@@ -76,7 +77,7 @@ type discoverySegmentCandidate struct {
 	Name string `json:"name"`
 }
 
-func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, discoveryService *discovery.Service, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
+func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService *discovery.Service, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
 	mux := http.NewServeMux()
 	upgrader := websocket.Upgrader{
 		CheckOrigin: checkWebSocketOrigin,
@@ -96,8 +97,11 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			Status:    "ok",
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 			Env:       cfg.Env,
+			NmapAvail: refresher.UsingNmap(),
 		})
 	})
+
+	mux.HandleFunc("/api/events", handleSSE(bus))
 
 	mux.HandleFunc("/api/inventory", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

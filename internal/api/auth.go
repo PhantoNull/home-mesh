@@ -33,39 +33,53 @@ type authManager struct {
 const (
 	loginMaxAttempts  = 5
 	loginWindowPeriod = 15 * time.Minute
+	maxLoginTrackIPs  = 1024
 )
 
 type loginAttemptRecord struct {
-	attempts []time.Time
+	failures  int
+	windowEnd time.Time
 }
 
 type loginRateLimiter struct {
-	mu          sync.Mutex
-	attempts    map[string]*loginAttemptRecord
-	maxAttempts int
-	window      time.Duration
-	now         func() time.Time
+	mu       sync.Mutex
+	attempts map[string]*loginAttemptRecord
+	now      func() time.Time
 }
 
 func newLoginRateLimiter() *loginRateLimiter {
 	return &loginRateLimiter{
-		attempts:    make(map[string]*loginAttemptRecord),
-		maxAttempts: loginMaxAttempts,
-		window:      loginWindowPeriod,
-		now:         time.Now,
+		attempts: make(map[string]*loginAttemptRecord),
+		now:      time.Now,
 	}
 }
 
-func (l *loginRateLimiter) allow(ip string) bool {
+func (l *loginRateLimiter) allow(ip string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	record, ok := l.pruneLocked(ip, l.now())
-	if !ok {
-		return true
+	now := l.now()
+	l.pruneExpiredLocked(now)
+	record, exists := l.attempts[ip]
+	if !exists {
+		return true, 0
 	}
 
-	return len(record.attempts) < l.maxAttempts
+	if now.After(record.windowEnd) {
+		delete(l.attempts, ip)
+		return true, 0
+	}
+
+	if record.failures < loginMaxAttempts {
+		return true, 0
+	}
+
+	retryAfter := record.windowEnd.Sub(now)
+	if retryAfter < time.Second {
+		retryAfter = time.Second
+	}
+
+	return false, retryAfter
 }
 
 func (l *loginRateLimiter) recordFailure(ip string) {
@@ -73,13 +87,20 @@ func (l *loginRateLimiter) recordFailure(ip string) {
 	defer l.mu.Unlock()
 
 	now := l.now()
-	record, ok := l.pruneLocked(ip, now)
-	if !ok {
-		record = &loginAttemptRecord{}
-		l.attempts[ip] = record
+	l.pruneExpiredLocked(now)
+	record, exists := l.attempts[ip]
+	if !exists || now.After(record.windowEnd) {
+		if len(l.attempts) >= maxLoginTrackIPs {
+			l.evictOldestLocked()
+		}
+		l.attempts[ip] = &loginAttemptRecord{
+			failures:  1,
+			windowEnd: now.Add(loginWindowPeriod),
+		}
+		return
 	}
 
-	record.attempts = append(record.attempts, now)
+	record.failures++
 }
 
 func (l *loginRateLimiter) reset(ip string) {
@@ -88,26 +109,31 @@ func (l *loginRateLimiter) reset(ip string) {
 	delete(l.attempts, ip)
 }
 
-func (l *loginRateLimiter) pruneLocked(ip string, now time.Time) (*loginAttemptRecord, bool) {
-	record, ok := l.attempts[ip]
-	if !ok {
-		return nil, false
-	}
-
-	cutoff := now.Add(-l.window)
-	kept := record.attempts[:0]
-	for _, attempt := range record.attempts {
-		if attempt.After(cutoff) {
-			kept = append(kept, attempt)
+func (l *loginRateLimiter) pruneExpiredLocked(now time.Time) {
+	for ip, record := range l.attempts {
+		if now.After(record.windowEnd) {
+			delete(l.attempts, ip)
 		}
 	}
-	record.attempts = kept
-	if len(record.attempts) == 0 {
-		delete(l.attempts, ip)
-		return nil, false
-	}
+}
 
-	return record, true
+func (l *loginRateLimiter) evictOldestLocked() {
+	var (
+		oldestIP  string
+		oldestSet bool
+		oldestEnd time.Time
+	)
+
+	for ip, record := range l.attempts {
+		if !oldestSet || record.windowEnd.Before(oldestEnd) {
+			oldestIP = ip
+			oldestEnd = record.windowEnd
+			oldestSet = true
+		}
+	}
+	if oldestSet {
+		delete(l.attempts, oldestIP)
+	}
 }
 
 type loginPayload struct {
@@ -198,8 +224,13 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	clientIP := extractClientIP(r)
-	if !a.loginLimiter.allow(clientIP) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many login attempts, try again later"})
+	if allowed, retryAfter := a.loginLimiter.allow(clientIP); !allowed {
+		retryAfterSeconds := int(retryAfter.Round(time.Second) / time.Second)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error":               "too many login attempts, try again later",
+			"retry_after_seconds": retryAfterSeconds,
+		})
 		return
 	}
 
