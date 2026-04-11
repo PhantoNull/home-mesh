@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"os/exec"
 	"regexp"
@@ -57,6 +58,8 @@ func (r *Refresher) UsingNmap() bool { return r.nmapPath != "" }
 // RunBackground starts a scan loop that runs until ctx is cancelled.
 // Each iteration performs a full batch scan and publishes events.
 func (r *Refresher) RunBackground(ctx context.Context, interval time.Duration) {
+	log.Printf("background refresh loop started: interval=%s nmap_enabled=%t", interval, r.nmapPath != "")
+
 	// Immediate first scan.
 	r.scanAndPublish(ctx)
 
@@ -76,12 +79,16 @@ func (r *Refresher) RunBackground(ctx context.Context, interval time.Duration) {
 func (r *Refresher) scanAndPublish(ctx context.Context) {
 	devices, err := r.store.ListDevices(ctx)
 	if err != nil {
+		log.Printf("background refresh: list devices failed: %v", err)
 		return
 	}
 	nodes, err := r.store.ListNetworkNodes(ctx)
 	if err != nil {
+		log.Printf("background refresh: list network nodes failed: %v", err)
 		return
 	}
+
+	log.Printf("background refresh: started devices=%d nodes=%d nmap_enabled=%t", len(devices), len(nodes), r.nmapPath != "")
 
 	// Build the started event payload.
 	deviceIDs := make([]string, len(devices))
@@ -105,8 +112,10 @@ func (r *Refresher) scanAndPublish(ctx context.Context) {
 		var nmapErr error
 		updatedDevices, updatedNodes, summary, nmapErr = r.batchScanWithNmap(ctx, devices, nodes)
 		if nmapErr != nil {
+			log.Printf("background refresh: nmap batch scan failed, falling back to legacy refresh: %v", nmapErr)
 			result, err := r.RefreshAll(ctx)
 			if err != nil {
+				log.Printf("background refresh: fallback refresh failed: %v", err)
 				return
 			}
 			updatedDevices = result.Devices
@@ -114,7 +123,11 @@ func (r *Refresher) scanAndPublish(ctx context.Context) {
 			summary = result.Summary
 		}
 	} else {
-		result, _ := r.RefreshAll(ctx)
+		result, err := r.RefreshAll(ctx)
+		if err != nil {
+			log.Printf("background refresh: refresh failed: %v", err)
+			return
+		}
 		updatedDevices = result.Devices
 		updatedNodes = result.NetworkNodes
 		summary = result.Summary
@@ -134,6 +147,15 @@ func (r *Refresher) scanAndPublish(ctx context.Context) {
 		"offline":  summary.Offline,
 		"nmapUsed": r.nmapPath != "",
 	})
+	log.Printf(
+		"background refresh: completed checked=%d updated=%d online=%d degraded=%d offline=%d nmap_used=%t",
+		summary.Checked,
+		summary.Updated,
+		summary.Online,
+		summary.Degraded,
+		summary.Offline,
+		r.nmapPath != "",
+	)
 }
 
 // batchScanWithNmap runs one nmap process over all known IPs and maps results

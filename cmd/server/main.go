@@ -59,6 +59,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	log.Printf("background refresh configured: interval=%s nmap_enabled=%t", cfg.ScanInterval, refresher.UsingNmap())
 	go refresher.RunBackground(ctx, cfg.ScanInterval)
 
 	go func() {
