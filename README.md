@@ -13,6 +13,10 @@ It is designed to discover, map, and manage:
 
 The goal is to provide a lightweight control surface that can manage heterogeneous devices and infrastructure, while being able to run on a thin client, Raspberry Pi, mini PC, or another always-on node near the network edge.
 
+It is built for the awkward middle ground between "just SSH into it" and "deploy a full enterprise stack": a small, opinionated dashboard that can inventory your network, run a few useful actions, and stay close to the edge where the network actually lives.
+
+The deployment model is intentionally portable. Docker is the easiest path, but the backend and frontend can also be run natively without assuming a Windows-only or PowerShell-only environment.
+
 ## What It Does
 
 Current MVP capabilities include:
@@ -20,9 +24,9 @@ Current MVP capabilities include:
 - support for heterogeneous managed targets, not just one class of device
 - inventory CRUD for devices, network nodes, and network segments
 - topology relations and a visual topology graph
-- global live refresh for device and network-node status
-- sequential browser-driven auto-refresh without overlapping cycles
-- progressive per-item refresh updates in the UI
+- backend-driven live refresh for devices and network nodes
+- SSE-based progressive UI updates pushed from the backend
+- batch `nmap`-powered background scanning when available, with fallback probing logic
 - DNS-to-IP refresh when a hostname is configured
 - best-effort MAC address resolution
 - manual MAC address entry for devices
@@ -40,7 +44,8 @@ The project is split into two main parts:
 - Go backend
   - REST API
   - SQLite persistence
-  - refresh/probing logic
+  - background refresh and probing logic
+  - SSE event stream for live updates
   - Wake-on-LAN
   - encrypted secrets
   - SSH execution and terminal sessions
@@ -48,6 +53,7 @@ The project is split into two main parts:
   - inventory dashboard
   - topology graph
   - CRUD popups
+  - server-driven live state updates
   - SSH modal and terminal UI
 
 ## Repository Structure
@@ -78,6 +84,7 @@ The project is split into two main parts:
 - TypeScript
 - Vite
 - SQLite
+- Server-Sent Events (SSE)
 - Docker Compose
 - Nginx for frontend container serving/proxying
 
@@ -99,6 +106,7 @@ Required values:
 - `HOME_MESH_MASTER_KEY`
 - `HOME_MESH_SESSION_SECRET`
 - `HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD`
+- optionally `HOME_MESH_SCAN_INTERVAL`
 - optionally `HOME_MESH_SSH_HOST_KEY_MODE`
 - optionally `HOME_MESH_NMAP_PATH`
 - optionally `HOME_MESH_WEB_PORT`
@@ -112,11 +120,20 @@ HOME_MESH_BOOTSTRAP_ADMIN_USERNAME=root
 HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password-for-first-start-only
 HOME_MESH_SSH_HOST_KEY_MODE=insecure
 HOME_MESH_NMAP_PATH=nmap
+HOME_MESH_SCAN_INTERVAL=30s
 HOME_MESH_API_PORT=8080
 HOME_MESH_WEB_PORT=3000
 ```
 
-To generate a local master key in PowerShell:
+To generate a local master key:
+
+Unix-like shells:
+
+```sh
+openssl rand -base64 32
+```
+
+PowerShell:
 
 ```powershell
 [Convert]::ToBase64String((1..32 | ForEach-Object { [byte](Get-Random -Maximum 256) }))
@@ -124,7 +141,7 @@ To generate a local master key in PowerShell:
 
 ### Run Backend Natively
 
-```powershell
+```sh
 go run ./cmd/server
 ```
 
@@ -134,7 +151,7 @@ The backend listens on:
 
 ### Run Frontend Natively
 
-```powershell
+```sh
 cd web
 npm install
 npm run dev
@@ -144,19 +161,19 @@ The frontend dev server runs on:
 
 - `http://localhost:5173`
 
-The Vite dev server proxies `/api` to the backend.
+The Vite dev server proxies `/api` to the backend, including SSE and SSH terminal websocket traffic.
 
 ### Build Checks
 
 Backend:
 
-```powershell
+```sh
 go build ./cmd/server
 ```
 
 Frontend:
 
-```powershell
+```sh
 cd web
 npm run build
 ```
@@ -169,16 +186,17 @@ Current Docker layout:
 
 - `api`
   - Go backend
-  - currently configured with `network_mode: host`
-  - this is useful for LAN operations such as Wake-on-LAN and reachability checks
-  - includes `nmap` in the container image for optional discovery scans
+  - configured with `network_mode: host`
+  - this is useful for LAN operations such as Wake-on-LAN, ARP, and reachability checks
+  - includes `nmap` in the container image for discovery and background scans
 - `web`
   - frontend served by Nginx
   - proxies `/api` to the backend via `host.docker.internal:8080`
+  - forwards websocket and forwarded-host headers required by the SSH terminal and stricter origin checks
 
 Start the stack:
 
-```powershell
+```sh
 docker compose up -d --build
 ```
 
@@ -189,7 +207,7 @@ Open:
 
 Stop the stack:
 
-```powershell
+```sh
 docker compose down
 ```
 
@@ -221,6 +239,7 @@ Behavior:
 - the frontend shows a login form before loading the dashboard
 - successful login creates an `HttpOnly` session cookie
 - session lifetime is 1 hour
+- failed login attempts are rate-limited per client IP
 
 This protection applies server-side, so direct requests to the backend API are also blocked without a valid session.
 
@@ -246,21 +265,31 @@ SQLite data is stored in:
 
 That directory should be treated as local state, not source code.
 
-### Optional `nmap` Discovery
+### Discovery And Background Scanning
 
-Home Mesh can use `nmap` as an optional LAN discovery provider.
+Home Mesh uses two closely related scan paths:
+
+- manual discovery via:
+  - `GET /api/discovery/capabilities`
+  - `POST /api/discovery/scan`
+- backend-scheduled refresh loops that update known devices and network nodes and push changes to the UI over SSE
 
 Current shape:
 
 - Docker Compose API image includes `nmap`
-- native non-Docker runs require you to install `nmap` separately if you want to use it
-- the backend exposes:
-  - `GET /api/discovery/capabilities`
-  - `POST /api/discovery/scan`
+- native non-Docker runs require `nmap` to be installed separately if you want discovery or faster batch scans
+- the backend falls back to legacy probing when `nmap` is unavailable
+- the background scan interval is controlled by `HOME_MESH_SCAN_INTERVAL`
 
 You can override the binary path with:
 
 - `HOME_MESH_NMAP_PATH`
+
+### Live Refresh
+
+Live refresh is server-driven.
+
+The backend runs a background scan loop, stores changes in SQLite, and publishes progressive updates over `/api/events`. The frontend subscribes once and updates the dashboard in place without browser polling.
 
 ## Deployment
 
@@ -313,14 +342,25 @@ This is especially attractive when:
 - you want better low-level LAN visibility
 - you want a smaller operational footprint
 
+## Contributing
+
+Home Mesh is being prepared for a cleaner open-source workflow.
+
+Working expectations for contributions:
+
+- changes should land through pull requests
+- `main` should stay mergeable and deployable
+- backend and frontend changes should be validated before merge
+- changes touching auth, proxying, SSH, discovery, or Docker should get especially careful review
+
 ## Known Current Limitations
 
 - topology discovery is still mostly manual
 - MAC address resolution is best-effort and depends on network visibility
 - Wake-on-LAN reliability depends on deployment/network environment
-- scheduled refresh is still browser-driven, not backend-scheduled
+- background scanning currently focuses on known devices and nodes, not full autonomous topology discovery
 - floorplans and physical placement are not implemented yet
-- application auth exists, but deeper hardening is still limited
+- authentication hardening exists, but proxy-trust and edge deployment behavior still deserve careful review
 - router/switch-specific discovery integrations are not implemented yet
 
 ## Project Status
@@ -331,12 +371,14 @@ Core foundations already in place:
 
 - persistent inventory
 - visual dashboard
-- live refresh
+- backend-driven live refresh
 - progressive per-item live updates
 - topology graph
 - Wake-on-LAN
 - SSH credentials and SSH terminal
 - application authentication
+- Docker deployment path
+- basic open-source contribution guardrails
 
 Next large product areas are likely to be:
 
