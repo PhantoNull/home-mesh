@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -45,23 +44,28 @@ type loginAttemptRecord struct {
 type loginRateLimiter struct {
 	mu       sync.Mutex
 	attempts map[string]*loginAttemptRecord
+	now      func() time.Time
 }
 
 func newLoginRateLimiter() *loginRateLimiter {
-	return &loginRateLimiter{attempts: make(map[string]*loginAttemptRecord)}
+	return &loginRateLimiter{
+		attempts: make(map[string]*loginAttemptRecord),
+		now:      time.Now,
+	}
 }
 
 func (l *loginRateLimiter) allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.pruneExpiredLocked(time.Now())
+	now := l.now()
+	l.pruneExpiredLocked(now)
 	record, exists := l.attempts[ip]
 	if !exists {
 		return true
 	}
 
-	if time.Now().After(record.windowEnd) {
+	if now.After(record.windowEnd) {
 		delete(l.attempts, ip)
 		return true
 	}
@@ -73,7 +77,7 @@ func (l *loginRateLimiter) recordFailure(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	now := time.Now()
+	now := l.now()
 	l.pruneExpiredLocked(now)
 	record, exists := l.attempts[ip]
 	if !exists || now.After(record.windowEnd) {
@@ -375,14 +379,6 @@ func hashPassword(password string) (string, error) {
 		base64.RawStdEncoding.EncodeToString(salt),
 		base64.RawStdEncoding.EncodeToString(hash),
 	}, "$"), nil
-}
-
-func extractClientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 func verifyPassword(password string, encoded string) bool {
