@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -41,6 +42,8 @@ func TestHandleLoginRateLimitBlocksSixthFailure(t *testing.T) {
 	t.Parallel()
 
 	auth := newTestAuthManager(t)
+	now := time.Date(2026, 4, 7, 12, 0, 0, 0, time.UTC)
+	auth.loginLimiter.now = func() time.Time { return now }
 
 	for i := 0; i < loginMaxAttempts; i++ {
 		recorder := httptest.NewRecorder()
@@ -54,6 +57,9 @@ func TestHandleLoginRateLimitBlocksSixthFailure(t *testing.T) {
 	auth.handleLogin(recorder, newLoginRequest(t, "admin", "wrong-pass"))
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("got %d want %d", recorder.Code, http.StatusTooManyRequests)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != strconv.Itoa(int(loginWindowPeriod/time.Second)) {
+		t.Fatalf("got Retry-After %q want %q", got, strconv.Itoa(int(loginWindowPeriod/time.Second)))
 	}
 }
 
@@ -116,6 +122,32 @@ func TestHandleLoginWindowExpiryAllowsRetry(t *testing.T) {
 	auth.handleLogin(recorder, newLoginRequest(t, "admin", "wrong-pass"))
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("got %d want %d after expiry", recorder.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestHandleLoginRateLimitRetryAfterTracksRemainingWindow(t *testing.T) {
+	t.Parallel()
+
+	auth := newTestAuthManager(t)
+	now := time.Date(2026, 4, 7, 12, 0, 0, 0, time.UTC)
+	auth.loginLimiter.now = func() time.Time { return now }
+
+	for i := 0; i < loginMaxAttempts; i++ {
+		recorder := httptest.NewRecorder()
+		auth.handleLogin(recorder, newLoginRequest(t, "admin", "wrong-pass"))
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: got %d want %d", i+1, recorder.Code, http.StatusUnauthorized)
+		}
+		now = now.Add(time.Minute)
+	}
+
+	recorder := httptest.NewRecorder()
+	auth.handleLogin(recorder, newLoginRequest(t, "admin", "wrong-pass"))
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("got %d want %d", recorder.Code, http.StatusTooManyRequests)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != strconv.Itoa(int((10*time.Minute)/time.Second)) {
+		t.Fatalf("got Retry-After %q want %q", got, strconv.Itoa(int((10*time.Minute)/time.Second)))
 	}
 }
 

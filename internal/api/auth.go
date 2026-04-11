@@ -54,7 +54,7 @@ func newLoginRateLimiter() *loginRateLimiter {
 	}
 }
 
-func (l *loginRateLimiter) allow(ip string) bool {
+func (l *loginRateLimiter) allow(ip string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -62,15 +62,24 @@ func (l *loginRateLimiter) allow(ip string) bool {
 	l.pruneExpiredLocked(now)
 	record, exists := l.attempts[ip]
 	if !exists {
-		return true
+		return true, 0
 	}
 
 	if now.After(record.windowEnd) {
 		delete(l.attempts, ip)
-		return true
+		return true, 0
 	}
 
-	return record.failures < loginMaxAttempts
+	if record.failures < loginMaxAttempts {
+		return true, 0
+	}
+
+	retryAfter := record.windowEnd.Sub(now)
+	if retryAfter < time.Second {
+		retryAfter = time.Second
+	}
+
+	return false, retryAfter
 }
 
 func (l *loginRateLimiter) recordFailure(ip string) {
@@ -215,8 +224,13 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	clientIP := extractClientIP(r)
-	if !a.loginLimiter.allow(clientIP) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many login attempts, try again later"})
+	if allowed, retryAfter := a.loginLimiter.allow(clientIP); !allowed {
+		retryAfterSeconds := int(retryAfter.Round(time.Second) / time.Second)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error":               "too many login attempts, try again later",
+			"retry_after_seconds": retryAfterSeconds,
+		})
 		return
 	}
 
