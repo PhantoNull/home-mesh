@@ -5,28 +5,67 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   backend:
-    name: Backend Tests
+    name: Backend quality
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
         with:
-          go-version-file: go.mod
+          go-version: "1.25.12"
           cache: true
+          cache-dependency-path: go.sum
 
-      - name: Run Go tests
-        run: go test ./...
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Run tests
+        run: go test -count=1 ./...
+
+      - name: Run race detector
+        run: go test -race -count=1 ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Install pinned analysis tools
+        env:
+          GOBIN: ${{ runner.temp }}/go-tools/bin
+        run: |
+          mkdir -p "$GOBIN"
+          echo "$GOBIN" >> "$GITHUB_PATH"
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Run staticcheck
+        run: staticcheck ./...
+
+      - name: Run gosec
+        run: gosec -exclude-generated ./...
+
+      - name: Run govulncheck
+        run: govulncheck ./...
 
   frontend:
-    name: Frontend Build
+    name: Frontend quality
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     defaults:
       run:
@@ -34,17 +73,80 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
-          node-version: 24
+          node-version: "24.13.1"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --no-fund
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Run tests
+        run: npm test
 
       - name: Build frontend
         run: npm run build
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Run end-to-end tests
+        run: npm run test:e2e
+
+  compose:
+    name: Validate Compose
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HOME_MESH_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      HOME_MESH_SESSION_SECRET: ci-only-session-secret-with-at-least-32-bytes
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+  containers:
+    name: Multiarch image (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            dockerfile: Dockerfile.api
+          - name: web
+            dockerfile: web/Dockerfile
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - name: Build amd64 and arm64 image
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: false
+          outputs: type=oci,dest=${{ runner.temp }}/home-mesh-${{ matrix.name }}.tar
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=multiarch-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=multiarch-${{ matrix.name }}

@@ -144,6 +144,7 @@ func secureDatabaseDirectory(dbPath string) error {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
+	// #nosec G302 -- directories need execute permission; 0700 is owner-only.
 	if err := os.Chmod(directory, 0o700); err != nil {
 		return fmt.Errorf("secure database directory: %w", err)
 	}

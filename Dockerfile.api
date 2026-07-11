@@ -1,25 +1,60 @@
-FROM golang:1.25-alpine AS build
-WORKDIR /app
+# syntax=docker/dockerfile:1.12@sha256:93bfd3b68c109427185cd78b4779fc82b484b0b7618e36d0f104d4d801e66d25
+
+ARG GO_IMAGE=golang:1.25.12-alpine3.23@sha256:cc985ef6f9c3bf9ece7488129c9abe0a150388ccdfa428d886fc709dca0b230a
+ARG RUNTIME_IMAGE=alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
+
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
+WORKDIR /src
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+
+ENV CGO_ENABLED=0
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY cmd ./cmd
 COPY internal ./internal
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/home-mesh-api ./cmd/server
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w -buildid=" -o /out/home-mesh-api ./cmd/server
 
-FROM alpine:3.22
+FROM ${RUNTIME_IMAGE} AS runtime
+
+LABEL org.opencontainers.image.source="https://github.com/PhantoNull/home-mesh" \
+      org.opencontainers.image.title="Home Mesh API"
+
+RUN apk upgrade --no-cache \
+    && find /etc -type f -name '*.apk-new' -delete \
+    && apk add --no-cache \
+        ca-certificates \
+        iputils \
+        net-tools \
+        nmap \
+    && addgroup -S -g 10001 homemesh \
+    && adduser -S -D -H -u 10001 -G homemesh homemesh \
+    && mkdir -p /app /data \
+    && chown homemesh:homemesh /data \
+    && chmod 0700 /data
+
+COPY --from=build --chown=root:root --chmod=0555 /out/home-mesh-api /usr/local/bin/home-mesh-api
+
 WORKDIR /app
-
-RUN apk add --no-cache iputils net-tools nmap
-
-COPY --from=build /out/home-mesh-api /usr/local/bin/home-mesh-api
-
-ENV HOME_MESH_HTTP_ADDR=:8080
-ENV HOME_MESH_DB_PATH=/data/home-mesh.db
+ENV HOME=/tmp \
+    HOME_MESH_HTTP_ADDR=:8080 \
+    HOME_MESH_DB_PATH=/data/home-mesh.db
 
 VOLUME ["/data"]
 EXPOSE 8080
 
-CMD ["home-mesh-api"]
+USER 10001:10001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -q -T 3 -O /dev/null http://127.0.0.1:8080/api/ready || exit 1
+
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/home-mesh-api"]

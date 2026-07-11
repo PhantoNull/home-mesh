@@ -1,0 +1,179 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - go
+          - javascript-typescript
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended,security-and-quality
+
+      - name: Analyze source
+        uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          category: /language:${{ matrix.language }}
+
+  container-security:
+    name: Container security (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            dockerfile: Dockerfile.api
+            image: home-mesh-api:security-scan
+            port: 18080
+            health: /api/ready
+          - name: web
+            dockerfile: web/Dockerfile
+            image: home-mesh-web:security-scan
+            port: 18081
+            health: /healthz
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - name: Build scan image
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          load: true
+          platforms: linux/amd64
+          tags: ${{ matrix.image }}
+          cache-from: type=gha,scope=security-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=security-${{ matrix.name }}
+
+      - name: Verify non-root runtime and health
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.name }}" == "api" ]]; then
+            docker run --detach --rm \
+              --name home-mesh-${{ matrix.name }}-smoke \
+              --read-only \
+              --security-opt no-new-privileges \
+              --tmpfs /tmp:uid=10001,gid=10001,mode=0700 \
+              --publish 127.0.0.1:${{ matrix.port }}:8080 \
+              --env HOME_MESH_AUTH_DISABLED=true \
+              --env HOME_MESH_DB_PATH=/tmp/home-mesh.db \
+              --env HOME_MESH_SESSION_SECRET=ci-only-session-secret-with-at-least-32-bytes \
+              --env HOME_MESH_SSH_KNOWN_HOSTS_PATH=/tmp/known_hosts \
+              --entrypoint /bin/sh \
+              "${{ matrix.image }}" \
+              -c 'touch /tmp/known_hosts && exec /usr/local/bin/home-mesh-api'
+          else
+            docker run --detach --rm \
+              --name home-mesh-${{ matrix.name }}-smoke \
+              --read-only \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --tmpfs /tmp:uid=101,gid=101,mode=1777 \
+              --add-host host.docker.internal:host-gateway \
+              --publish 127.0.0.1:${{ matrix.port }}:8080 \
+              "${{ matrix.image }}"
+          fi
+          trap 'docker rm --force home-mesh-${{ matrix.name }}-smoke >/dev/null 2>&1 || true' EXIT
+
+          healthy=false
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error \
+              "http://127.0.0.1:${{ matrix.port }}${{ matrix.health }}" >/dev/null; then
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$healthy" != "true" ]]; then
+            docker logs home-mesh-${{ matrix.name }}-smoke
+            exit 1
+          fi
+          test "$(docker exec home-mesh-${{ matrix.name }}-smoke id -u)" != "0"
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ matrix.image }}
+          format: spdx-json
+          artifact-name: home-mesh-${{ matrix.name }}-sbom.spdx.json
+          output-file: ${{ runner.temp }}/home-mesh-${{ matrix.name }}-sbom.spdx.json
+          upload-artifact: true
+          upload-artifact-retention: 14
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          scan-type: image
+          image-ref: ${{ matrix.image }}
+          format: sarif
+          output: ${{ runner.temp }}/trivy-${{ matrix.name }}.sarif
+          exit-code: 1
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          timeout: 10m
+
+      - name: Upload Trivy results
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-${{ matrix.name }}.sarif
+          category: trivy-${{ matrix.name }}

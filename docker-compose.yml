@@ -4,6 +4,16 @@ services:
       context: .
       dockerfile: Dockerfile.api
     network_mode: host
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 2.0
     environment:
       HOME_MESH_HTTP_ADDR: ":8080"
       HOME_MESH_DB_PATH: /data/home-mesh.db
@@ -15,23 +25,56 @@ services:
       HOME_MESH_SESSION_DURATION: "${HOME_MESH_SESSION_DURATION:-1h}"
       HOME_MESH_AUTH_DISABLED: "${HOME_MESH_AUTH_DISABLED:-false}"
       HOME_MESH_TRUSTED_PROXY_CIDRS: "${HOME_MESH_TRUSTED_PROXY_CIDRS:-172.16.0.0/12}"
+      HOME_MESH_ALLOWED_HOSTS: "${HOME_MESH_ALLOWED_HOSTS:-}"
       HOME_MESH_BOOTSTRAP_ADMIN_USERNAME: "${HOME_MESH_BOOTSTRAP_ADMIN_USERNAME:-root}"
       HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD: "${HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD:-}"
       HOME_MESH_SSH_HOST_KEY_MODE: "${HOME_MESH_SSH_HOST_KEY_MODE:-known_hosts}"
-      HOME_MESH_SSH_KNOWN_HOSTS_PATH: /data/known_hosts
+      HOME_MESH_SSH_KNOWN_HOSTS_PATH: /etc/home-mesh/known_hosts
       HOME_MESH_NMAP_PATH: "${HOME_MESH_NMAP_PATH:-nmap}"
       HOME_MESH_DISCOVERY_ALLOW_PUBLIC: "${HOME_MESH_DISCOVERY_ALLOW_PUBLIC:-false}"
       HOME_MESH_SCAN_INTERVAL: "${HOME_MESH_SCAN_INTERVAL:-30s}"
     volumes:
-      - ./data:/data
+      - home_mesh_data:/data
+      - "${HOME_MESH_SSH_KNOWN_HOSTS_FILE:-./config/known_hosts}:/etc/home-mesh/known_hosts:ro"
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=0700
+    stop_grace_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
 
   web:
     build:
       context: .
       dockerfile: web/Dockerfile
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+        restart: true
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "${HOME_MESH_WEB_PORT:-3000}:80"
+      - "${HOME_MESH_WEB_BIND:-127.0.0.1}:${HOME_MESH_WEB_PORT:-3000}:8080"
+    tmpfs:
+      - /tmp:uid=101,gid=101,mode=1777
+    stop_grace_period: 15s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  home_mesh_data:
