@@ -588,6 +588,27 @@ func TestDatabasePermissions(t *testing.T) {
 	}
 }
 
+func TestFilesystemDatabasePathHandlesSQLiteURIs(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		path  string
+		ok    bool
+	}{
+		{input: ":memory:"},
+		{input: "file::memory:?cache=shared"},
+		{input: "file:memory-name?mode=memory&cache=shared"},
+		{input: "data/home-mesh.db", path: "data/home-mesh.db", ok: true},
+		{input: "file:data/home%20mesh.db?mode=rwc", path: filepath.FromSlash("data/home mesh.db"), ok: true},
+	} {
+		t.Run(test.input, func(t *testing.T) {
+			path, ok := filesystemDatabasePath(test.input)
+			if path != test.path || ok != test.ok {
+				t.Fatalf("filesystemDatabasePath(%q) = %q, %t", test.input, path, ok)
+			}
+		})
+	}
+}
+
 func openTestStore(t *testing.T, dbPath string, options Options) *Store {
 	t.Helper()
 	store, err := NewWithOptions(dbPath, options)

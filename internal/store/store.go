@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -132,10 +133,11 @@ func (s *Store) configure(ctx context.Context) error {
 }
 
 func secureDatabaseDirectory(dbPath string) error {
-	if !isFilesystemDatabase(dbPath) {
+	databasePath, ok := filesystemDatabasePath(dbPath)
+	if !ok {
 		return nil
 	}
-	directory := filepath.Clean(filepath.Dir(dbPath))
+	directory := filepath.Clean(filepath.Dir(databasePath))
 	if directory == "." || directory == string(os.PathSeparator) || directory == filepath.VolumeName(directory)+string(os.PathSeparator) {
 		return nil
 	}
@@ -149,18 +151,41 @@ func secureDatabaseDirectory(dbPath string) error {
 }
 
 func secureDatabaseFile(dbPath string) error {
-	if !isFilesystemDatabase(dbPath) {
+	databasePath, ok := filesystemDatabasePath(dbPath)
+	if !ok {
 		return nil
 	}
-	if err := os.Chmod(dbPath, 0o600); err != nil {
-		return fmt.Errorf("secure database file: %w", err)
+	for _, path := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		if err := os.Chmod(path, 0o600); err != nil {
+			if errors.Is(err, os.ErrNotExist) && path != databasePath {
+				continue
+			}
+			return fmt.Errorf("secure database file %s: %w", path, err)
+		}
 	}
 	return nil
 }
 
-func isFilesystemDatabase(dbPath string) bool {
+func filesystemDatabasePath(dbPath string) (string, bool) {
 	trimmed := strings.TrimSpace(dbPath)
-	return trimmed != "" && trimmed != ":memory:" && !strings.HasPrefix(strings.ToLower(trimmed), "file:")
+	if trimmed == "" || trimmed == ":memory:" {
+		return "", false
+	}
+	if !strings.HasPrefix(strings.ToLower(trimmed), "file:") {
+		return trimmed, true
+	}
+
+	remainder := trimmed[len("file:"):]
+	pathPart, rawQuery, _ := strings.Cut(remainder, "?")
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil || strings.EqualFold(query.Get("mode"), "memory") || pathPart == "" || pathPart == ":memory:" {
+		return "", false
+	}
+	decoded, err := url.PathUnescape(pathPart)
+	if err != nil || decoded == "" {
+		return "", false
+	}
+	return filepath.FromSlash(decoded), true
 }
 
 func (s *Store) Close() error {
