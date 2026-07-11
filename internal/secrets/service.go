@@ -68,6 +68,9 @@ func (s *Service) Decrypt(ciphertext string, nonce string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("decode nonce: %w", err)
 	}
+	if len(nonceBytes) != chacha20poly1305.NonceSizeX {
+		return "", fmt.Errorf("nonce must decode to %d bytes", chacha20poly1305.NonceSizeX)
+	}
 
 	plaintext, err := aead.Open(nil, nonceBytes, ciphertextBytes, nil)
 	if err != nil {

@@ -3,6 +3,7 @@ package secrets
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -33,5 +34,32 @@ func TestServiceEncryptDecryptRoundTrip(t *testing.T) {
 	}
 	if plaintext != "super-secret" {
 		t.Fatalf("unexpected plaintext %q", plaintext)
+	}
+}
+
+func TestServiceDecryptRejectsInvalidNonceLength(t *testing.T) {
+	t.Parallel()
+
+	key := make([]byte, 32)
+	service, err := New(base64.StdEncoding.EncodeToString(key))
+	if err != nil {
+		t.Fatalf("create service: %v", err)
+	}
+
+	ciphertext := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	shortNonce := base64.StdEncoding.EncodeToString(make([]byte, 1))
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("Decrypt panicked for malformed nonce: %v", recovered)
+		}
+	}()
+
+	_, err = service.Decrypt(ciphertext, shortNonce)
+	if err == nil {
+		t.Fatal("expected malformed nonce to be rejected")
+	}
+	if !strings.Contains(err.Error(), "nonce") {
+		t.Fatalf("expected nonce error, got %v", err)
 	}
 }
