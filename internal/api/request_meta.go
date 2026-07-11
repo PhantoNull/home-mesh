@@ -9,9 +9,10 @@ import (
 
 type requestMetadata struct {
 	trustedProxyCIDRs []netip.Prefix
+	allowedHosts      map[string]struct{}
 }
 
-func newRequestMetadata(cidrs []string) (*requestMetadata, error) {
+func newRequestMetadata(cidrs []string, allowedHostLists ...[]string) (*requestMetadata, error) {
 	trustedProxyCIDRs := make([]netip.Prefix, 0, len(cidrs))
 	for _, value := range cidrs {
 		prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
@@ -21,7 +22,18 @@ func newRequestMetadata(cidrs []string) (*requestMetadata, error) {
 		trustedProxyCIDRs = append(trustedProxyCIDRs, prefix.Masked())
 	}
 
-	return &requestMetadata{trustedProxyCIDRs: trustedProxyCIDRs}, nil
+	allowedHosts := make(map[string]struct{})
+	for _, values := range allowedHostLists {
+		for _, value := range values {
+			host, ok := canonicalAllowedHost(value)
+			if !ok {
+				return nil, fmt.Errorf("invalid HOME_MESH_ALLOWED_HOSTS entry %q", value)
+			}
+			allowedHosts[host] = struct{}{}
+		}
+	}
+
+	return &requestMetadata{trustedProxyCIDRs: trustedProxyCIDRs, allowedHosts: allowedHosts}, nil
 }
 
 func (m *requestMetadata) clientIP(r *http.Request) string {
@@ -82,15 +94,57 @@ func (m *requestMetadata) isSecureRequest(r *http.Request) bool {
 
 func (m *requestMetadata) isTrustedProxy(address netip.Addr) bool {
 	address = address.Unmap()
-	if address.IsLoopback() {
-		return true
-	}
 	for _, prefix := range m.trustedProxyCIDRs {
 		if prefix.Contains(address) {
 			return true
 		}
 	}
 	return false
+}
+
+func (m *requestMetadata) isAllowedHost(hostport string) bool {
+	host, _, ok := splitHostPort(hostport)
+	if !ok {
+		return false
+	}
+	if address, err := netip.ParseAddr(host); err == nil && address.IsValid() {
+		return true
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "localhost" {
+		return true
+	}
+	_, allowed := m.allowedHosts[host]
+	return allowed
+}
+
+func canonicalAllowedHost(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "/?#@") {
+		return "", false
+	}
+	host, _, ok := splitHostPort(value)
+	if !ok {
+		return "", false
+	}
+	if address, err := netip.ParseAddr(host); err == nil && address.IsValid() {
+		return address.Unmap().String(), true
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" || len(host) > 253 {
+		return "", false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+				return "", false
+			}
+		}
+	}
+	return host, true
 }
 
 func remoteAddr(r *http.Request) (netip.Addr, bool) {

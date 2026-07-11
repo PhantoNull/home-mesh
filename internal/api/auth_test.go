@@ -2,11 +2,13 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -72,6 +74,34 @@ func TestNewAuthManagerAllowsExplicitDisabledMode(t *testing.T) {
 	}
 	if auth.enabled {
 		t.Fatal("expected explicit disabled mode")
+	}
+}
+
+func TestAuthMiddlewareLeavesLivenessAndReadinessPublic(t *testing.T) {
+	manager := &authManager{enabled: true}
+	called := 0
+	handler := manager.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	for _, path := range []string{"/api/health", "/api/ready"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("public probe %s status = %d", path, response.Code)
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/inventory", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("protected inventory status = %d", response.Code)
+	}
+	if called != 2 {
+		t.Fatalf("protected request reached handler; calls = %d", called)
 	}
 }
 
@@ -223,10 +253,26 @@ func TestClientIPIgnoresPrivatePeerOutsideTrustedCIDRs(t *testing.T) {
 	}
 }
 
+func TestLoopbackIsNotAnImplicitTrustedProxy(t *testing.T) {
+	requests := newTestRequestMetadata(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-For", "203.0.113.10")
+	req.Header.Set("X-Forwarded-Proto", "https")
+
+	if got := requests.clientIP(req); got != "127.0.0.1" {
+		t.Fatalf("client IP = %q", got)
+	}
+	if got := requests.effectiveScheme(req); got != "http" {
+		t.Fatalf("effective scheme = %q", got)
+	}
+}
+
 func TestHandleLoginSetsSecureCookieForTrustedHTTPSProxy(t *testing.T) {
 	t.Parallel()
 
 	auth := newTestAuthManager(t)
+	auth.requests = newTestRequestMetadata(t, "127.0.0.0/8")
 	req := newLoginRequest(t, "admin", "s3cret-pass")
 	req.RemoteAddr = "127.0.0.1:1234"
 	req.Header.Set("X-Forwarded-Proto", "https")
@@ -300,9 +346,8 @@ func TestHandleLoginBoundsConcurrentPasswordChecks(t *testing.T) {
 func TestSessionRegistryIsBoundedAndExpiresEntries(t *testing.T) {
 	t.Parallel()
 
-	registry := newSessionRegistry()
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
-	registry.now = func() time.Time { return now }
+	registry := newDeterministicSessionRegistry(t, &now)
 	registry.register("expired", now.Add(-time.Second))
 	for index := 0; index <= maxActiveSessions; index++ {
 		registry.register(strconv.Itoa(index), now.Add(time.Duration(index+1)*time.Second))
@@ -312,6 +357,196 @@ func TestSessionRegistryIsBoundedAndExpiresEntries(t *testing.T) {
 	}
 	if registry.valid("expired", now.Add(-time.Second)) {
 		t.Fatal("expired session remained valid")
+	}
+}
+
+func TestSessionRegistryRevokeCancelsBoundContext(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	registry := newDeterministicSessionRegistry(t, &now)
+	expiresAt := now.Add(time.Hour)
+	registry.register("session", expiresAt)
+
+	bound, release, ok := registry.bind(context.Background(), "session", expiresAt)
+	if !ok {
+		t.Fatal("registered session could not bind a request context")
+	}
+	defer release()
+	assertContextActive(t, bound)
+
+	registry.revoke("session")
+	assertContextCanceled(t, bound)
+	if registry.valid("session", expiresAt) {
+		t.Fatal("revoked session remained valid")
+	}
+}
+
+func TestSessionRegistryExpiryCancelsBoundContext(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	registry := newDeterministicSessionRegistry(t, &now)
+	expiresAt := now.Add(time.Minute)
+	registry.register("session", expiresAt)
+
+	bound, release, ok := registry.bind(context.Background(), "session", expiresAt)
+	if !ok {
+		t.Fatal("registered session could not bind a request context")
+	}
+	defer release()
+	assertContextActive(t, bound)
+
+	now = expiresAt
+	if registry.valid("session", expiresAt) {
+		t.Fatal("expired session remained valid")
+	}
+	assertContextCanceled(t, bound)
+}
+
+func TestSessionRegistryLifecycleDeadlineCancelsBoundContext(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	registry := newSessionRegistry()
+	registry.now = func() time.Time { return now }
+	var expire context.CancelFunc
+	registry.newLifecycle = func(time.Time) (context.Context, context.CancelFunc) {
+		lifecycle, cancel := context.WithCancel(context.Background())
+		expire = cancel
+		return lifecycle, cancel
+	}
+	expiresAt := now.Add(time.Hour)
+	registry.register("session", expiresAt)
+
+	bound, release, ok := registry.bind(context.Background(), "session", expiresAt)
+	if !ok {
+		t.Fatal("registered session could not bind a request context")
+	}
+	defer release()
+	expire()
+
+	select {
+	case <-bound.Done():
+	case <-time.After(time.Second):
+		t.Fatal("session lifecycle deadline did not cancel the bound context")
+	}
+	assertContextCanceled(t, bound)
+	if registry.valid("session", expiresAt) {
+		t.Fatal("lifecycle-expired session remained valid")
+	}
+}
+
+func TestSessionRegistryEvictionCancelsBoundContext(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	registry := newDeterministicSessionRegistry(t, &now)
+	earliestExpiry := now.Add(time.Minute)
+	registry.register("earliest", earliestExpiry)
+
+	bound, release, ok := registry.bind(context.Background(), "earliest", earliestExpiry)
+	if !ok {
+		t.Fatal("registered session could not bind a request context")
+	}
+	defer release()
+
+	for index := 1; index < maxActiveSessions; index++ {
+		registry.register(strconv.Itoa(index), now.Add(time.Duration(index+1)*time.Minute))
+	}
+	registry.register("overflow", now.Add((maxActiveSessions+1)*time.Minute))
+
+	assertContextCanceled(t, bound)
+	if registry.valid("earliest", earliestExpiry) {
+		t.Fatal("evicted session remained valid")
+	}
+	if len(registry.sessions) != maxActiveSessions {
+		t.Fatalf("session count = %d, want %d", len(registry.sessions), maxActiveSessions)
+	}
+}
+
+func TestSessionRegistryConcurrentReleaseAndRevoke(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	registry := newDeterministicSessionRegistry(t, &now)
+	expiresAt := now.Add(time.Hour)
+	registry.register("session", expiresAt)
+
+	const bindingCount = 128
+	contexts := make([]context.Context, 0, bindingCount)
+	releases := make([]func(), 0, bindingCount)
+	for range bindingCount {
+		bound, release, ok := registry.bind(context.Background(), "session", expiresAt)
+		if !ok {
+			t.Fatal("registered session could not bind a request context")
+		}
+		contexts = append(contexts, bound)
+		releases = append(releases, release)
+	}
+
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for _, release := range releases {
+		workers.Add(1)
+		go func(release func()) {
+			defer workers.Done()
+			<-start
+			release()
+		}(release)
+	}
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		<-start
+		registry.revoke("session")
+	}()
+	close(start)
+	workers.Wait()
+
+	for _, bound := range contexts {
+		assertContextCanceled(t, bound)
+	}
+	if registry.valid("session", expiresAt) {
+		t.Fatal("concurrently revoked session remained valid")
+	}
+}
+
+func TestAuthMiddlewareCancelsLiveRequestOnLogout(t *testing.T) {
+	auth := newTestAuthManager(t)
+	cookieValue, _, err := auth.newSessionValue(auth.account.Username)
+	if err != nil {
+		t.Fatalf("newSessionValue returned error: %v", err)
+	}
+	cookie := &http.Cookie{Name: sessionCookieName, Value: cookieValue}
+
+	requestStarted := make(chan context.Context, 1)
+	handler := auth.middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestStarted <- r.Context()
+		<-r.Context().Done()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	request := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	requestFinished := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(response, request)
+		close(requestFinished)
+	}()
+
+	liveContext := <-requestStarted
+	assertContextActive(t, liveContext)
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
+	logoutRequest.AddCookie(cookie)
+	logoutResponse := httptest.NewRecorder()
+	auth.handleLogout(logoutResponse, logoutRequest)
+
+	if logoutResponse.Code != http.StatusOK {
+		t.Fatalf("logout status = %d", logoutResponse.Code)
+	}
+	select {
+	case <-requestFinished:
+	case <-time.After(time.Second):
+		t.Fatal("authenticated middleware request did not stop after logout")
+	}
+	assertContextCanceled(t, liveContext)
+	if request.Context().Err() != nil {
+		t.Fatalf("middleware canceled the parent request context: %v", request.Context().Err())
+	}
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("protected handler status = %d", response.Code)
 	}
 }
 
@@ -332,6 +567,48 @@ func newTestAuthManager(t *testing.T) *authManager {
 		passwordSlots:   make(chan struct{}, maxConcurrentPasswordChecks),
 		loginLimiter:    newLoginRateLimiter(),
 		requests:        newTestRequestMetadata(t),
+	}
+}
+
+func newDeterministicSessionRegistry(t *testing.T, now *time.Time) *sessionRegistry {
+	t.Helper()
+	registry := newSessionRegistry()
+	registry.now = func() time.Time { return *now }
+	registry.newLifecycle = func(time.Time) (context.Context, context.CancelFunc) {
+		return context.WithCancel(context.Background())
+	}
+	t.Cleanup(func() {
+		registry.mu.Lock()
+		nonces := make([]string, 0, len(registry.sessions))
+		for nonce := range registry.sessions {
+			nonces = append(nonces, nonce)
+		}
+		registry.mu.Unlock()
+		for _, nonce := range nonces {
+			registry.revoke(nonce)
+		}
+	})
+	return registry
+}
+
+func assertContextActive(t *testing.T, ctx context.Context) {
+	t.Helper()
+	select {
+	case <-ctx.Done():
+		t.Fatalf("context was canceled unexpectedly: %v", ctx.Err())
+	default:
+	}
+}
+
+func assertContextCanceled(t *testing.T, ctx context.Context) {
+	t.Helper()
+	select {
+	case <-ctx.Done():
+		if ctx.Err() != context.Canceled {
+			t.Fatalf("context error = %v, want %v", ctx.Err(), context.Canceled)
+		}
+	default:
+		t.Fatal("context was not canceled")
 	}
 }
 

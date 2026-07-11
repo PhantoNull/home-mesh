@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -144,6 +146,86 @@ func TestExecuteAuditedActionRecordsOperationalFailure(t *testing.T) {
 	}
 }
 
+func TestClearActionHistoryDoesNotRunBeforeInitialAudit(t *testing.T) {
+	t.Parallel()
+
+	auditErr := errors.New("audit unavailable")
+	inventory := &fakeActionHistoryStore{
+		fakeAuditedActionRecorder: fakeAuditedActionRecorder{addErr: auditErr},
+	}
+	response := httptest.NewRecorder()
+	handleActionHistory(inventory).ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodDelete, "/api/actions", nil),
+	)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if inventory.clearCalls.Load() != 0 {
+		t.Fatalf("ClearActions calls = %d, want 0", inventory.clearCalls.Load())
+	}
+	if inventory.added.ActionType != "clear_action_history" || inventory.added.Status != "running" {
+		t.Fatalf("initial audit = %+v", inventory.added)
+	}
+	if inventory.updateCalls.Load() != 0 {
+		t.Fatalf("UpdateAction calls = %d, want 0", inventory.updateCalls.Load())
+	}
+}
+
+func TestClearActionHistoryPreservesAndFinalizesItsAudit(t *testing.T) {
+	handler, inventory := newOCCRouter(t)
+	startedAt := time.Now().UTC().Add(-time.Minute)
+	if _, err := inventory.AddAction(context.Background(), store.Action{
+		ID:            "old-action",
+		ActionType:    "test",
+		Status:        "completed",
+		ResultSummary: "Old action.",
+		StartedAt:     startedAt,
+		FinishedAt:    startedAt.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("seed action history: %v", err)
+	}
+
+	response := serveOCCRequest(t, handler, http.MethodDelete, "/api/actions", "", "")
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	actions, err := inventory.ListActions(context.Background())
+	if err != nil {
+		t.Fatalf("list action history: %v", err)
+	}
+	if len(actions) != 1 {
+		t.Fatalf("actions after clear = %+v", actions)
+	}
+	clearAction := actions[0]
+	if clearAction.ActionType != "clear_action_history" || clearAction.Status != "completed" || clearAction.FinishedAt.IsZero() {
+		t.Fatalf("clear audit was not finalized: %+v", clearAction)
+	}
+	if clearAction.ResultSummary != "Action history cleared." || clearAction.Metadata["terminationReason"] != "history_cleared" {
+		t.Fatalf("clear audit outcome = %+v", clearAction)
+	}
+}
+
+func TestClearActionHistoryFinalizesOperationalFailure(t *testing.T) {
+	t.Parallel()
+
+	clearErr := errors.New("clear failed")
+	inventory := &fakeActionHistoryStore{clearErr: clearErr}
+	response := httptest.NewRecorder()
+	handleActionHistory(inventory).ServeHTTP(
+		response,
+		httptest.NewRequest(http.MethodDelete, "/api/actions", nil),
+	)
+
+	if response.Code != http.StatusInternalServerError || inventory.clearCalls.Load() != 1 {
+		t.Fatalf("status = %d, clear calls = %d", response.Code, inventory.clearCalls.Load())
+	}
+	if inventory.updated.Status != "failed" || inventory.updated.ResultSummary != "Action history clear failed." {
+		t.Fatalf("final audit = %+v", inventory.updated)
+	}
+}
+
 type fakeAuditedActionRecorder struct {
 	addErr                error
 	updateErr             error
@@ -153,6 +235,21 @@ type fakeAuditedActionRecorder struct {
 	updateCalls           atomic.Int32
 	updateContextCanceled atomic.Bool
 	updateHasDeadline     atomic.Bool
+}
+
+type fakeActionHistoryStore struct {
+	fakeAuditedActionRecorder
+	clearErr   error
+	clearCalls atomic.Int32
+}
+
+func (s *fakeActionHistoryStore) ListActionsPage(context.Context, int, int) ([]store.Action, error) {
+	return nil, nil
+}
+
+func (s *fakeActionHistoryStore) ClearActions(context.Context) error {
+	s.clearCalls.Add(1)
+	return s.clearErr
 }
 
 func (r *fakeAuditedActionRecorder) AddAction(_ context.Context, action store.Action) (store.Action, error) {

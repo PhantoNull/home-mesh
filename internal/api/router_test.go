@@ -20,7 +20,7 @@ func TestNormalizeSSHPort(t *testing.T) {
 	}{
 		{name: "default", input: "", want: "22"},
 		{name: "numeric", input: "2222", want: "2222"},
-		{name: "service name", input: "ssh", want: "ssh"},
+		{name: "service name", input: "ssh", want: "22"},
 		{name: "invalid", input: "99999", wantErr: true},
 	}
 
@@ -129,6 +129,12 @@ func TestWithCORSAllowsMatchingOriginAndPreservesVary(t *testing.T) {
 	if got := recorder.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
 		t.Fatalf("got %q want %q", got, "http://localhost:5173")
 	}
+	if got := recorder.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "If-Match") {
+		t.Fatalf("If-Match is not allowed by CORS: %q", got)
+	}
+	if got := recorder.Header().Get("Access-Control-Expose-Headers"); got != "ETag" {
+		t.Fatalf("exposed headers = %q, want ETag", got)
+	}
 	if got := recorder.Header().Values("Vary"); len(got) != 2 || got[0] != "Accept-Encoding" || got[1] != "Origin" {
 		t.Fatalf("unexpected Vary values: %v", got)
 	}
@@ -161,6 +167,24 @@ func TestOriginPolicyRejectsMismatchedPOSTBeforeHandler(t *testing.T) {
 	}
 }
 
+func TestOriginPolicyRejectsUnapprovedDNSRebindingHost(t *testing.T) {
+	nextCalled := false
+	handler := withOriginPolicy(newTestRequestMetadata(t), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/devices/refresh", nil)
+	req.Host = "attacker.example"
+	req.Header.Set("Origin", "http://attacker.example")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if nextCalled || recorder.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("nextCalled=%t status=%d", nextCalled, recorder.Code)
+	}
+}
+
 func TestWithCORSOptionsShortCircuits(t *testing.T) {
 	t.Parallel()
 
@@ -188,7 +212,10 @@ func TestWithCORSOptionsShortCircuits(t *testing.T) {
 func TestWebSocketOriginUsesCanonicalHostAndTrustedForwardedProto(t *testing.T) {
 	t.Parallel()
 
-	requests := newTestRequestMetadata(t)
+	requests, err := newRequestMetadata([]string{"127.0.0.0/8"}, []string{"home.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	req := httptest.NewRequest(http.MethodGet, "/api/ws", nil)
 	req.RemoteAddr = "127.0.0.1:4000"
 	req.Host = "home.example"
@@ -207,5 +234,27 @@ func TestNewRouterRejectsInvalidTrustedProxyCIDR(t *testing.T) {
 	_, err := NewRouter(config.Config{TrustedProxyCIDRs: []string{"not-a-cidr"}}, nil, nil, nil, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "HOME_MESH_TRUSTED_PROXY_CIDRS") {
 		t.Fatalf("got error %v, want invalid trusted proxy CIDR error", err)
+	}
+}
+
+func TestNewRouterRejectsInvalidAllowedHost(t *testing.T) {
+	_, err := NewRouter(config.Config{AllowedHosts: []string{"https://home.example"}}, nil, nil, nil, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "HOME_MESH_ALLOWED_HOSTS") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRequestHostPolicyAllowsIPsLocalhostAndConfiguredNames(t *testing.T) {
+	requests, err := newRequestMetadata(nil, []string{"Home.Example:8443"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"127.0.0.1:8080", "[::1]:8080", "localhost:5173", "home.example:8443"} {
+		if !requests.isAllowedHost(host) {
+			t.Fatalf("host %q was rejected", host)
+		}
+	}
+	if requests.isAllowedHost("attacker.example") {
+		t.Fatal("unconfigured DNS host was accepted")
 	}
 }

@@ -17,13 +17,10 @@ func TestSSHCommandAuditDataExcludesCommandAndOutputPlaintext(t *testing.T) {
 
 	command := "cat /private/command-sentinel"
 	output := "output-sentinel: super secret value"
-	metadata := map[string]string{
-		"commandHash": sshCommandAuditHash(command),
-	}
-	metadata = mergeActionMetadata(metadata, sshCommandCompletionMetadata(sshclient.Result{
+	metadata := sshCommandCompletionMetadata(sshclient.Result{
 		Output:    output,
 		Truncated: true,
-	}, nil))
+	}, nil)
 	action := store.Action{
 		ActionType:    "ssh_command",
 		ResultSummary: "SSH command completed.",
@@ -46,8 +43,11 @@ func TestSSHCommandAuditDataExcludesCommandAndOutputPlaintext(t *testing.T) {
 	if _, exists := metadata["output"]; exists {
 		t.Fatalf("audit metadata contains output field: %v", metadata)
 	}
-	if !strings.HasPrefix(metadata["commandHash"], "sha256:") {
-		t.Fatalf("command hash = %q", metadata["commandHash"])
+	if _, exists := metadata["commandHash"]; exists {
+		t.Fatalf("audit metadata contains command digest: %v", metadata)
+	}
+	if strings.Contains(serialized, "sha256:") {
+		t.Fatalf("audit contains a command digest: %s", serialized)
 	}
 	if metadata["capturedOutputBytes"] != "35" || metadata["outputTruncated"] != "true" {
 		t.Fatalf("completion metadata = %v", metadata)

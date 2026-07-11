@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 )
@@ -80,6 +81,10 @@ type terminalClientEvent struct {
 
 type terminalSessionCommand struct {
 	message terminalClientMessage
+}
+
+type terminalUTF8Decoder struct {
+	carry []byte
 }
 
 type terminalBridge struct {
@@ -163,12 +168,23 @@ func (b *terminalBridge) coordinate() terminalBridgeResult {
 		select {
 		case <-b.ctx.Done():
 			return terminalBridgeResult{Err: b.ctx.Err(), TerminationReason: "context_cancelled"}
+		default:
+		}
+		select {
+		case <-b.ctx.Done():
+			return terminalBridgeResult{Err: b.ctx.Err(), TerminationReason: "context_cancelled"}
 		case err := <-b.waitDone:
+			if ctxErr := b.ctx.Err(); ctxErr != nil {
+				return terminalBridgeResult{Err: ctxErr, TerminationReason: "context_cancelled"}
+			}
 			if isNormalTerminalWait(err) {
 				return terminalBridgeResult{TerminationReason: "remote_exit", notifyClient: true}
 			}
 			return terminalBridgeResult{Err: fmt.Errorf("remote SSH session failed: %w", err), TerminationReason: "remote_error", notifyClient: true}
 		case event := <-b.clientEvents:
+			if ctxErr := b.ctx.Err(); ctxErr != nil {
+				return terminalBridgeResult{Err: ctxErr, TerminationReason: "context_cancelled"}
+			}
 			if event.err != nil {
 				if isNormalTerminalDisconnect(event.err) {
 					return terminalBridgeResult{TerminationReason: "client_disconnect"}
@@ -179,12 +195,18 @@ func (b *terminalBridge) coordinate() terminalBridgeResult {
 				return *result
 			}
 		case err := <-b.workerErrors:
+			if ctxErr := b.ctx.Err(); ctxErr != nil {
+				return terminalBridgeResult{Err: ctxErr, TerminationReason: "context_cancelled"}
+			}
 			reason := "ssh_io_error"
 			if errors.Is(err, errTerminalOutputBackpressure) || errors.Is(err, errTerminalInputBackpressure) {
 				reason = "backpressure"
 			}
 			return terminalBridgeResult{Err: err, TerminationReason: reason, notifyClient: true}
 		case err := <-b.writerDone:
+			if ctxErr := b.ctx.Err(); ctxErr != nil {
+				return terminalBridgeResult{Err: ctxErr, TerminationReason: "context_cancelled"}
+			}
 			if isNormalTerminalDisconnect(err) {
 				return terminalBridgeResult{TerminationReason: "client_disconnect"}
 			}
@@ -292,10 +314,12 @@ func completeTerminalWrite(request terminalWriteRequest, err error) {
 func (b *terminalBridge) readSessionOutput(reader io.Reader) {
 	defer b.workers.Done()
 	buffer := make([]byte, terminalOutputChunkBytes)
+	decoder := terminalUTF8Decoder{}
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
-			if !b.tryEnqueue(terminalServerMessage{Type: "output", Data: string(buffer[:n])}) {
+			output := decoder.Decode(buffer[:n], false)
+			if output != "" && !b.tryEnqueue(terminalServerMessage{Type: "output", Data: output}) {
 				if b.ctx.Err() == nil {
 					b.reportWorkerError(errTerminalOutputBackpressure)
 				}
@@ -303,12 +327,42 @@ func (b *terminalBridge) readSessionOutput(reader io.Reader) {
 			}
 		}
 		if err != nil {
+			if output := decoder.Decode(nil, true); output != "" && !b.tryEnqueue(terminalServerMessage{Type: "output", Data: output}) {
+				if b.ctx.Err() == nil {
+					b.reportWorkerError(errTerminalOutputBackpressure)
+				}
+				return
+			}
 			if !errors.Is(err, io.EOF) && b.ctx.Err() == nil {
 				b.reportWorkerError(fmt.Errorf("read SSH terminal output: %w", err))
 			}
 			return
 		}
 	}
+}
+
+func (d *terminalUTF8Decoder) Decode(chunk []byte, final bool) string {
+	data := make([]byte, 0, len(d.carry)+len(chunk))
+	data = append(data, d.carry...)
+	data = append(data, chunk...)
+	d.carry = d.carry[:0]
+
+	var output strings.Builder
+	for len(data) > 0 {
+		if !final && !utf8.FullRune(data) {
+			d.carry = append(d.carry, data...)
+			break
+		}
+		r, size := utf8.DecodeRune(data)
+		if r == utf8.RuneError && size == 1 {
+			output.WriteRune(utf8.RuneError)
+			data = data[1:]
+			continue
+		}
+		output.Write(data[:size])
+		data = data[size:]
+	}
+	return output.String()
 }
 
 func (b *terminalBridge) writeSession() {

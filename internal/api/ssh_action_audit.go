@@ -2,17 +2,11 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 
 	"github.com/PhantoNull/home-mesh/internal/sshclient"
 )
-
-func sshCommandAuditHash(command string) string {
-	digest := sha256.Sum256([]byte(command))
-	return fmt.Sprintf("sha256:%x", digest)
-}
 
 func sshCommandCompletionMetadata(result sshclient.Result, err error) map[string]string {
 	return map[string]string{

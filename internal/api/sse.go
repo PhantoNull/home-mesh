@@ -10,7 +10,10 @@ import (
 	"github.com/PhantoNull/home-mesh/internal/monitor"
 )
 
-const sseHeartbeatInterval = 25 * time.Second
+const (
+	sseHeartbeatInterval = 25 * time.Second
+	sseWriteTimeout      = 10 * time.Second
+)
 
 func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +94,9 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 }
 
 func writeSSEEvent(w http.ResponseWriter, event monitor.ScanEvent) error {
+	if err := setSSEWriteDeadline(w); err != nil {
+		return err
+	}
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -105,6 +111,9 @@ func writeSSEEvent(w http.ResponseWriter, event monitor.ScanEvent) error {
 }
 
 func writeSSEJSONEvent(w http.ResponseWriter, eventName string, payload any) error {
+	if err := setSSEWriteDeadline(w); err != nil {
+		return err
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -114,10 +123,30 @@ func writeSSEJSONEvent(w http.ResponseWriter, eventName string, payload any) err
 }
 
 func writeSSEComment(w http.ResponseWriter, comment string) error {
+	if err := setSSEWriteDeadline(w); err != nil {
+		return err
+	}
 	_, err := fmt.Fprintf(w, ": %s\n\n", comment)
 	return err
 }
 
 func flushSSE(w http.ResponseWriter) error {
-	return http.NewResponseController(w).Flush()
+	controller := http.NewResponseController(w)
+	err := controller.Flush()
+	clearErr := controller.SetWriteDeadline(time.Time{})
+	if errors.Is(clearErr, http.ErrNotSupported) {
+		clearErr = nil
+	}
+	if err != nil {
+		return err
+	}
+	return clearErr
+}
+
+func setSSEWriteDeadline(w http.ResponseWriter) error {
+	err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(sseWriteTimeout))
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
 }

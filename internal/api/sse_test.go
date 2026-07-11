@@ -61,6 +61,9 @@ func TestHandleSSEStreamsHeadersAndEventsUntilCancelled(t *testing.T) {
 			t.Fatalf("body %q does not contain %q", body, want)
 		}
 	}
+	if bounded, cleared := writer.DeadlineStates(); bounded == 0 || cleared == 0 {
+		t.Fatalf("SSE deadlines bounded=%d cleared=%d", bounded, cleared)
+	}
 }
 
 func TestHandleSSEReplaysEventsAfterLastEventID(t *testing.T) {
@@ -169,15 +172,16 @@ func waitForHandler(t *testing.T, done <-chan struct{}) {
 }
 
 type controlledStreamWriter struct {
-	mu       sync.Mutex
-	header   http.Header
-	body     bytes.Buffer
-	status   int
-	writes   int
-	failAt   int
-	writeErr error
-	flushErr error
-	flushes  chan struct{}
+	mu        sync.Mutex
+	header    http.Header
+	body      bytes.Buffer
+	status    int
+	writes    int
+	failAt    int
+	writeErr  error
+	flushErr  error
+	flushes   chan struct{}
+	deadlines []time.Time
 }
 
 func newControlledStreamWriter() *controlledStreamWriter {
@@ -224,8 +228,28 @@ func (w *controlledStreamWriter) FlushError() error {
 	return w.flushErr
 }
 
+func (w *controlledStreamWriter) SetWriteDeadline(deadline time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
+}
+
 func (w *controlledStreamWriter) BodyString() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.body.String()
+}
+
+func (w *controlledStreamWriter) DeadlineStates() (bounded int, cleared int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, deadline := range w.deadlines {
+		if deadline.IsZero() {
+			cleared++
+		} else {
+			bounded++
+		}
+	}
+	return bounded, cleared
 }

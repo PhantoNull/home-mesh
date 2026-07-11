@@ -135,6 +135,23 @@ func TestTerminalBridgeRejectsOversizedClientCommands(t *testing.T) {
 	}
 }
 
+func TestTerminalUTF8DecoderCarriesSplitRunes(t *testing.T) {
+	decoder := terminalUTF8Decoder{}
+	euro := []byte("EUR: \u20ac")
+	if got := decoder.Decode(euro[:6], false); got != "EUR: " {
+		t.Fatalf("first chunk = %q", got)
+	}
+	if got := decoder.Decode(euro[6:7], false); got != "" {
+		t.Fatalf("incomplete chunk = %q", got)
+	}
+	if got := decoder.Decode(euro[7:], false); got != "\u20ac" {
+		t.Fatalf("completed rune = %q", got)
+	}
+	if got := decoder.Decode([]byte{0xff}, true); got != "\ufffd" {
+		t.Fatalf("invalid byte = %q", got)
+	}
+}
+
 func runTerminalBridgeAsync(ctx context.Context, socket terminalSocket, session terminalSession) <-chan terminalBridgeResult {
 	result := make(chan terminalBridgeResult, 1)
 	go func() {

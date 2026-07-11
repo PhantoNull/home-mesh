@@ -52,31 +52,98 @@ const (
 )
 
 type sessionRegistry struct {
-	mu       sync.Mutex
-	sessions map[string]time.Time
-	now      func() time.Time
+	mu           sync.Mutex
+	sessions     map[string]*sessionEntry
+	now          func() time.Time
+	newLifecycle func(time.Time) (context.Context, context.CancelFunc)
+}
+
+type sessionEntry struct {
+	expiresAt       time.Time
+	lifecycle       context.Context
+	cancelLifecycle context.CancelFunc
+	stopExpiry      func() bool
+	bindings        map[*sessionBinding]context.CancelFunc
+}
+
+type sessionBinding struct{}
+
+type sessionTermination struct {
+	stopExpiry      func() bool
+	cancelLifecycle context.CancelFunc
+	cancelBindings  []context.CancelFunc
+}
+
+type sessionClaims struct {
+	username  string
+	nonce     string
+	expiresAt time.Time
 }
 
 func newSessionRegistry() *sessionRegistry {
-	return &sessionRegistry{sessions: make(map[string]time.Time), now: time.Now}
+	return &sessionRegistry{
+		sessions: make(map[string]*sessionEntry),
+		now:      time.Now,
+		newLifecycle: func(expiresAt time.Time) (context.Context, context.CancelFunc) {
+			return context.WithDeadline(context.Background(), expiresAt)
+		},
+	}
 }
 
 func (r *sessionRegistry) register(nonce string, expiresAt time.Time) {
+	if r == nil {
+		return
+	}
+	expiresAt = time.Unix(expiresAt.Unix(), 0).UTC()
+	now := r.currentTime()
+	if !now.Before(expiresAt) {
+		return
+	}
+	lifecycle, cancelLifecycle := r.createLifecycle(expiresAt)
+	entry := &sessionEntry{
+		expiresAt:       expiresAt,
+		lifecycle:       lifecycle,
+		cancelLifecycle: cancelLifecycle,
+		bindings:        make(map[*sessionBinding]context.CancelFunc),
+	}
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.pruneLocked()
+	terminated := r.pruneLocked()
+	if current, exists := r.sessions[nonce]; exists {
+		delete(r.sessions, nonce)
+		terminated = append(terminated, detachSessionEntryLocked(current))
+	}
 	if len(r.sessions) >= maxActiveSessions {
 		var earliestNonce string
 		var earliestExpiry time.Time
-		for candidate, expiry := range r.sessions {
-			if earliestNonce == "" || expiry.Before(earliestExpiry) {
+		for candidate, current := range r.sessions {
+			if earliestNonce == "" || current.expiresAt.Before(earliestExpiry) {
 				earliestNonce = candidate
-				earliestExpiry = expiry
+				earliestExpiry = current.expiresAt
 			}
 		}
+		terminated = append(terminated, detachSessionEntryLocked(r.sessions[earliestNonce]))
 		delete(r.sessions, earliestNonce)
 	}
-	r.sessions[nonce] = expiresAt
+	if r.sessions == nil {
+		r.sessions = make(map[string]*sessionEntry)
+	}
+	r.sessions[nonce] = entry
+	r.mu.Unlock()
+	terminateSessions(terminated)
+
+	stopExpiry := context.AfterFunc(lifecycle, func() {
+		r.expire(nonce, entry)
+	})
+	r.mu.Lock()
+	if r.sessions[nonce] == entry {
+		entry.stopExpiry = stopExpiry
+		stopExpiry = nil
+	}
+	r.mu.Unlock()
+	if stopExpiry != nil {
+		stopExpiry()
+	}
 }
 
 func (r *sessionRegistry) valid(nonce string, expiresAt time.Time) bool {
@@ -84,10 +151,46 @@ func (r *sessionRegistry) valid(nonce string, expiresAt time.Time) bool {
 		return false
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.pruneLocked()
-	registeredExpiry, ok := r.sessions[nonce]
-	return ok && registeredExpiry.Unix() == expiresAt.Unix()
+	terminated := r.pruneLocked()
+	entry, ok := r.sessions[nonce]
+	valid := ok && entry.expiresAt.Unix() == expiresAt.Unix() && entry.lifecycle.Err() == nil
+	r.mu.Unlock()
+	terminateSessions(terminated)
+	return valid
+}
+
+func (r *sessionRegistry) bind(parent context.Context, nonce string, expiresAt time.Time) (context.Context, func(), bool) {
+	if r == nil {
+		return parent, nil, false
+	}
+
+	r.mu.Lock()
+	terminated := r.pruneLocked()
+	entry, ok := r.sessions[nonce]
+	if !ok || entry.expiresAt.Unix() != expiresAt.Unix() || entry.lifecycle.Err() != nil {
+		r.mu.Unlock()
+		terminateSessions(terminated)
+		return parent, nil, false
+	}
+
+	boundContext, cancel := context.WithCancel(parent)
+	binding := &sessionBinding{}
+	entry.bindings[binding] = cancel
+	r.mu.Unlock()
+	terminateSessions(terminated)
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if current := r.sessions[nonce]; current == entry {
+				delete(entry.bindings, binding)
+			}
+			r.mu.Unlock()
+			cancel()
+		})
+	}
+	return boundContext, release, true
 }
 
 func (r *sessionRegistry) revoke(nonce string) {
@@ -95,17 +198,86 @@ func (r *sessionRegistry) revoke(nonce string) {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	entry := r.sessions[nonce]
 	delete(r.sessions, nonce)
+	terminated := detachSessionEntryLocked(entry)
+	r.mu.Unlock()
+	terminateSessions([]sessionTermination{terminated})
 }
 
-func (r *sessionRegistry) pruneLocked() {
-	now := r.now()
-	for nonce, expiresAt := range r.sessions {
-		if !now.Before(expiresAt) {
+func (r *sessionRegistry) pruneLocked() []sessionTermination {
+	now := r.currentTime()
+	terminated := make([]sessionTermination, 0)
+	for nonce, entry := range r.sessions {
+		if !now.Before(entry.expiresAt) || entry.lifecycle.Err() != nil {
 			delete(r.sessions, nonce)
+			terminated = append(terminated, detachSessionEntryLocked(entry))
 		}
 	}
+	return terminated
+}
+
+func (r *sessionRegistry) expire(nonce string, expected *sessionEntry) {
+	if r == nil || expected == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.sessions[nonce] != expected {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.sessions, nonce)
+	terminated := detachSessionEntryLocked(expected)
+	r.mu.Unlock()
+	terminateSessions([]sessionTermination{terminated})
+}
+
+// detachSessionEntryLocked transfers every cancellation handle out of an entry.
+// Callers must hold the registry mutex while invoking it.
+func detachSessionEntryLocked(entry *sessionEntry) sessionTermination {
+	if entry == nil {
+		return sessionTermination{}
+	}
+	terminated := sessionTermination{
+		stopExpiry:      entry.stopExpiry,
+		cancelLifecycle: entry.cancelLifecycle,
+		cancelBindings:  make([]context.CancelFunc, 0, len(entry.bindings)),
+	}
+	entry.stopExpiry = nil
+	entry.cancelLifecycle = nil
+	for binding, cancel := range entry.bindings {
+		terminated.cancelBindings = append(terminated.cancelBindings, cancel)
+		delete(entry.bindings, binding)
+	}
+	return terminated
+}
+
+func terminateSessions(terminations []sessionTermination) {
+	for _, terminated := range terminations {
+		if terminated.stopExpiry != nil {
+			terminated.stopExpiry()
+		}
+		if terminated.cancelLifecycle != nil {
+			terminated.cancelLifecycle()
+		}
+		for _, cancel := range terminated.cancelBindings {
+			cancel()
+		}
+	}
+}
+
+func (r *sessionRegistry) currentTime() time.Time {
+	if r.now == nil {
+		return time.Now()
+	}
+	return r.now()
+}
+
+func (r *sessionRegistry) createLifecycle(expiresAt time.Time) (context.Context, context.CancelFunc) {
+	if r.newLifecycle == nil {
+		return context.WithDeadline(context.Background(), expiresAt)
+	}
+	return r.newLifecycle(expiresAt)
 }
 
 type loginAttemptRecord struct {
@@ -335,8 +507,7 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload loginPayload
-	if err := decodeJSON(r, &payload); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid login payload"})
+	if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid login payload") {
 		return
 	}
 	if len(payload.Username) > maxLoginUsernameBytes || len(payload.Password) > maxLoginPasswordBytes {
@@ -413,16 +584,23 @@ func (a *authManager) middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.Method == http.MethodOptions || r.URL.Path == "/api/health" || r.URL.Path == "/api/auth/session" || r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/logout" {
+		if r.Method == http.MethodOptions || r.URL.Path == "/api/health" || r.URL.Path == "/api/ready" || r.URL.Path == "/api/auth/session" || r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/logout" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if _, ok := a.authenticatedUsername(r); !ok {
+		claims, ok := a.sessionClaims(r)
+		if !ok {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 			return
 		}
+		requestContext, release, ok := a.sessions.bind(r.Context(), claims.nonce, claims.expiresAt)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+			return
+		}
+		defer release()
 
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(requestContext))
 	})
 }
 
@@ -430,48 +608,51 @@ func (a *authManager) authenticatedUsername(r *http.Request) (string, bool) {
 	if !a.enabled {
 		return "", true
 	}
+	claims, ok := a.sessionClaims(r)
+	if !ok || !a.sessions.valid(claims.nonce, claims.expiresAt) {
+		return "", false
+	}
+	return claims.username, true
+}
 
+func (a *authManager) sessionClaims(r *http.Request) (sessionClaims, bool) {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil || cookie.Value == "" {
-		return "", false
+		return sessionClaims{}, false
 	}
 
 	parts := strings.Split(cookie.Value, ".")
 	if len(parts) != 4 {
-		return "", false
+		return sessionClaims{}, false
 	}
 
 	usernameBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return "", false
+		return sessionClaims{}, false
 	}
 	nonce, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return "", false
+		return sessionClaims{}, false
 	}
 	expiresAt, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {
-		return "", false
+		return sessionClaims{}, false
 	}
 	expiresAtTime := time.Unix(expiresAt, 0).UTC()
 	if !time.Now().UTC().Before(expiresAtTime) {
-		return "", false
+		return sessionClaims{}, false
 	}
 
 	expected := a.signSession(parts[0], parts[1], parts[2], nonce)
 	if subtle.ConstantTimeCompare([]byte(parts[3]), []byte(expected)) != 1 {
-		return "", false
+		return sessionClaims{}, false
 	}
 
 	username := string(usernameBytes)
 	if subtle.ConstantTimeCompare([]byte(username), []byte(a.account.Username)) != 1 {
-		return "", false
+		return sessionClaims{}, false
 	}
-	if !a.sessions.valid(parts[1], expiresAtTime) {
-		return "", false
-	}
-
-	return username, true
+	return sessionClaims{username: username, nonce: parts[1], expiresAt: expiresAtTime}, true
 }
 
 func (a *authManager) newSessionValue(username string) (string, time.Time, error) {
@@ -484,7 +665,7 @@ func (a *authManager) newSessionValue(username string) (string, time.Time, error
 	if duration == 0 {
 		duration = time.Hour
 	}
-	expiresAt := time.Now().UTC().Add(duration)
+	expiresAt := time.Now().UTC().Add(duration).Truncate(time.Second)
 	userPart := base64.RawURLEncoding.EncodeToString([]byte(username))
 	noncePart := base64.RawURLEncoding.EncodeToString(nonce)
 	expiresPart := strconv.FormatInt(expiresAt.Unix(), 10)

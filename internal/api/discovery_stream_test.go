@@ -133,6 +133,84 @@ func TestDiscoveryScanStreamMapsScanInProgress(t *testing.T) {
 	}
 }
 
+func TestDiscoveryScanStreamSanitizesTerminalErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name        string
+		err         error
+		wantMessage string
+		secret      string
+	}{
+		{
+			name:        "network not allowed",
+			err:         errors.Join(discovery.ErrNetworkNotAllowed, errors.New("network-policy-secret")),
+			wantMessage: "the requested network is not allowed",
+			secret:      "network-policy-secret",
+		},
+		{
+			name:        "nmap unavailable",
+			err:         errors.Join(discovery.ErrNmapUnavailable, errors.New("nmap-path-secret")),
+			wantMessage: "nmap is not available in the current runtime",
+			secret:      "nmap-path-secret",
+		},
+		{
+			name:        "deadline",
+			err:         errors.Join(context.DeadlineExceeded, errors.New("deadline-detail-secret")),
+			wantMessage: "discovery scan timed out",
+			secret:      "deadline-detail-secret",
+		},
+		{
+			name:        "upstream execution",
+			err:         errors.New("upstream-stderr-secret"),
+			wantMessage: "discovery scan failed",
+			secret:      "upstream-stderr-secret",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			inventory := newDiscoveryTestStore(t)
+			writer := newControlledStreamWriter()
+			handleDiscoveryScanStream(inventory, &fakeDiscoveryScanner{streamErr: test.err}).ServeHTTP(
+				writer,
+				httptest.NewRequest(http.MethodGet, "/api/discovery/scan/stream", nil),
+			)
+
+			body := writer.BodyString()
+			if !strings.Contains(body, "event: discovery-error") || !strings.Contains(body, test.wantMessage) {
+				t.Fatalf("unexpected body: %q", body)
+			}
+			if strings.Contains(body, test.secret) {
+				t.Fatalf("stream exposed internal error detail %q: %q", test.secret, body)
+			}
+		})
+	}
+}
+
+func TestDiscoveryScanStreamRejectsInvalidCIDRWithoutScanning(t *testing.T) {
+	t.Parallel()
+
+	inventory := newDiscoveryTestStore(t)
+	scanner := &fakeDiscoveryScanner{
+		stream: func(context.Context, string, func(discovery.HostMatch) error) (discovery.ScanResult, error) {
+			t.Fatal("scanner called for invalid CIDR")
+			return discovery.ScanResult{}, nil
+		},
+	}
+	writer := newControlledStreamWriter()
+	handleDiscoveryScanStream(inventory, scanner).ServeHTTP(
+		writer,
+		httptest.NewRequest(http.MethodGet, "/api/discovery/scan/stream?cidr=not-a-cidr", nil),
+	)
+
+	body := writer.BodyString()
+	if !strings.Contains(body, "event: discovery-error") || !strings.Contains(body, "discovery CIDR must be a valid IPv4 network") {
+		t.Fatalf("unexpected body: %q", body)
+	}
+}
+
 func TestDiscoveryScanStreamPropagatesClientWriteFailure(t *testing.T) {
 	t.Parallel()
 
@@ -180,6 +258,98 @@ func TestDiscoveryScanMapsScanInProgressToConflict(t *testing.T) {
 	}
 }
 
+func TestDiscoveryScanRejectsInvalidRequestsWithoutScanning(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "malformed JSON", body: `{"cidr":`},
+		{name: "invalid CIDR", body: `{"cidr":"not-a-cidr"}`},
+		{name: "oversized network", body: `{"cidr":"10.0.0.0/8"}`},
+		{name: "IPv6", body: `{"cidr":"fd00::/64"}`},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			scanner := &fakeDiscoveryScanner{
+				scan: func(context.Context, string) (discovery.ScanResult, error) {
+					t.Fatal("scanner called for invalid request")
+					return discovery.ScanResult{}, nil
+				},
+			}
+			recorder := httptest.NewRecorder()
+			handleDiscoveryScan(nil, scanner).ServeHTTP(
+				recorder,
+				httptest.NewRequest(http.MethodPost, "/api/discovery/scan", strings.NewReader(test.body)),
+			)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestDiscoveryScanMapsAndSanitizesServiceErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name        string
+		err         error
+		wantStatus  int
+		wantMessage string
+		secret      string
+	}{
+		{
+			name:        "network not allowed",
+			err:         errors.Join(discovery.ErrNetworkNotAllowed, errors.New("network-policy-secret")),
+			wantStatus:  http.StatusForbidden,
+			wantMessage: "the requested network is not allowed",
+			secret:      "network-policy-secret",
+		},
+		{
+			name:        "nmap unavailable",
+			err:         errors.Join(discovery.ErrNmapUnavailable, errors.New("nmap-path-secret")),
+			wantStatus:  http.StatusServiceUnavailable,
+			wantMessage: "nmap is not available in the current runtime",
+			secret:      "nmap-path-secret",
+		},
+		{
+			name:        "deadline",
+			err:         errors.Join(context.DeadlineExceeded, errors.New("deadline-detail-secret")),
+			wantStatus:  http.StatusGatewayTimeout,
+			wantMessage: "discovery scan timed out",
+			secret:      "deadline-detail-secret",
+		},
+		{
+			name:        "upstream execution",
+			err:         errors.New("upstream-stderr-secret"),
+			wantStatus:  http.StatusBadGateway,
+			wantMessage: "discovery scan failed",
+			secret:      "upstream-stderr-secret",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			recorder := httptest.NewRecorder()
+			handleDiscoveryScan(nil, &fakeDiscoveryScanner{scanErr: test.err}).ServeHTTP(
+				recorder,
+				httptest.NewRequest(http.MethodPost, "/api/discovery/scan", strings.NewReader(`{"cidr":"203.0.113.0/24"}`)),
+			)
+
+			if recorder.Code != test.wantStatus || !strings.Contains(recorder.Body.String(), test.wantMessage) {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if strings.Contains(recorder.Body.String(), test.secret) {
+				t.Fatalf("response exposed internal error detail %q: %s", test.secret, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func newDiscoveryTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	inventory, err := store.New(filepath.Join(t.TempDir(), "home-mesh.db"))
@@ -200,6 +370,7 @@ type fakeDiscoveryScanner struct {
 	scanErr      error
 	streamResult discovery.ScanResult
 	streamErr    error
+	scan         func(context.Context, string) (discovery.ScanResult, error)
 	stream       func(context.Context, string, func(discovery.HostMatch) error) (discovery.ScanResult, error)
 }
 
@@ -207,7 +378,10 @@ func (f *fakeDiscoveryScanner) Capabilities() discovery.Capabilities {
 	return f.capabilities
 }
 
-func (f *fakeDiscoveryScanner) ScanCIDR(context.Context, string) (discovery.ScanResult, error) {
+func (f *fakeDiscoveryScanner) ScanCIDR(ctx context.Context, cidr string) (discovery.ScanResult, error) {
+	if f.scan != nil {
+		return f.scan(ctx, cidr)
+	}
 	return f.scanResult, f.scanErr
 }
 
