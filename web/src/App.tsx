@@ -616,9 +616,9 @@ function SSHTerminalPane({ deviceId, enabled, sessionKey, onConnectionState, onR
     void (async () => {
       try {
         const [{ Terminal }, { FitAddon }] = await Promise.all([
-          import('xterm'),
-          import('xterm-addon-fit'),
-          import('xterm/css/xterm.css'),
+          import('@xterm/xterm'),
+          import('@xterm/addon-fit'),
+          import('@xterm/xterm/css/xterm.css'),
         ])
         if (cancelled || !hostRef.current) {
           return
