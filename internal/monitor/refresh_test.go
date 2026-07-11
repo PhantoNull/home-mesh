@@ -1,6 +1,26 @@
 package monitor
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/PhantoNull/home-mesh/internal/store"
+)
+
+func TestApplyNmapToDeviceDoesNotMutateInputMetadata(t *testing.T) {
+	t.Parallel()
+
+	original := store.Device{
+		Metadata: map[string]string{"owner": "home"},
+	}
+	updated := applyNmapToDevice(original, nmapScanResult{Up: true, OpenPorts: []int{22}})
+
+	if _, exists := original.Metadata["lastReachablePorts"]; exists {
+		t.Fatal("input metadata was mutated")
+	}
+	if got := updated.Metadata["lastReachablePorts"]; got != "22" {
+		t.Fatalf("lastReachablePorts = %q, want 22", got)
+	}
+}
 
 func TestDerivePanelLinkPrefersHTTPS(t *testing.T) {
 	t.Parallel()

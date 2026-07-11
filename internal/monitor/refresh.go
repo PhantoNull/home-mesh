@@ -2,12 +2,15 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net"
 	"os/exec"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,12 +24,21 @@ var (
 	macAddressDashRegex  = regexp.MustCompile(`([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}`)
 )
 
+const (
+	refreshConcurrency = 8
+	batchScanTimeout   = 30 * time.Second
+	singleScanTimeout  = 10 * time.Second
+	targetProbeTimeout = 10 * time.Second
+	dnsLookupTimeout   = 2 * time.Second
+)
+
 type RefreshSummary struct {
 	Checked     int `json:"checked"`
 	Updated     int `json:"updated"`
 	Online      int `json:"online"`
 	Degraded    int `json:"degraded"`
 	Offline     int `json:"offline"`
+	Unknown     int `json:"unknown"`
 	MACResolved int `json:"macResolved"`
 }
 
@@ -34,38 +46,78 @@ type RefreshResult struct {
 	Summary      RefreshSummary      `json:"summary"`
 	Devices      []store.Device      `json:"devices"`
 	NetworkNodes []store.NetworkNode `json:"networkNodes"`
+	NmapUsed     bool                `json:"nmapUsed"`
+}
+
+type RefresherOptions struct {
+	NmapPath string
+}
+
+type nmapScanFunc func(context.Context, string, []string, []int) (map[string]nmapScanResult, error)
+
+type probeSet struct {
+	resolveIPv4   func(context.Context, string) (string, error)
+	reverseLookup func(context.Context, string) (string, error)
+	pingHost      func(context.Context, string, time.Duration) (bool, error)
+	lookupMAC     func(context.Context, string) (string, error)
+	probeTCPPorts func(context.Context, string, []int) (bool, bool, []string, error)
 }
 
 type Refresher struct {
 	store    *store.Store
 	bus      *EventBus
 	nmapPath string
+	scanGate chan struct{}
+	nmapScan nmapScanFunc
+	probes   probeSet
 }
 
-const refreshConcurrency = 8
+type nmapExecutionError struct {
+	err error
+}
+
+func (e *nmapExecutionError) Error() string { return e.err.Error() }
+func (e *nmapExecutionError) Unwrap() error { return e.err }
 
 func NewRefresher(inventory *store.Store, bus *EventBus) *Refresher {
+	return NewRefresherWithOptions(inventory, bus, RefresherOptions{NmapPath: nmapDetect()})
+}
+
+func NewRefresherWithOptions(inventory *store.Store, bus *EventBus, options RefresherOptions) *Refresher {
+	path := ""
+	if configured := strings.TrimSpace(options.NmapPath); configured != "" {
+		if resolved, err := exec.LookPath(configured); err == nil {
+			path = resolved
+		}
+	}
+	if bus == nil {
+		bus = NewEventBus()
+	}
+
 	return &Refresher{
 		store:    inventory,
 		bus:      bus,
-		nmapPath: nmapDetect(),
+		nmapPath: path,
+		scanGate: make(chan struct{}, 1),
+		nmapScan: nmapScan,
+		probes: probeSet{
+			resolveIPv4:   resolveIPv4,
+			reverseLookup: reverseLookup,
+			pingHost:      pingHost,
+			lookupMAC:     lookupMAC,
+			probeTCPPorts: probeTCPPorts,
+		},
 	}
 }
 
-// UsingNmap reports whether nmap was detected and will be used for scanning.
 func (r *Refresher) UsingNmap() bool { return r.nmapPath != "" }
 
-// RunBackground starts a scan loop that runs until ctx is cancelled.
-// Each iteration performs a full batch scan and publishes events.
 func (r *Refresher) RunBackground(ctx context.Context, interval time.Duration) {
-	log.Printf("background refresh loop started: interval=%s nmap_enabled=%t", interval, r.nmapPath != "")
-
-	// Immediate first scan.
+	log.Printf("background refresh loop started: interval=%s nmap_enabled=%t", interval, r.UsingNmap())
 	r.scanAndPublish(ctx)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -77,193 +129,220 @@ func (r *Refresher) RunBackground(ctx context.Context, interval time.Duration) {
 }
 
 func (r *Refresher) scanAndPublish(ctx context.Context) {
-	devices, err := r.store.ListDevices(ctx)
+	release, err := r.acquireScan(ctx)
 	if err != nil {
-		log.Printf("background refresh: list devices failed: %v", err)
 		return
 	}
-	nodes, err := r.store.ListNetworkNodes(ctx)
+	defer release()
+
+	devices, nodes, err := r.loadInventory(ctx)
 	if err != nil {
-		log.Printf("background refresh: list network nodes failed: %v", err)
+		log.Printf("background refresh: load inventory failed: %v", err)
 		return
 	}
 
-	log.Printf("background refresh: started devices=%d nodes=%d nmap_enabled=%t", len(devices), len(nodes), r.nmapPath != "")
-
-	// Build the started event payload.
 	deviceIDs := make([]string, len(devices))
-	for i, d := range devices {
-		deviceIDs[i] = d.ID
+	for index, device := range devices {
+		deviceIDs[index] = device.ID
 	}
 	nodeIDs := make([]string, len(nodes))
-	for i, n := range nodes {
-		nodeIDs[i] = n.ID
+	for index, node := range nodes {
+		nodeIDs[index] = node.ID
 	}
-	r.bus.publishJSON(EventScanStarted, map[string]any{
-		"deviceIds": deviceIDs,
-		"nodeIds":   nodeIDs,
-	})
+	r.bus.publishJSON(EventScanStarted, map[string]any{"deviceIds": deviceIDs, "nodeIds": nodeIDs})
 
-	var updatedDevices []store.Device
-	var updatedNodes []store.NetworkNode
-	var summary RefreshSummary
-
-	if r.nmapPath != "" {
-		var nmapErr error
-		updatedDevices, updatedNodes, summary, nmapErr = r.batchScanWithNmap(ctx, devices, nodes)
-		if nmapErr != nil {
-			log.Printf("background refresh: nmap batch scan failed, falling back to legacy refresh: %v", nmapErr)
-			result, err := r.RefreshAll(ctx)
-			if err != nil {
-				log.Printf("background refresh: fallback refresh failed: %v", err)
-				return
-			}
-			updatedDevices = result.Devices
-			updatedNodes = result.NetworkNodes
-			summary = result.Summary
-		}
-	} else {
-		result, err := r.RefreshAll(ctx)
-		if err != nil {
-			log.Printf("background refresh: refresh failed: %v", err)
-			return
-		}
-		updatedDevices = result.Devices
-		updatedNodes = result.NetworkNodes
-		summary = result.Summary
+	result, err := r.refreshInventory(ctx, devices, nodes)
+	if err != nil {
+		log.Printf("background refresh failed: %v", err)
+		r.bus.publishJSON(EventScanComplete, map[string]any{
+			"checked": 0, "updated": 0, "online": 0, "degraded": 0,
+			"offline": 0, "unknown": len(devices) + len(nodes), "nmapUsed": false,
+			"error": "refresh failed",
+		})
+		return
 	}
 
-	for _, d := range updatedDevices {
-		r.bus.publishJSON(EventDeviceUpdate, d)
+	for _, device := range result.Devices {
+		r.bus.publishJSON(EventDeviceUpdate, device)
 	}
-	for _, n := range updatedNodes {
-		r.bus.publishJSON(EventNodeUpdate, n)
+	for _, node := range result.NetworkNodes {
+		r.bus.publishJSON(EventNodeUpdate, node)
 	}
 	r.bus.publishJSON(EventScanComplete, map[string]any{
-		"checked":  summary.Checked,
-		"updated":  summary.Updated,
-		"online":   summary.Online,
-		"degraded": summary.Degraded,
-		"offline":  summary.Offline,
-		"nmapUsed": r.nmapPath != "",
+		"checked": result.Summary.Checked, "updated": result.Summary.Updated,
+		"online": result.Summary.Online, "degraded": result.Summary.Degraded,
+		"offline": result.Summary.Offline, "unknown": result.Summary.Unknown,
+		"nmapUsed": result.NmapUsed,
 	})
 	log.Printf(
-		"background refresh: completed checked=%d updated=%d online=%d degraded=%d offline=%d nmap_used=%t",
-		summary.Checked,
-		summary.Updated,
-		summary.Online,
-		summary.Degraded,
-		summary.Offline,
-		r.nmapPath != "",
+		"background refresh completed: checked=%d updated=%d online=%d degraded=%d offline=%d unknown=%d nmap_used=%t",
+		result.Summary.Checked, result.Summary.Updated, result.Summary.Online,
+		result.Summary.Degraded, result.Summary.Offline, result.Summary.Unknown, result.NmapUsed,
 	)
 }
 
-// batchScanWithNmap runs one nmap process over all known IPs and maps results
-// back to devices and network nodes.
-func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Device, nodes []store.NetworkNode) ([]store.Device, []store.NetworkNode, RefreshSummary, error) {
-	// Collect all IPs that are actually scannable.
-	type ipEntry struct {
+func (r *Refresher) acquireScan(ctx context.Context) (func(), error) {
+	select {
+	case r.scanGate <- struct{}{}:
+		return func() { <-r.scanGate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (r *Refresher) loadInventory(ctx context.Context) ([]store.Device, []store.NetworkNode, error) {
+	devices, err := r.store.ListDevices(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	nodes, err := r.store.ListNetworkNodes(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return devices, nodes, nil
+}
+
+func (r *Refresher) RefreshAll(ctx context.Context) (RefreshResult, error) {
+	release, err := r.acquireScan(ctx)
+	if err != nil {
+		return RefreshResult{}, err
+	}
+	defer release()
+
+	devices, nodes, err := r.loadInventory(ctx)
+	if err != nil {
+		return RefreshResult{}, err
+	}
+	return r.refreshInventory(ctx, devices, nodes)
+}
+
+func (r *Refresher) refreshInventory(ctx context.Context, devices []store.Device, nodes []store.NetworkNode) (RefreshResult, error) {
+	if r.UsingNmap() {
+		result, err := r.batchScanWithNmap(ctx, devices, nodes)
+		if err == nil {
+			return result, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return RefreshResult{}, ctxErr
+		}
+		var executionError *nmapExecutionError
+		if !errors.As(err, &executionError) {
+			return RefreshResult{}, err
+		}
+		log.Printf("nmap batch scan failed; using bounded fallback probes: %v", executionError)
+	}
+	return r.refreshAllFallback(ctx, devices, nodes)
+}
+
+func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Device, nodes []store.NetworkNode) (RefreshResult, error) {
+	refreshedDevices := cloneDevices(devices)
+	refreshedNodes := cloneNetworkNodes(nodes)
+	type target struct {
 		ip       string
 		isDevice bool
 		index    int
 	}
-	var entries []ipEntry
-	var ips []string
+	targets := make([]target, 0, len(devices)+len(nodes))
+	ips := make([]string, 0, len(devices)+len(nodes))
+	seenIPs := make(map[string]struct{}, len(devices)+len(nodes))
 
-	for i, d := range devices {
-		ip := strings.TrimSpace(d.IPAddress)
-		if ip == "" && strings.TrimSpace(d.Hostname) != "" {
-			if resolved, err := resolveIPv4(d.Hostname); err == nil {
-				ip = resolved
-			}
+	for index := range refreshedDevices {
+		refreshedDevices[index].Status = "unknown"
+		ip, ok, err := r.canonicalDeviceTarget(ctx, &refreshedDevices[index])
+		if err != nil {
+			return RefreshResult{}, err
 		}
-		if ip != "" {
-			entries = append(entries, ipEntry{ip: ip, isDevice: true, index: i})
+		if !ok {
+			continue
+		}
+		targets = append(targets, target{ip: ip, isDevice: true, index: index})
+		if _, exists := seenIPs[ip]; !exists {
+			seenIPs[ip] = struct{}{}
 			ips = append(ips, ip)
 		}
 	}
-	for i, n := range nodes {
-		ip := strings.TrimSpace(n.ManagementIP)
-		if ip != "" {
-			entries = append(entries, ipEntry{ip: ip, isDevice: false, index: i})
+	for index := range refreshedNodes {
+		refreshedNodes[index].Status = "unknown"
+		ip, ok := canonicalNodeTarget(&refreshedNodes[index])
+		if !ok {
+			continue
+		}
+		targets = append(targets, target{ip: ip, index: index})
+		if _, exists := seenIPs[ip]; !exists {
+			seenIPs[ip] = struct{}{}
 			ips = append(ips, ip)
 		}
 	}
 
-	if len(ips) == 0 {
-		return devices, nodes, RefreshSummary{}, nil
+	nmapResults := map[string]nmapScanResult{}
+	nmapUsed := len(ips) > 0
+	if nmapUsed {
+		scanCtx, cancel := context.WithTimeout(ctx, batchScanTimeout)
+		results, err := r.nmapScan(scanCtx, r.nmapPath, ips, allCandidatePorts())
+		cancel()
+		if err != nil {
+			return RefreshResult{}, &nmapExecutionError{err: err}
+		}
+		nmapResults = results
 	}
 
-	scanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	nmapResults, err := nmapScan(scanCtx, r.nmapPath, ips, allCandidatePorts())
-	if err != nil {
-		return devices, nodes, RefreshSummary{}, err
-	}
-	summary := RefreshSummary{Checked: len(entries)}
-
-	for _, entry := range entries {
-		nm := nmapResults[entry.ip]
-
-		if entry.isDevice {
-			original := devices[entry.index]
-			updated := applyNmapToDevice(original, nm)
-			updated.IPAddress = entry.ip
-			devices[entry.index] = updated
-			if persistIfChanged(ctx, r.store, original, updated) {
-				summary.Updated++
-			}
-			switch updated.Status {
-			case "online":
-				summary.Online++
-			case "degraded":
-				summary.Degraded++
-			default:
-				summary.Offline++
-			}
+	for _, current := range targets {
+		result := nmapResults[current.ip]
+		result.IP = current.ip
+		if current.isDevice {
+			refreshedDevices[current.index] = applyNmapToDevice(refreshedDevices[current.index], result)
 		} else {
-			original := nodes[entry.index]
-			updated := applyNmapToNode(original, nm)
-			updated.ManagementIP = entry.ip
-			nodes[entry.index] = updated
-			if persistNodeIfChanged(ctx, r.store, original, updated) {
-				summary.Updated++
-			}
-			switch updated.Status {
-			case "online":
-				summary.Online++
-			case "degraded":
-				summary.Degraded++
-			default:
-				summary.Offline++
-			}
+			refreshedNodes[current.index] = applyNmapToNode(refreshedNodes[current.index], result)
 		}
 	}
 
-	return devices, nodes, summary, nil
+	summary := RefreshSummary{Checked: len(devices) + len(nodes)}
+	for index, device := range refreshedDevices {
+		updated, err := persistIfChanged(ctx, r.store, devices[index], device)
+		if err != nil {
+			return RefreshResult{}, err
+		}
+		if updated {
+			summary.Updated++
+		}
+		if device.MACAddress != "" && device.MACAddress != devices[index].MACAddress {
+			summary.MACResolved++
+		}
+		accumulateStatus(&summary, device.Status)
+	}
+	for index, node := range refreshedNodes {
+		updated, err := persistNodeIfChanged(ctx, r.store, nodes[index], node)
+		if err != nil {
+			return RefreshResult{}, err
+		}
+		if updated {
+			summary.Updated++
+		}
+		if node.MACAddress != "" && node.MACAddress != nodes[index].MACAddress {
+			summary.MACResolved++
+		}
+		accumulateStatus(&summary, node.Status)
+	}
+
+	return RefreshResult{
+		Summary: summary, Devices: refreshedDevices, NetworkNodes: refreshedNodes, NmapUsed: nmapUsed,
+	}, nil
 }
 
-func applyNmapToDevice(device store.Device, nm nmapScanResult) store.Device {
-	if nm.MAC != "" && nm.MAC != device.MACAddress {
-		device.MACAddress = nm.MAC
+func applyNmapToDevice(device store.Device, result nmapScanResult) store.Device {
+	device = cloneDevice(device)
+	if result.MAC != "" {
+		device.MACAddress = result.MAC
 	}
-	if nm.Hostname != "" && device.Hostname == "" {
-		device.Hostname = nm.Hostname
+	if result.Hostname != "" && strings.TrimSpace(device.Hostname) == "" {
+		device.Hostname = result.Hostname
 	}
-	if len(nm.OpenPorts) > 0 {
-		if device.Metadata == nil {
-			device.Metadata = map[string]string{}
-		}
-		device.Metadata["lastReachablePorts"] = joinPorts(nm.OpenPorts)
-	}
+	setReachabilityMetadata(device.Metadata, coalesce(device.Hostname, device.IPAddress), result.OpenPorts)
 
 	switch {
-	case nm.Up && len(nm.OpenPorts) > 0:
+	case result.Up || len(result.OpenPorts) > 0:
 		device.Status = "online"
-	case nm.Up:
-		device.Status = "online"
-	case nm.MAC != "":
+	case result.MAC != "":
 		device.Status = "degraded"
 	default:
 		device.Status = "offline"
@@ -271,20 +350,17 @@ func applyNmapToDevice(device store.Device, nm nmapScanResult) store.Device {
 	return device
 }
 
-func applyNmapToNode(node store.NetworkNode, nm nmapScanResult) store.NetworkNode {
-	if nm.MAC != "" && nm.MAC != node.MACAddress {
-		node.MACAddress = nm.MAC
+func applyNmapToNode(node store.NetworkNode, result nmapScanResult) store.NetworkNode {
+	node = cloneNetworkNode(node)
+	if result.MAC != "" {
+		node.MACAddress = result.MAC
 	}
-	if len(nm.OpenPorts) > 0 {
-		if node.Metadata == nil {
-			node.Metadata = map[string]string{}
-		}
-		node.Metadata["lastReachablePorts"] = joinPorts(nm.OpenPorts)
-	}
+	setReachabilityMetadata(node.Metadata, node.ManagementIP, result.OpenPorts)
+
 	switch {
-	case nm.Up:
+	case result.Up || len(result.OpenPorts) > 0:
 		node.Status = "online"
-	case nm.MAC != "":
+	case result.MAC != "":
 		node.Status = "degraded"
 	default:
 		node.Status = "offline"
@@ -292,314 +368,300 @@ func applyNmapToNode(node store.NetworkNode, nm nmapScanResult) store.NetworkNod
 	return node
 }
 
-func (r *Refresher) RefreshAll(ctx context.Context) (RefreshResult, error) {
-	devices, err := r.store.ListDevices(ctx)
+func (r *Refresher) refreshAllFallback(ctx context.Context, devices []store.Device, nodes []store.NetworkNode) (RefreshResult, error) {
+	refreshedDevices, deviceSummary, err := r.refreshDevicesParallel(ctx, devices, r.refreshDeviceFallback)
 	if err != nil {
 		return RefreshResult{}, err
 	}
-	nodes, err := r.store.ListNetworkNodes(ctx)
+	refreshedNodes, nodeSummary, err := r.refreshNodesParallel(ctx, nodes, r.refreshNetworkNodeFallback)
 	if err != nil {
 		return RefreshResult{}, err
 	}
-
-	summary := RefreshSummary{}
-	refreshedDevices, deviceSummary := r.refreshDevicesParallel(ctx, devices)
-	refreshedNodes, nodeSummary := r.refreshNodesParallel(ctx, nodes)
-	summary.Checked = deviceSummary.Checked + nodeSummary.Checked
-	summary.Updated = deviceSummary.Updated + nodeSummary.Updated
-	summary.Online = deviceSummary.Online + nodeSummary.Online
-	summary.Degraded = deviceSummary.Degraded + nodeSummary.Degraded
-	summary.Offline = deviceSummary.Offline + nodeSummary.Offline
-	summary.MACResolved = deviceSummary.MACResolved + nodeSummary.MACResolved
-
 	return RefreshResult{
-		Summary:      summary,
+		Summary:      mergeSummaries(deviceSummary, nodeSummary),
 		Devices:      refreshedDevices,
 		NetworkNodes: refreshedNodes,
 	}, nil
 }
 
-func (r *Refresher) refreshDevicesParallel(ctx context.Context, devices []store.Device) ([]store.Device, RefreshSummary) {
-	type job struct {
-		index  int
-		device store.Device
-	}
+type deviceRefreshFunc func(context.Context, store.Device) (store.Device, bool, string, bool, error)
+
+func (r *Refresher) refreshDevicesParallel(ctx context.Context, devices []store.Device, refresh deviceRefreshFunc) ([]store.Device, RefreshSummary, error) {
 	type result struct {
-		index       int
 		device      store.Device
 		updated     bool
 		status      string
 		macResolved bool
 	}
-
-	refreshed := make([]store.Device, len(devices))
-	summary := RefreshSummary{Checked: len(devices)}
+	results := make([]result, len(devices))
 	if len(devices) == 0 {
-		return refreshed, summary
+		return []store.Device{}, RefreshSummary{}, nil
 	}
 
-	jobs := make(chan job)
-	results := make(chan result, len(devices))
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var next int
+	var workMu sync.Mutex
+	var firstErr error
 	workers := min(len(devices), refreshConcurrency)
-	var wg sync.WaitGroup
-
+	var group sync.WaitGroup
 	for range workers {
-		wg.Add(1)
+		group.Add(1)
 		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				device, updated, status, macResolved, err := r.refreshDevice(ctx, job.device)
+			defer group.Done()
+			for {
+				workMu.Lock()
+				if firstErr != nil || next >= len(devices) {
+					workMu.Unlock()
+					return
+				}
+				index := next
+				next++
+				workMu.Unlock()
+
+				device, updated, status, macResolved, err := refresh(workCtx, cloneDevice(devices[index]))
 				if err != nil {
-					results <- result{index: job.index, device: job.device, status: "offline"}
-					continue
+					workMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+						cancel()
+					}
+					workMu.Unlock()
+					return
 				}
-				results <- result{
-					index:       job.index,
-					device:      device,
-					updated:     updated,
-					status:      status,
-					macResolved: macResolved,
-				}
+				results[index] = result{device: device, updated: updated, status: status, macResolved: macResolved}
 			}
 		}()
 	}
+	group.Wait()
+	if firstErr != nil {
+		return nil, RefreshSummary{}, firstErr
+	}
 
-	go func() {
-		for index, device := range devices {
-			jobs <- job{index: index, device: device}
-		}
-		close(jobs)
-		wg.Wait()
-		close(results)
-	}()
-
-	for current := range results {
-		refreshed[current.index] = current.device
+	refreshed := make([]store.Device, len(results))
+	summary := RefreshSummary{Checked: len(results)}
+	for index, current := range results {
+		refreshed[index] = current.device
 		if current.updated {
 			summary.Updated++
-		}
-		switch current.status {
-		case "online":
-			summary.Online++
-		case "degraded":
-			summary.Degraded++
-		default:
-			summary.Offline++
 		}
 		if current.macResolved {
 			summary.MACResolved++
 		}
+		accumulateStatus(&summary, current.status)
 	}
-
-	return refreshed, summary
+	return refreshed, summary, nil
 }
 
-func (r *Refresher) refreshNodesParallel(ctx context.Context, nodes []store.NetworkNode) ([]store.NetworkNode, RefreshSummary) {
-	type job struct {
-		index int
-		node  store.NetworkNode
-	}
+type nodeRefreshFunc func(context.Context, store.NetworkNode) (store.NetworkNode, bool, string, bool, error)
+
+func (r *Refresher) refreshNodesParallel(ctx context.Context, nodes []store.NetworkNode, refresh nodeRefreshFunc) ([]store.NetworkNode, RefreshSummary, error) {
 	type result struct {
-		index       int
 		node        store.NetworkNode
 		updated     bool
 		status      string
 		macResolved bool
 	}
-
-	refreshed := make([]store.NetworkNode, len(nodes))
-	summary := RefreshSummary{Checked: len(nodes)}
+	results := make([]result, len(nodes))
 	if len(nodes) == 0 {
-		return refreshed, summary
+		return []store.NetworkNode{}, RefreshSummary{}, nil
 	}
 
-	jobs := make(chan job)
-	results := make(chan result, len(nodes))
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var next int
+	var workMu sync.Mutex
+	var firstErr error
 	workers := min(len(nodes), refreshConcurrency)
-	var wg sync.WaitGroup
-
+	var group sync.WaitGroup
 	for range workers {
-		wg.Add(1)
+		group.Add(1)
 		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				node, updated, status, macResolved, err := r.refreshNetworkNode(ctx, job.node)
+			defer group.Done()
+			for {
+				workMu.Lock()
+				if firstErr != nil || next >= len(nodes) {
+					workMu.Unlock()
+					return
+				}
+				index := next
+				next++
+				workMu.Unlock()
+
+				node, updated, status, macResolved, err := refresh(workCtx, cloneNetworkNode(nodes[index]))
 				if err != nil {
-					results <- result{index: job.index, node: job.node, status: "offline"}
-					continue
+					workMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+						cancel()
+					}
+					workMu.Unlock()
+					return
 				}
-				results <- result{
-					index:       job.index,
-					node:        node,
-					updated:     updated,
-					status:      status,
-					macResolved: macResolved,
-				}
+				results[index] = result{node: node, updated: updated, status: status, macResolved: macResolved}
 			}
 		}()
 	}
+	group.Wait()
+	if firstErr != nil {
+		return nil, RefreshSummary{}, firstErr
+	}
 
-	go func() {
-		for index, node := range nodes {
-			jobs <- job{index: index, node: node}
-		}
-		close(jobs)
-		wg.Wait()
-		close(results)
-	}()
-
-	for current := range results {
-		refreshed[current.index] = current.node
+	refreshed := make([]store.NetworkNode, len(results))
+	summary := RefreshSummary{Checked: len(results)}
+	for index, current := range results {
+		refreshed[index] = current.node
 		if current.updated {
 			summary.Updated++
-		}
-		switch current.status {
-		case "online":
-			summary.Online++
-		case "degraded":
-			summary.Degraded++
-		default:
-			summary.Offline++
 		}
 		if current.macResolved {
 			summary.MACResolved++
 		}
+		accumulateStatus(&summary, current.status)
 	}
-
-	return refreshed, summary
+	return refreshed, summary, nil
 }
 
 func (r *Refresher) RefreshDeviceByID(ctx context.Context, id string) error {
+	release, err := r.acquireScan(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	device, err := r.store.GetDevice(ctx, id)
 	if err != nil {
 		return err
 	}
-
 	_, _, _, _, err = r.refreshDevice(ctx, device)
 	return err
 }
 
 func (r *Refresher) RefreshDeviceSnapshotByID(ctx context.Context, id string) (store.Device, error) {
+	release, err := r.acquireScan(ctx)
+	if err != nil {
+		return store.Device{}, err
+	}
+	defer release()
+
 	device, err := r.store.GetDevice(ctx, id)
 	if err != nil {
 		return store.Device{}, err
 	}
-
 	refreshed, _, _, _, err := r.refreshDevice(ctx, device)
 	if err != nil {
 		return store.Device{}, err
 	}
-
 	r.bus.publishJSON(EventDeviceUpdate, refreshed)
 	return refreshed, nil
 }
 
 func (r *Refresher) RefreshNetworkNodeSnapshotByID(ctx context.Context, id string) (store.NetworkNode, error) {
+	release, err := r.acquireScan(ctx)
+	if err != nil {
+		return store.NetworkNode{}, err
+	}
+	defer release()
+
 	node, err := r.store.GetNetworkNode(ctx, id)
 	if err != nil {
 		return store.NetworkNode{}, err
 	}
-
 	refreshed, _, _, _, err := r.refreshNetworkNode(ctx, node)
 	if err != nil {
 		return store.NetworkNode{}, err
 	}
-
 	r.bus.publishJSON(EventNodeUpdate, refreshed)
 	return refreshed, nil
 }
 
 func (r *Refresher) refreshDevice(ctx context.Context, device store.Device) (store.Device, bool, string, bool, error) {
-	if r.nmapPath != "" {
-		return r.refreshDeviceWithNmap(ctx, device)
+	if r.UsingNmap() {
+		refreshed, updated, status, macResolved, err := r.refreshDeviceWithNmap(ctx, device)
+		if err == nil {
+			return refreshed, updated, status, macResolved, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return store.Device{}, false, "unknown", false, ctxErr
+		}
+		var executionError *nmapExecutionError
+		if !errors.As(err, &executionError) {
+			return store.Device{}, false, "unknown", false, err
+		}
 	}
 	return r.refreshDeviceFallback(ctx, device)
 }
 
 func (r *Refresher) refreshDeviceWithNmap(ctx context.Context, device store.Device) (store.Device, bool, string, bool, error) {
-	original := device
-	targetIP := strings.TrimSpace(device.IPAddress)
-
-	if strings.TrimSpace(device.Hostname) != "" {
-		if resolved, err := resolveIPv4(device.Hostname); err == nil {
-			device.IPAddress = resolved
-			targetIP = resolved
-		}
+	original := cloneDevice(device)
+	device = cloneDevice(device)
+	targetIP, ok, err := r.canonicalDeviceTarget(ctx, &device)
+	if err != nil {
+		return store.Device{}, false, "unknown", false, err
 	}
-	if targetIP == "" {
+	if !ok {
 		device.Status = "unknown"
-		return device, persistIfChanged(ctx, r.store, original, device), "unknown", false, nil
+		updated, err := persistIfChanged(ctx, r.store, original, device)
+		return device, updated, device.Status, false, err
 	}
 
-	nm := nmapScanOne(ctx, r.nmapPath, targetIP, candidatePorts(device))
-	device = applyNmapToDevice(device, nm)
-
-	macResolved := nm.MAC != "" && nm.MAC != original.MACAddress
-	updated := persistIfChanged(ctx, r.store, original, device)
-	return device, updated, device.Status, macResolved, nil
+	scanCtx, cancel := context.WithTimeout(ctx, singleScanTimeout)
+	result, err := nmapScanOne(scanCtx, r.nmapScan, r.nmapPath, targetIP, candidatePorts(device))
+	cancel()
+	if err != nil {
+		return store.Device{}, false, "unknown", false, &nmapExecutionError{err: err}
+	}
+	device = applyNmapToDevice(device, result)
+	macResolved := device.MACAddress != "" && device.MACAddress != original.MACAddress
+	updated, err := persistIfChanged(ctx, r.store, original, device)
+	return device, updated, device.Status, macResolved, err
 }
 
 func (r *Refresher) refreshDeviceFallback(ctx context.Context, device store.Device) (store.Device, bool, string, bool, error) {
-	original := device
-	targetIP := strings.TrimSpace(device.IPAddress)
-	macResolved := false
-	if device.Metadata == nil {
-		device.Metadata = map[string]string{}
+	original := cloneDevice(device)
+	device = cloneDevice(device)
+	targetIP, ok, err := r.canonicalDeviceTarget(ctx, &device)
+	if err != nil {
+		return store.Device{}, false, "unknown", false, err
 	}
-
-	if strings.TrimSpace(device.Hostname) != "" {
-		if resolvedIP, err := resolveIPv4(device.Hostname); err == nil {
-			device.IPAddress = resolvedIP
-			targetIP = resolvedIP
-		}
-	}
-
-	if targetIP == "" {
+	if !ok {
 		device.Status = "unknown"
-		return device, persistIfChanged(ctx, r.store, original, device), "unknown", false, nil
+		updated, err := persistIfChanged(ctx, r.store, original, device)
+		return device, updated, device.Status, false, err
 	}
 
-	pingOK := pingHost(targetIP, 1500*time.Millisecond)
-	tcpOpen := false
-	tcpRefused := false
-	var openPorts []string
-	if !pingOK {
-		tcpOpen, tcpRefused, openPorts = probeTCPPorts(targetIP, candidatePorts(device))
+	probeCtx, cancel := context.WithTimeout(ctx, targetProbeTimeout)
+	defer cancel()
+	pingOK, _ := r.probes.pingHost(probeCtx, targetIP, 1500*time.Millisecond)
+	ports := candidatePorts(device)
+	if pingOK {
+		ports = []int{443, 80}
 	}
-	openPorts = mergeOpenPorts(openPorts, probeSelectedPorts(targetIP, 443, 80))
+	tcpOpen, tcpRefused, openPorts, tcpErr := r.probes.probeTCPPorts(probeCtx, targetIP, ports)
+	if tcpErr != nil && probeCtx.Err() == nil {
+		return store.Device{}, false, "unknown", false, tcpErr
+	}
+	if probeCtx.Err() != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return store.Device{}, false, "unknown", false, ctxErr
+		}
+		unknown := cloneDevice(original)
+		unknown.Status = "unknown"
+		updated, persistErr := persistIfChanged(ctx, r.store, original, unknown)
+		return unknown, updated, unknown.Status, false, persistErr
+	}
+
 	hasARP := false
-
-	if pingOK || tcpOpen {
-		device.Status = "online"
-
-		if device.Hostname == "" {
-			if hostname, err := reverseLookup(targetIP); err == nil {
-				device.Hostname = hostname
-			}
-		}
-
-		if macAddress, err := lookupMAC(targetIP); err == nil && macAddress != "" {
-			hasARP = true
-			if macAddress != device.MACAddress {
-				device.MACAddress = macAddress
-				macResolved = true
-			}
-		}
-	} else if macAddress, err := lookupMAC(targetIP); err == nil && macAddress != "" {
+	if macAddress, lookupErr := r.probes.lookupMAC(probeCtx, targetIP); lookupErr == nil && macAddress != "" {
 		hasARP = true
-		if device.MACAddress == "" {
-			device.MACAddress = macAddress
-			macResolved = true
+		device.MACAddress = macAddress
+	}
+	if (pingOK || tcpOpen) && strings.TrimSpace(device.Hostname) == "" {
+		if hostname, lookupErr := r.probes.reverseLookup(probeCtx, targetIP); lookupErr == nil {
+			device.Hostname = hostname
 		}
 	}
-
-	if len(openPorts) > 0 {
-		device.Metadata["lastReachablePorts"] = strings.Join(openPorts, ",")
-	}
-	if panelLink, source, ok := derivePanelLink(device.Metadata, coalesce(strings.TrimSpace(device.Hostname), targetIP), openPorts); ok {
-		device.Metadata["panelLink"] = panelLink
-		device.Metadata["panelLinkSource"] = source
-	}
+	setReachabilityMetadata(device.Metadata, coalesce(device.Hostname, targetIP), parsePorts(openPorts))
 
 	switch {
 	case pingOK || tcpOpen:
@@ -609,79 +671,87 @@ func (r *Refresher) refreshDeviceFallback(ctx context.Context, device store.Devi
 	default:
 		device.Status = "offline"
 	}
-
-	return device, persistIfChanged(ctx, r.store, original, device), device.Status, macResolved, nil
+	macResolved := device.MACAddress != "" && device.MACAddress != original.MACAddress
+	updated, err := persistIfChanged(ctx, r.store, original, device)
+	return device, updated, device.Status, macResolved, err
 }
 
 func (r *Refresher) refreshNetworkNode(ctx context.Context, node store.NetworkNode) (store.NetworkNode, bool, string, bool, error) {
-	if r.nmapPath != "" {
-		return r.refreshNetworkNodeWithNmap(ctx, node)
+	if r.UsingNmap() {
+		refreshed, updated, status, macResolved, err := r.refreshNetworkNodeWithNmap(ctx, node)
+		if err == nil {
+			return refreshed, updated, status, macResolved, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return store.NetworkNode{}, false, "unknown", false, ctxErr
+		}
+		var executionError *nmapExecutionError
+		if !errors.As(err, &executionError) {
+			return store.NetworkNode{}, false, "unknown", false, err
+		}
 	}
 	return r.refreshNetworkNodeFallback(ctx, node)
 }
 
 func (r *Refresher) refreshNetworkNodeWithNmap(ctx context.Context, node store.NetworkNode) (store.NetworkNode, bool, string, bool, error) {
-	original := node
-	targetIP := strings.TrimSpace(node.ManagementIP)
-	if targetIP == "" {
+	original := cloneNetworkNode(node)
+	node = cloneNetworkNode(node)
+	targetIP, ok := canonicalNodeTarget(&node)
+	if !ok {
 		node.Status = "unknown"
-		return node, persistNodeIfChanged(ctx, r.store, original, node), "unknown", false, nil
+		updated, err := persistNodeIfChanged(ctx, r.store, original, node)
+		return node, updated, node.Status, false, err
 	}
 
-	nm := nmapScanOne(ctx, r.nmapPath, targetIP, candidatePortsForNode(node))
-	node = applyNmapToNode(node, nm)
-
-	macResolved := nm.MAC != "" && nm.MAC != original.MACAddress
-	updated := persistNodeIfChanged(ctx, r.store, original, node)
-	return node, updated, node.Status, macResolved, nil
+	scanCtx, cancel := context.WithTimeout(ctx, singleScanTimeout)
+	result, err := nmapScanOne(scanCtx, r.nmapScan, r.nmapPath, targetIP, candidatePortsForNode(node))
+	cancel()
+	if err != nil {
+		return store.NetworkNode{}, false, "unknown", false, &nmapExecutionError{err: err}
+	}
+	node = applyNmapToNode(node, result)
+	macResolved := node.MACAddress != "" && node.MACAddress != original.MACAddress
+	updated, err := persistNodeIfChanged(ctx, r.store, original, node)
+	return node, updated, node.Status, macResolved, err
 }
 
 func (r *Refresher) refreshNetworkNodeFallback(ctx context.Context, node store.NetworkNode) (store.NetworkNode, bool, string, bool, error) {
-	original := node
-	targetIP := strings.TrimSpace(node.ManagementIP)
-	macResolved := false
-	if node.Metadata == nil {
-		node.Metadata = map[string]string{}
-	}
-
-	if targetIP == "" {
+	original := cloneNetworkNode(node)
+	node = cloneNetworkNode(node)
+	targetIP, ok := canonicalNodeTarget(&node)
+	if !ok {
 		node.Status = "unknown"
-		return node, persistNodeIfChanged(ctx, r.store, original, node), "unknown", false, nil
+		updated, err := persistNodeIfChanged(ctx, r.store, original, node)
+		return node, updated, node.Status, false, err
 	}
 
-	pingOK := pingHost(targetIP, 1500*time.Millisecond)
-	tcpOpen := false
-	tcpRefused := false
-	var openPorts []string
-	if !pingOK {
-		tcpOpen, tcpRefused, openPorts = probeTCPPorts(targetIP, candidatePortsForNode(node))
+	probeCtx, cancel := context.WithTimeout(ctx, targetProbeTimeout)
+	defer cancel()
+	pingOK, _ := r.probes.pingHost(probeCtx, targetIP, 1500*time.Millisecond)
+	ports := candidatePortsForNode(node)
+	if pingOK {
+		ports = []int{443, 80}
 	}
-	openPorts = mergeOpenPorts(openPorts, probeSelectedPorts(targetIP, 443, 80))
+	tcpOpen, tcpRefused, openPorts, tcpErr := r.probes.probeTCPPorts(probeCtx, targetIP, ports)
+	if tcpErr != nil && probeCtx.Err() == nil {
+		return store.NetworkNode{}, false, "unknown", false, tcpErr
+	}
+	if probeCtx.Err() != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return store.NetworkNode{}, false, "unknown", false, ctxErr
+		}
+		unknown := cloneNetworkNode(original)
+		unknown.Status = "unknown"
+		updated, persistErr := persistNodeIfChanged(ctx, r.store, original, unknown)
+		return unknown, updated, unknown.Status, false, persistErr
+	}
+
 	hasARP := false
-
-	if pingOK || tcpOpen {
-		if macAddress, err := lookupMAC(targetIP); err == nil && macAddress != "" {
-			hasARP = true
-			if macAddress != node.MACAddress {
-				node.MACAddress = macAddress
-				macResolved = true
-			}
-		}
-	} else if macAddress, err := lookupMAC(targetIP); err == nil && macAddress != "" {
+	if macAddress, lookupErr := r.probes.lookupMAC(probeCtx, targetIP); lookupErr == nil && macAddress != "" {
 		hasARP = true
-		if node.MACAddress == "" {
-			node.MACAddress = macAddress
-			macResolved = true
-		}
+		node.MACAddress = macAddress
 	}
-
-	if len(openPorts) > 0 {
-		node.Metadata["lastReachablePorts"] = strings.Join(openPorts, ",")
-	}
-	if panelLink, source, ok := derivePanelLink(node.Metadata, targetIP, openPorts); ok {
-		node.Metadata["panelLink"] = panelLink
-		node.Metadata["panelLinkSource"] = source
-	}
+	setReachabilityMetadata(node.Metadata, targetIP, parsePorts(openPorts))
 
 	switch {
 	case pingOK || tcpOpen:
@@ -691,168 +761,310 @@ func (r *Refresher) refreshNetworkNodeFallback(ctx context.Context, node store.N
 	default:
 		node.Status = "offline"
 	}
-
-	return node, persistNodeIfChanged(ctx, r.store, original, node), node.Status, macResolved, nil
+	macResolved := node.MACAddress != "" && node.MACAddress != original.MACAddress
+	updated, err := persistNodeIfChanged(ctx, r.store, original, node)
+	return node, updated, node.Status, macResolved, err
 }
 
-func persistIfChanged(ctx context.Context, inventory *store.Store, original store.Device, current store.Device) bool {
-	persisted := current
-	persisted.Status = original.Status
-	if devicesEqualIgnoringStatus(original, persisted) {
-		return false
+func (r *Refresher) canonicalDeviceTarget(ctx context.Context, device *store.Device) (string, bool, error) {
+	candidate := strings.TrimSpace(device.IPAddress)
+	if hostname := strings.TrimSpace(device.Hostname); hostname != "" {
+		resolved, err := r.probes.resolveIPv4(ctx, hostname)
+		if err == nil {
+			candidate = resolved
+		} else if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", false, ctxErr
+		}
 	}
+	canonical, err := canonicalIPv4(candidate)
+	if err != nil {
+		return "", false, nil
+	}
+	device.IPAddress = canonical
+	return canonical, true, nil
+}
 
+func canonicalNodeTarget(node *store.NetworkNode) (string, bool) {
+	canonical, err := canonicalIPv4(node.ManagementIP)
+	if err != nil {
+		return "", false
+	}
+	node.ManagementIP = canonical
+	return canonical, true
+}
+
+func persistIfChanged(ctx context.Context, inventory *store.Store, original store.Device, current store.Device) (bool, error) {
+	persisted := cloneDevice(current)
+	if devicesEqual(original, persisted) {
+		return false, nil
+	}
 	_, err := inventory.UpdateDevice(ctx, persisted)
-	return err == nil
+	return err == nil, err
 }
 
-func persistNodeIfChanged(ctx context.Context, inventory *store.Store, original store.NetworkNode, current store.NetworkNode) bool {
-	persisted := current
-	persisted.Status = original.Status
-	if networkNodesEqualIgnoringStatus(original, persisted) {
-		return false
+func persistNodeIfChanged(ctx context.Context, inventory *store.Store, original store.NetworkNode, current store.NetworkNode) (bool, error) {
+	persisted := cloneNetworkNode(current)
+	if networkNodesEqual(original, persisted) {
+		return false, nil
 	}
-
 	_, err := inventory.UpdateNetworkNode(ctx, persisted)
-	return err == nil
+	return err == nil, err
 }
 
-func devicesEqualIgnoringStatus(left store.Device, right store.Device) bool {
-	if left.Name != right.Name ||
-		left.Hostname != right.Hostname ||
-		left.Role != right.Role ||
-		left.DeviceType != right.DeviceType ||
-		left.IPAddress != right.IPAddress ||
-		left.MACAddress != right.MACAddress ||
-		left.NetworkSegment != right.NetworkSegment ||
-		strings.Join(left.Tags, ",") != strings.Join(right.Tags, ",") {
-		return false
-	}
+func devicesEqual(left store.Device, right store.Device) bool {
+	return left.Name == right.Name &&
+		left.Hostname == right.Hostname &&
+		left.Role == right.Role &&
+		left.DeviceType == right.DeviceType &&
+		left.IPAddress == right.IPAddress &&
+		left.MACAddress == right.MACAddress &&
+		left.NetworkSegment == right.NetworkSegment &&
+		left.Status == right.Status &&
+		slices.Equal(left.Tags, right.Tags) &&
+		maps.Equal(left.Metadata, right.Metadata)
+}
 
-	if len(left.Metadata) != len(right.Metadata) {
-		return false
+func networkNodesEqual(left store.NetworkNode, right store.NetworkNode) bool {
+	return left.Name == right.Name &&
+		left.NodeType == right.NodeType &&
+		left.ManagementIP == right.ManagementIP &&
+		left.MACAddress == right.MACAddress &&
+		left.Vendor == right.Vendor &&
+		left.Model == right.Model &&
+		left.Status == right.Status &&
+		slices.Equal(left.Tags, right.Tags) &&
+		maps.Equal(left.Metadata, right.Metadata)
+}
+
+func cloneDevice(device store.Device) store.Device {
+	device.Tags = slices.Clone(device.Tags)
+	device.Metadata = maps.Clone(device.Metadata)
+	if device.Metadata == nil {
+		device.Metadata = map[string]string{}
 	}
-	for key, value := range left.Metadata {
-		if right.Metadata[key] != value {
-			return false
+	return device
+}
+
+func cloneDevices(devices []store.Device) []store.Device {
+	cloned := make([]store.Device, len(devices))
+	for index, device := range devices {
+		cloned[index] = cloneDevice(device)
+	}
+	return cloned
+}
+
+func cloneNetworkNode(node store.NetworkNode) store.NetworkNode {
+	node.Tags = slices.Clone(node.Tags)
+	node.Metadata = maps.Clone(node.Metadata)
+	if node.Metadata == nil {
+		node.Metadata = map[string]string{}
+	}
+	return node
+}
+
+func cloneNetworkNodes(nodes []store.NetworkNode) []store.NetworkNode {
+	cloned := make([]store.NetworkNode, len(nodes))
+	for index, node := range nodes {
+		cloned[index] = cloneNetworkNode(node)
+	}
+	return cloned
+}
+
+func mergeSummaries(left RefreshSummary, right RefreshSummary) RefreshSummary {
+	return RefreshSummary{
+		Checked: left.Checked + right.Checked, Updated: left.Updated + right.Updated,
+		Online: left.Online + right.Online, Degraded: left.Degraded + right.Degraded,
+		Offline: left.Offline + right.Offline, Unknown: left.Unknown + right.Unknown,
+		MACResolved: left.MACResolved + right.MACResolved,
+	}
+}
+
+func accumulateStatus(summary *RefreshSummary, status string) {
+	switch status {
+	case "online":
+		summary.Online++
+	case "degraded":
+		summary.Degraded++
+	case "offline":
+		summary.Offline++
+	default:
+		summary.Unknown++
+	}
+}
+
+func setReachabilityMetadata(metadata map[string]string, host string, ports []int) {
+	if len(ports) == 0 {
+		delete(metadata, "lastReachablePorts")
+	} else {
+		metadata["lastReachablePorts"] = joinPorts(ports)
+	}
+	stringsPorts := make([]string, len(ports))
+	for index, port := range ports {
+		stringsPorts[index] = strconv.Itoa(port)
+	}
+	if panelLink, source, ok := derivePanelLink(metadata, host, stringsPorts); ok {
+		if panelLink == "" {
+			delete(metadata, "panelLink")
+			delete(metadata, "panelLinkSource")
+		} else {
+			metadata["panelLink"] = panelLink
+			metadata["panelLinkSource"] = source
 		}
 	}
-
-	return true
 }
 
-func networkNodesEqualIgnoringStatus(left store.NetworkNode, right store.NetworkNode) bool {
-	if left.Name != right.Name ||
-		left.NodeType != right.NodeType ||
-		left.ManagementIP != right.ManagementIP ||
-		left.MACAddress != right.MACAddress ||
-		left.Vendor != right.Vendor ||
-		left.Model != right.Model ||
-		strings.Join(left.Tags, ",") != strings.Join(right.Tags, ",") {
-		return false
-	}
-
-	if len(left.Metadata) != len(right.Metadata) {
-		return false
-	}
-	for key, value := range left.Metadata {
-		if right.Metadata[key] != value {
-			return false
+func parsePorts(values []string) []int {
+	ports := make([]int, 0, len(values))
+	for _, value := range values {
+		port, err := strconv.Atoi(value)
+		if err == nil && port > 0 && port <= 65535 {
+			ports = append(ports, port)
 		}
 	}
-
-	return true
+	return ports
 }
 
-func resolveIPv4(hostname string) (string, error) {
-	ips, err := net.LookupIP(hostname)
+func resolveIPv4(ctx context.Context, hostname string) (string, error) {
+	lookupCtx, cancel := context.WithTimeout(ctx, dnsLookupTimeout)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupNetIP(lookupCtx, "ip4", strings.TrimSpace(hostname))
 	if err != nil {
 		return "", err
 	}
-
-	for _, ip := range ips {
-		if ipv4 := ip.To4(); ipv4 != nil {
-			return ipv4.String(), nil
+	for _, address := range addresses {
+		if canonical, err := canonicalIPv4(address.String()); err == nil {
+			return canonical, nil
 		}
 	}
-
-	return "", fmt.Errorf("no ipv4 found")
+	return "", fmt.Errorf("no IPv4 address found")
 }
 
-func reverseLookup(ipAddress string) (string, error) {
-	names, err := net.LookupAddr(ipAddress)
+func reverseLookup(ctx context.Context, ipAddress string) (string, error) {
+	canonical, err := canonicalIPv4(ipAddress)
+	if err != nil {
+		return "", err
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, dnsLookupTimeout)
+	defer cancel()
+	names, err := net.DefaultResolver.LookupAddr(lookupCtx, canonical)
 	if err != nil || len(names) == 0 {
 		return "", fmt.Errorf("reverse lookup failed")
 	}
-
 	return strings.TrimSuffix(names[0], "."), nil
 }
 
-func pingHost(target string, timeout time.Duration) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout+time.Second)
+func pingHost(ctx context.Context, target string, timeout time.Duration) (bool, error) {
+	canonical, err := canonicalIPv4(target)
+	if err != nil {
+		return false, err
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, timeout+time.Second)
 	defer cancel()
 
 	var command *exec.Cmd
 	if runtime.GOOS == "windows" {
-		command = exec.CommandContext(ctx, "ping", "-n", "1", "-w", strconv.Itoa(int(timeout.Milliseconds())), target)
+		// #nosec G204 -- canonical is a parsed IPv4 literal, never an option.
+		command = exec.CommandContext(commandCtx, "ping", "-n", "1", "-w", strconv.Itoa(int(timeout.Milliseconds())), canonical)
 	} else {
-		seconds := int(timeout.Seconds())
-		if seconds < 1 {
-			seconds = 1
-		}
-		command = exec.CommandContext(ctx, "ping", "-c", "1", "-W", strconv.Itoa(seconds), target)
+		seconds := max(1, int(timeout.Seconds()))
+		// #nosec G204 -- canonical is a parsed IPv4 literal, never an option.
+		command = exec.CommandContext(commandCtx, "ping", "-c", "1", "-W", strconv.Itoa(seconds), canonical)
 	}
-
-	return command.Run() == nil
+	err = command.Run()
+	if err == nil {
+		return true, nil
+	}
+	if ctxErr := commandCtx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		return false, nil
+	}
+	return false, err
 }
 
-func lookupMAC(ipAddress string) (string, error) {
-	if runtime.GOOS == "windows" {
-		output, err := exec.Command("arp", "-a", ipAddress).CombinedOutput()
-		if err != nil {
-			return "", err
-		}
-
-		match := macAddressDashRegex.FindString(string(output))
-		if match == "" {
-			return "", fmt.Errorf("no mac address found")
-		}
-
-		return strings.ToUpper(strings.ReplaceAll(match, "-", ":")), nil
-	}
-
-	output, err := exec.Command("arp", "-n", ipAddress).CombinedOutput()
+func lookupMAC(ctx context.Context, ipAddress string) (string, error) {
+	canonical, err := canonicalIPv4(ipAddress)
 	if err != nil {
 		return "", err
 	}
+	commandCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 
-	match := macAddressColonRegex.FindString(string(output))
-	if match == "" {
-		return "", fmt.Errorf("no mac address found")
+	var output []byte
+	if runtime.GOOS == "windows" {
+		// #nosec G204 -- canonical is a parsed IPv4 literal, never an option.
+		output, err = exec.CommandContext(commandCtx, "arp", "-a", canonical).CombinedOutput()
+	} else {
+		// #nosec G204 -- canonical is a parsed IPv4 literal, never an option.
+		output, err = exec.CommandContext(commandCtx, "arp", "-n", canonical).CombinedOutput()
+	}
+	if err != nil {
+		if ctxErr := commandCtx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		return "", err
 	}
 
-	return strings.ToUpper(match), nil
+	pattern := macAddressColonRegex
+	if runtime.GOOS == "windows" {
+		pattern = macAddressDashRegex
+	}
+	match := pattern.FindString(string(output))
+	if match == "" {
+		return "", fmt.Errorf("no MAC address found")
+	}
+	return strings.ToUpper(strings.ReplaceAll(match, "-", ":")), nil
+}
+
+func probeTCPPorts(ctx context.Context, ipAddress string, ports []int) (bool, bool, []string, error) {
+	canonical, err := canonicalIPv4(ipAddress)
+	if err != nil {
+		return false, false, nil, err
+	}
+	openPorts := make([]string, 0)
+	refused := false
+	dialer := net.Dialer{}
+	for _, port := range ports {
+		if port < 1 || port > 65535 {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return len(openPorts) > 0, refused, openPorts, err
+		}
+		portCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+		connection, dialErr := dialer.DialContext(portCtx, "tcp", net.JoinHostPort(canonical, strconv.Itoa(port)))
+		cancel()
+		if dialErr == nil {
+			_ = connection.Close()
+			openPorts = append(openPorts, strconv.Itoa(port))
+			continue
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return len(openPorts) > 0, refused, openPorts, ctxErr
+		}
+		if strings.Contains(strings.ToLower(dialErr.Error()), "connection refused") {
+			refused = true
+		}
+	}
+	return len(openPorts) > 0, refused, openPorts, nil
 }
 
 func candidatePorts(device store.Device) []int {
 	seen := map[int]bool{}
-	var ports []int
-
+	ports := make([]int, 0)
 	add := func(values ...int) {
 		for _, value := range values {
-			if value <= 0 || seen[value] {
-				continue
+			if value > 0 && !seen[value] {
+				seen[value] = true
+				ports = append(ports, value)
 			}
-			seen[value] = true
-			ports = append(ports, value)
 		}
 	}
-
 	add(443, 80, 22, 445)
-
 	deviceType := strings.ToLower(device.DeviceType)
 	role := strings.ToLower(device.Role)
-
 	if strings.Contains(deviceType, "nas") || strings.Contains(role, "storage") {
 		add(5000, 5001, 2049)
 	}
@@ -865,96 +1077,29 @@ func candidatePorts(device store.Device) []int {
 	if strings.Contains(deviceType, "linux") || strings.Contains(deviceType, "raspberry") || strings.Contains(role, "controller") {
 		add(22)
 	}
-
 	return ports
 }
 
 func candidatePortsForNode(node store.NetworkNode) []int {
 	seen := map[int]bool{}
-	var ports []int
-
+	ports := make([]int, 0)
 	add := func(values ...int) {
 		for _, value := range values {
-			if value <= 0 || seen[value] {
-				continue
+			if value > 0 && !seen[value] {
+				seen[value] = true
+				ports = append(ports, value)
 			}
-			seen[value] = true
-			ports = append(ports, value)
 		}
 	}
-
 	add(443, 80, 22, 53, 161)
-
 	nodeType := strings.ToLower(node.NodeType)
-	if strings.Contains(nodeType, "switch") {
+	if strings.Contains(nodeType, "switch") || strings.Contains(nodeType, "access-point") || strings.Contains(nodeType, "ap") {
 		add(22, 80, 443, 161)
 	}
 	if strings.Contains(nodeType, "router") || strings.Contains(nodeType, "gateway") {
 		add(22, 80, 443, 53, 161)
 	}
-	if strings.Contains(nodeType, "access-point") || strings.Contains(nodeType, "ap") {
-		add(22, 80, 443, 161)
-	}
-
 	return ports
-}
-
-func probeTCPPorts(ipAddress string, ports []int) (bool, bool, []string) {
-	for _, port := range ports {
-		address := net.JoinHostPort(ipAddress, strconv.Itoa(port))
-		conn, err := net.DialTimeout("tcp", address, 750*time.Millisecond)
-		if err == nil {
-			openPort := strconv.Itoa(port)
-			_ = conn.Close()
-			return true, false, []string{openPort}
-		}
-
-		errText := strings.ToLower(err.Error())
-		if strings.Contains(errText, "connection refused") {
-			return false, true, nil
-		}
-	}
-
-	return false, false, nil
-}
-
-func probeSelectedPorts(ipAddress string, ports ...int) []string {
-	var openPorts []string
-	for _, port := range ports {
-		address := net.JoinHostPort(ipAddress, strconv.Itoa(port))
-		conn, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			openPorts = append(openPorts, strconv.Itoa(port))
-		}
-	}
-
-	return openPorts
-}
-
-func mergeOpenPorts(base []string, extras []string) []string {
-	if len(extras) == 0 {
-		return base
-	}
-
-	seen := make(map[string]bool, len(base)+len(extras))
-	merged := make([]string, 0, len(base)+len(extras))
-	for _, value := range base {
-		if value == "" || seen[value] {
-			continue
-		}
-		seen[value] = true
-		merged = append(merged, value)
-	}
-	for _, value := range extras {
-		if value == "" || seen[value] {
-			continue
-		}
-		seen[value] = true
-		merged = append(merged, value)
-	}
-
-	return merged
 }
 
 func derivePanelLink(metadata map[string]string, host string, openPorts []string) (string, string, bool) {
@@ -962,24 +1107,13 @@ func derivePanelLink(metadata map[string]string, host string, openPorts []string
 	if host == "" {
 		return "", "", false
 	}
-
 	existing := strings.TrimSpace(metadata["panelLink"])
 	source := strings.TrimSpace(metadata["panelLinkSource"])
 	if existing != "" && source != "auto" {
 		return "", "", false
 	}
-
-	has443 := false
-	has80 := false
-	for _, port := range openPorts {
-		switch strings.TrimSpace(port) {
-		case "443":
-			has443 = true
-		case "80":
-			has80 = true
-		}
-	}
-
+	has443 := slices.Contains(openPorts, "443")
+	has80 := slices.Contains(openPorts, "80")
 	switch {
 	case has443:
 		return "https://" + host, "auto", true
@@ -994,10 +1128,9 @@ func derivePanelLink(metadata map[string]string, host string, openPorts []string
 
 func coalesce(values ...string) string {
 	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
 		}
 	}
-
 	return ""
 }

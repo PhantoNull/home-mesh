@@ -56,10 +56,61 @@ func TestHandleSSEStreamsHeadersAndEventsUntilCancelled(t *testing.T) {
 		t.Fatalf("X-Accel-Buffering = %q, want no", got)
 	}
 	body := writer.BodyString()
-	for _, want := range []string{": connected\n\n", "event: scan\n", `"kind":"scan-started"`} {
+	for _, want := range []string{": connected\n\n", "id: ", "event: scan\n", `"kind":"scan-started"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body %q does not contain %q", body, want)
 		}
+	}
+}
+
+func TestHandleSSEReplaysEventsAfterLastEventID(t *testing.T) {
+	t.Parallel()
+
+	bus := monitor.NewEventBusWithOptions(monitor.EventBusOptions{Generation: "generation-a"})
+	first := bus.Publish(monitor.ScanEvent{Kind: monitor.EventScanStarted, Data: []byte(`{"sequence":1}`)})
+	bus.Publish(monitor.ScanEvent{Kind: monitor.EventDeviceUpdate, Data: []byte(`{"sequence":2}`)})
+
+	writer := newControlledStreamWriter()
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
+	request.Header.Set("Last-Event-ID", first.Cursor())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleSSE(bus).ServeHTTP(writer, request)
+	}()
+	waitForFlush(t, writer.flushes)
+	waitForFlush(t, writer.flushes)
+	cancel()
+	waitForHandler(t, done)
+
+	body := writer.BodyString()
+	if strings.Contains(body, `"sequence":1`) || !strings.Contains(body, `"sequence":2`) {
+		t.Fatalf("unexpected replay body: %q", body)
+	}
+}
+
+func TestHandleSSESignalsResetForUnavailableHistory(t *testing.T) {
+	t.Parallel()
+
+	bus := monitor.NewEventBusWithOptions(monitor.EventBusOptions{Generation: "generation-a"})
+	writer := newControlledStreamWriter()
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
+	request.Header.Set("Last-Event-ID", "old-generation:42")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleSSE(bus).ServeHTTP(writer, request)
+	}()
+	waitForFlush(t, writer.flushes)
+	waitForFlush(t, writer.flushes)
+	cancel()
+	waitForHandler(t, done)
+
+	body := writer.BodyString()
+	if !strings.Contains(body, `"kind":"stream-reset"`) || !strings.Contains(body, `"reason":"history-unavailable"`) {
+		t.Fatalf("reset event missing from body: %q", body)
 	}
 }
 

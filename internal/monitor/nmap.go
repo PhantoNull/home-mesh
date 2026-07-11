@@ -1,15 +1,17 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"fmt"
+	"net/netip"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 )
 
-// nmapScanResult holds the probed state of a single host returned by nmap.
 type nmapScanResult struct {
 	IP        string
 	Up        bool
@@ -19,11 +21,19 @@ type nmapScanResult struct {
 	OpenPorts []int
 }
 
-// --- XML structs matching nmap's -oX output ---
-
 type nmapXMLRun struct {
-	XMLName xml.Name     `xml:"nmaprun"`
-	Hosts   []nmapXMLHost `xml:"host"`
+	XMLName  xml.Name        `xml:"nmaprun"`
+	Hosts    []nmapXMLHost   `xml:"host"`
+	RunStats nmapXMLRunStats `xml:"runstats"`
+}
+
+type nmapXMLRunStats struct {
+	Finished nmapXMLFinished `xml:"finished"`
+}
+
+type nmapXMLFinished struct {
+	Exit     string `xml:"exit,attr"`
+	ErrorMsg string `xml:"errormsg,attr"`
 }
 
 type nmapXMLHost struct {
@@ -57,8 +67,8 @@ type nmapXMLPorts struct {
 }
 
 type nmapXMLPort struct {
-	Protocol string          `xml:"protocol,attr"`
-	PortID   string          `xml:"portid,attr"`
+	Protocol string           `xml:"protocol,attr"`
+	PortID   string           `xml:"portid,attr"`
 	State    nmapXMLPortState `xml:"state"`
 }
 
@@ -66,7 +76,6 @@ type nmapXMLPortState struct {
 	State string `xml:"state,attr"`
 }
 
-// nmapDetect returns the path to nmap if it is installed, or an empty string.
 func nmapDetect() string {
 	path, err := exec.LookPath("nmap")
 	if err != nil {
@@ -75,50 +84,67 @@ func nmapDetect() string {
 	return path
 }
 
-// nmapScan runs a single nmap process over ips with the given ports and returns
-// a map keyed by IPv4 address. Hosts that did not respond are absent from the map.
-//
-// The scan uses TCP connect (-sT) which requires no elevated privileges.
-// Timing template -T4 is aggressive but well-behaved on local networks.
+// nmapScan runs one bounded process for a canonicalized set of IPv4 targets.
+// It deliberately does not use --open: hosts without an open candidate port
+// must remain visible so they are not mistaken for hosts that were never seen.
 func nmapScan(ctx context.Context, nmapPath string, ips []string, ports []int) (map[string]nmapScanResult, error) {
 	if len(ips) == 0 {
 		return map[string]nmapScanResult{}, nil
 	}
 
+	canonicalIPs, err := canonicalIPv4List(ips)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(nmapPath) == "" {
+		return nil, fmt.Errorf("nmap path is empty")
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	// #nosec G204 -- the executable is resolved from administrator configuration;
+	// every dynamic target is a parsed IPv4 literal and ports are numeric.
+	cmd := exec.CommandContext(ctx, nmapPath, nmapArguments(canonicalIPs, ports)...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("nmap failed: %w: %s", err, boundedMessage(stderr.String(), 512))
+	}
+
+	return parseNmapXML(stdout.Bytes())
+}
+
+func nmapArguments(ips []string, ports []int) []string {
 	args := []string{
-		"-sT",               // TCP connect — no root required
-		"-T4",               // aggressive timing
-		"--host-timeout", "6s",
-		"--open",            // only report open ports
-		"-oX", "-",          // XML to stdout
+		"-sT",
+		"-T4",
+		"-oX", "-",
 	}
 	if portList := joinPorts(ports); portList != "" {
 		args = append(args, "-p", portList)
 	}
-	args = append(args, ips...)
-
-	out, err := exec.CommandContext(ctx, nmapPath, args...).Output()
-	if err != nil {
-		// nmap exits non-zero when no hosts are up; still parse what we have.
-		if len(out) == 0 {
-			return map[string]nmapScanResult{}, fmt.Errorf("nmap: %w", err)
-		}
-	}
-
-	return parseNmapXML(out)
+	return append(args, ips...)
 }
 
-// nmapScanOne is a convenience wrapper for probing a single IP.
-func nmapScanOne(ctx context.Context, nmapPath string, ip string, ports []int) nmapScanResult {
-	results, err := nmapScan(ctx, nmapPath, []string{ip}, ports)
-	if err != nil || len(results) == 0 {
-		return nmapScanResult{IP: ip, Up: false}
+// A missing result after a successful process is a conclusive unreachable
+// result. Process and XML errors stay distinct so callers can use real probes.
+func nmapScanOne(ctx context.Context, scan func(context.Context, string, []string, []int) (map[string]nmapScanResult, error), nmapPath string, ip string, ports []int) (nmapScanResult, error) {
+	canonicalIP, err := canonicalIPv4(ip)
+	if err != nil {
+		return nmapScanResult{}, err
 	}
-	result, ok := results[ip]
+	results, err := scan(ctx, nmapPath, []string{canonicalIP}, ports)
+	if err != nil {
+		return nmapScanResult{}, err
+	}
+	result, ok := results[canonicalIP]
 	if !ok {
-		return nmapScanResult{IP: ip, Up: false}
+		return nmapScanResult{IP: canonicalIP}, nil
 	}
-	return result
+	return result, nil
 }
 
 func parseNmapXML(data []byte) (map[string]nmapScanResult, error) {
@@ -126,28 +152,31 @@ func parseNmapXML(data []byte) (map[string]nmapScanResult, error) {
 	if err := xml.Unmarshal(data, &run); err != nil {
 		return nil, fmt.Errorf("parse nmap xml: %w", err)
 	}
+	if run.RunStats.Finished.Exit != "" && run.RunStats.Finished.Exit != "success" {
+		return nil, fmt.Errorf("nmap reported %s: %s", run.RunStats.Finished.Exit, run.RunStats.Finished.ErrorMsg)
+	}
 
 	results := make(map[string]nmapScanResult, len(run.Hosts))
 	for _, host := range run.Hosts {
 		result := nmapScanResult{Up: host.Status.State == "up"}
 
-		for _, addr := range host.Addresses {
-			switch addr.AddrType {
+		for _, address := range host.Addresses {
+			switch address.AddrType {
 			case "ipv4":
-				result.IP = addr.Addr
+				result.IP = address.Addr
 			case "mac":
-				result.MAC = strings.ToUpper(addr.Addr)
-				result.Vendor = addr.Vendor
+				result.MAC = strings.ToUpper(address.Addr)
+				result.Vendor = address.Vendor
 			}
 		}
 		if result.IP == "" {
 			continue
 		}
 
-		for _, hn := range host.Hostnames.List {
-			if hn.Type == "PTR" || result.Hostname == "" {
-				result.Hostname = strings.TrimSuffix(hn.Name, ".")
-				if hn.Type == "PTR" {
+		for _, hostname := range host.Hostnames.List {
+			if hostname.Type == "PTR" || result.Hostname == "" {
+				result.Hostname = strings.TrimSuffix(hostname.Name, ".")
+				if hostname.Type == "PTR" {
 					break
 				}
 			}
@@ -155,39 +184,102 @@ func parseNmapXML(data []byte) (map[string]nmapScanResult, error) {
 
 		for _, port := range host.Ports.List {
 			if port.State.State == "open" && port.Protocol == "tcp" {
-				if n, err := strconv.Atoi(port.PortID); err == nil {
-					result.OpenPorts = append(result.OpenPorts, n)
+				if number, err := strconv.Atoi(port.PortID); err == nil {
+					result.OpenPorts = append(result.OpenPorts, number)
 				}
 			}
 		}
 
-		results[result.IP] = result
+		if normalized, ok := normalizeNmapResult(result); ok {
+			results[normalized.IP] = normalized
+		}
 	}
 
 	return results, nil
 }
 
+func normalizeNmapResult(result nmapScanResult) (nmapScanResult, bool) {
+	canonicalIP, err := canonicalIPv4(result.IP)
+	if err != nil {
+		return nmapScanResult{}, false
+	}
+	result.IP = canonicalIP
+	result.MAC = strings.ToUpper(strings.TrimSpace(result.MAC))
+	result.Hostname = strings.TrimSuffix(strings.TrimSpace(result.Hostname), ".")
+	validPorts := result.OpenPorts[:0]
+	for _, port := range result.OpenPorts {
+		if port >= 1 && port <= 65535 {
+			validPorts = append(validPorts, port)
+		}
+	}
+	result.OpenPorts = validPorts
+	slices.Sort(result.OpenPorts)
+	result.OpenPorts = slices.Compact(result.OpenPorts)
+	return result, true
+}
+
+func canonicalIPv4List(values []string) ([]string, error) {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		canonical, err := canonicalIPv4(value)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seen[canonical]; exists {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		result = append(result, canonical)
+	}
+	return result, nil
+}
+
+func canonicalIPv4(value string) (string, error) {
+	address, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil {
+		return "", fmt.Errorf("invalid IP address %q: %w", value, err)
+	}
+	address = address.Unmap()
+	if !address.Is4() {
+		return "", fmt.Errorf("IP address %q is not IPv4", value)
+	}
+	return address.String(), nil
+}
+
 func joinPorts(ports []int) string {
-	if len(ports) == 0 {
+	filtered := make([]int, 0, len(ports))
+	seen := make(map[int]struct{}, len(ports))
+	for _, port := range ports {
+		if port < 1 || port > 65535 {
+			continue
+		}
+		if _, exists := seen[port]; exists {
+			continue
+		}
+		seen[port] = struct{}{}
+		filtered = append(filtered, port)
+	}
+	if len(filtered) == 0 {
 		return ""
 	}
-	parts := make([]string, len(ports))
-	for i, p := range ports {
-		parts[i] = strconv.Itoa(p)
+
+	slices.Sort(filtered)
+	parts := make([]string, len(filtered))
+	for index, port := range filtered {
+		parts[index] = strconv.Itoa(port)
 	}
 	return strings.Join(parts, ",")
 }
 
-// allCandidatePorts returns the union of ports used across all device/node types.
-// Used for batch scans where we don't know device types in advance.
-func allCandidatePorts() []int {
-	seen := map[int]bool{}
-	var ports []int
-	for _, p := range []int{22, 53, 80, 139, 161, 443, 445, 2049, 5000, 5001, 5985, 5986} {
-		if !seen[p] {
-			seen[p] = true
-			ports = append(ports, p)
-		}
+func boundedMessage(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= limit {
+		return value
 	}
-	return ports
+	return value[:limit]
+}
+
+func allCandidatePorts() []int {
+	return []int{22, 53, 80, 139, 161, 443, 445, 2049, 5000, 5001, 5985, 5986}
 }

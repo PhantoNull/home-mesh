@@ -125,13 +125,6 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load inventory"})
 			return
 		}
-		for i := range snapshot.Devices {
-			snapshot.Devices[i].Status = "unknown"
-		}
-		for i := range snapshot.NetworkNodes {
-			snapshot.NetworkNodes[i].Status = "unknown"
-		}
-
 		writeJSON(w, http.StatusOK, snapshot)
 	})
 

@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -28,7 +29,18 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no") // disable nginx proxy buffering
 
-		id, events := bus.Subscribe()
+		id, events, replayErr := bus.SubscribeFrom(r.Header.Get("Last-Event-ID"))
+		resetStream := false
+		if replayErr != nil {
+			if !errors.Is(replayErr, monitor.ErrEventCursorInvalid) &&
+				!errors.Is(replayErr, monitor.ErrEventHistoryExpired) &&
+				!errors.Is(replayErr, monitor.ErrEventGenerationChange) {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to subscribe to event stream"})
+				return
+			}
+			id, events = bus.Subscribe()
+			resetStream = true
+		}
 		defer bus.Unsubscribe(id)
 
 		if err := writeSSEComment(w, "connected"); err != nil {
@@ -36,6 +48,15 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 		}
 		if err := flushSSE(w); err != nil {
 			return
+		}
+		if resetStream {
+			resetData, _ := json.Marshal(map[string]string{"reason": "history-unavailable"})
+			if err := writeSSEEvent(w, monitor.ScanEvent{Kind: monitor.EventStreamReset, Data: resetData}); err != nil {
+				return
+			}
+			if err := flushSSE(w); err != nil {
+				return
+			}
 		}
 
 		heartbeat := time.NewTicker(sseHeartbeatInterval)
@@ -70,7 +91,17 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 }
 
 func writeSSEEvent(w http.ResponseWriter, event monitor.ScanEvent) error {
-	return writeSSEJSONEvent(w, "scan", event)
+	data, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	if cursor := event.Cursor(); cursor != "" {
+		if _, err := fmt.Fprintf(w, "id: %s\n", cursor); err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintf(w, "event: scan\ndata: %s\n\n", data)
+	return err
 }
 
 func writeSSEJSONEvent(w http.ResponseWriter, eventName string, payload any) error {

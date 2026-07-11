@@ -48,7 +48,7 @@ func main() {
 	}
 
 	bus := monitor.NewEventBus()
-	refresher := monitor.NewRefresher(inventory, bus)
+	refresher := monitor.NewRefresherWithOptions(inventory, bus, monitor.RefresherOptions{NmapPath: cfg.NmapPath})
 	discoveryService := discovery.NewServiceWithOptions(discovery.Options{
 		NmapPath:            cfg.NmapPath,
 		AllowPublicNetworks: cfg.DiscoveryAllowPublic,
