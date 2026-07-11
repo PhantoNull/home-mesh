@@ -39,11 +39,13 @@ type sshCredentialPayload struct {
 }
 
 type sshCredentialResponse struct {
-	DeviceID    string `json:"deviceId"`
-	Username    string `json:"username"`
-	HasPassword bool   `json:"hasPassword"`
-	KeyVersion  int    `json:"keyVersion"`
-	SSHPort     string `json:"sshPort"`
+	DeviceID          string `json:"deviceId"`
+	Username          string `json:"username"`
+	HasPassword       bool   `json:"hasPassword"`
+	KeyVersion        int    `json:"keyVersion"`
+	SSHPort           string `json:"sshPort"`
+	Available         bool   `json:"available"`
+	UnavailableReason string `json:"unavailableReason,omitempty"`
 }
 
 type sshCommandPayload struct {
@@ -340,14 +342,21 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 
 		switch r.Method {
 		case http.MethodGet:
+			available := secretService != nil
+			unavailableReason := ""
+			if !available {
+				unavailableReason = "SSH credential storage is not configured."
+			}
 			credential, err := inventory.GetSSHCredential(r.Context(), id)
 			if errors.Is(err, store.ErrNotFound) {
 				writeJSON(w, http.StatusOK, sshCredentialResponse{
-					DeviceID:    id,
-					Username:    "",
-					HasPassword: false,
-					KeyVersion:  1,
-					SSHPort:     sshPortForDevice(device),
+					DeviceID:          id,
+					Username:          "",
+					HasPassword:       false,
+					KeyVersion:        currentSecretVersion(secretService),
+					SSHPort:           sshPortForDevice(device),
+					Available:         available,
+					UnavailableReason: unavailableReason,
 				})
 				return
 			}
@@ -356,11 +365,13 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			}
 
 			writeJSON(w, http.StatusOK, sshCredentialResponse{
-				DeviceID:    credential.DeviceID,
-				Username:    credential.Username,
-				HasPassword: credential.HasPassword,
-				KeyVersion:  credential.KeyVersion,
-				SSHPort:     sshPortForDevice(device),
+				DeviceID:          credential.DeviceID,
+				Username:          credential.Username,
+				HasPassword:       credential.HasPassword,
+				KeyVersion:        credential.KeyVersion,
+				SSHPort:           sshPortForDevice(device),
+				Available:         available,
+				UnavailableReason: unavailableReason,
 			})
 		case http.MethodPut:
 			if secretService == nil {
@@ -387,31 +398,21 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 				return
 			}
 
-			ciphertext, nonce, err := secretService.Encrypt(payload.Password)
+			ciphertext, nonce, keyVersion, err := secretService.EncryptFor(sshCredentialScope(id), payload.Password)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encrypt ssh password"})
 				return
 			}
 
-			credential, err := inventory.UpsertSSHCredential(r.Context(), store.SSHCredential{
+			credential, err := inventory.UpsertSSHCredentialAndPort(r.Context(), store.SSHCredential{
 				DeviceID:           id,
 				Username:           strings.TrimSpace(payload.Username),
 				PasswordCiphertext: ciphertext,
 				PasswordNonce:      nonce,
-				KeyVersion:         1,
-			})
+				KeyVersion:         keyVersion,
+			}, sshPort)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist ssh credential"})
-				return
-			}
-
-			if device.Metadata == nil {
-				device.Metadata = map[string]string{}
-			}
-			device.Metadata["sshPort"] = sshPort
-			device, err = inventory.UpdateDevice(r.Context(), device)
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist ssh port"})
 				return
 			}
 
@@ -420,7 +421,8 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 				Username:    credential.Username,
 				HasPassword: credential.HasPassword,
 				KeyVersion:  credential.KeyVersion,
-				SSHPort:     sshPortForDevice(device),
+				SSHPort:     sshPort,
+				Available:   true,
 			})
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodPut)
@@ -462,7 +464,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			return
 		}
 
-		password, err := secretService.Decrypt(credential.PasswordCiphertext, credential.PasswordNonce)
+		password, err := decryptAndRotateSSHCredential(r.Context(), inventory, secretService, credential)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to decrypt ssh password"})
 			return
@@ -548,7 +550,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			return
 		}
 
-		password, err := secretService.Decrypt(credential.PasswordCiphertext, credential.PasswordNonce)
+		password, err := decryptAndRotateSSHCredential(r.Context(), inventory, secretService, credential)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to decrypt ssh password"})
 			return

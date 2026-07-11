@@ -677,6 +677,28 @@ func (s *Store) GetSSHCredential(ctx context.Context, deviceID string) (SSHCrede
 	return credential, err
 }
 
+func (s *Store) ListSSHCredentials(ctx context.Context) ([]SSHCredential, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT device_id, username, password_ciphertext, password_nonce, key_version, created_at, updated_at
+		FROM ssh_credentials
+		ORDER BY device_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	credentials := make([]SSHCredential, 0)
+	for rows.Next() {
+		credential, err := scanSSHCredential(rows)
+		if err != nil {
+			return nil, err
+		}
+		credentials = append(credentials, credential)
+	}
+	return credentials, rows.Err()
+}
+
 func (s *Store) UpsertSSHCredential(ctx context.Context, credential SSHCredential) (SSHCredential, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

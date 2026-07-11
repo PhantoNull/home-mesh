@@ -92,9 +92,9 @@ The project is split into two main parts:
 
 ### Prerequisites
 
-- Go 1.22+
-- Node.js 20+
-- npm 10+
+- Go 1.25+
+- Node.js 24+
+- npm 11+
 - Docker Desktop or Docker Engine
 
 ### Environment
@@ -112,12 +112,16 @@ Required values:
 - optionally `HOME_MESH_NMAP_PATH`
 - optionally `HOME_MESH_DISCOVERY_ALLOW_PUBLIC` for an explicit, high-risk
   public-range scan opt-in
+- optionally `HOME_MESH_SEED_DEMO_DATA=true` for a disposable, empty database
 - optionally `HOME_MESH_WEB_PORT`
 
 Example:
 
 ```dotenv
 HOME_MESH_MASTER_KEY=replace-with-a-base64-encoded-32-byte-key
+HOME_MESH_MASTER_KEY_VERSION=2
+HOME_MESH_PREVIOUS_MASTER_KEYS=
+HOME_MESH_SEED_DEMO_DATA=false
 HOME_MESH_SESSION_SECRET=replace-with-a-long-random-session-secret
 HOME_MESH_AUTH_DISABLED=false
 HOME_MESH_TRUSTED_PROXY_CIDRS=172.16.0.0/12
@@ -230,7 +234,17 @@ docker compose down
 
 SSH passwords are not stored in plaintext.
 
-They are encrypted server-side using the configured master key. Without `HOME_MESH_MASTER_KEY`, encrypted SSH credential storage and SSH execution will not work.
+They are encrypted server-side using XChaCha20-Poly1305 and authenticated against
+the owning device ID. Without `HOME_MESH_MASTER_KEY`, encrypted SSH credential
+storage and SSH execution will not work. Startup validates all stored credentials
+before accepting traffic, so a missing or incorrect key fails immediately.
+
+To rotate the key, increment `HOME_MESH_MASTER_KEY_VERSION`, put the new key in
+`HOME_MESH_MASTER_KEY`, and retain older keys in
+`HOME_MESH_PREVIOUS_MASTER_KEYS` as comma-separated `version:base64` entries.
+Previous versions must be lower than the current version. Readable legacy rows
+are re-encrypted with the current key during startup; remove an old key only
+after one successful start has completed that migration.
 
 ### Application Authentication
 
@@ -282,6 +296,11 @@ SQLite data is stored in:
 - `data/home-mesh.db`
 
 That directory should be treated as local state, not source code.
+
+Schema migrations, integrity checks, foreign-key checks, and file-permission
+hardening run automatically when the store opens. Fresh databases start empty;
+demo inventory is inserted only with `HOME_MESH_SEED_DEMO_DATA=true` and only
+when every application table is empty.
 
 ### Discovery And Background Scanning
 

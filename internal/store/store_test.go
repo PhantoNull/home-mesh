@@ -314,6 +314,10 @@ func TestUpsertSSHCredentialAndPortIsAtomic(t *testing.T) {
 	if err != nil || storedCredential.Username != "root" {
 		t.Fatalf("stored credential %+v, error %v", storedCredential, err)
 	}
+	credentials, err := store.ListSSHCredentials(ctx)
+	if err != nil || len(credentials) != 1 || credentials[0].DeviceID != device.ID {
+		t.Fatalf("listed credentials %+v, error %v", credentials, err)
+	}
 	storedDevice, err := store.GetDevice(ctx, device.ID)
 	if err != nil || storedDevice.Metadata["sshPort"] != "2222" {
 		t.Fatalf("stored device %+v, error %v", storedDevice, err)

@@ -20,24 +20,11 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
-	inventory, err := store.New(cfg.DBPath)
+	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() {
-		if closeErr := inventory.Close(); closeErr != nil {
-			log.Printf("close store: %v", closeErr)
-		}
-	}()
-
-	bus := monitor.NewEventBus()
-	refresher := monitor.NewRefresher(inventory, bus)
-	discoveryService := discovery.NewServiceWithOptions(discovery.Options{
-		NmapPath:            cfg.NmapPath,
-		AllowPublicNetworks: cfg.DiscoveryAllowPublic,
-	})
-	secretService, err := secrets.New(cfg.MasterKeyBase)
+	secretService, err := secrets.NewKeyring(cfg.MasterKeyBase, cfg.MasterKeyVersion, cfg.PreviousMasterKeys)
 	if err != nil && err != secrets.ErrUnavailable {
 		log.Fatal(err)
 	}
@@ -47,6 +34,25 @@ func main() {
 		log.Fatal(err)
 	}
 
+	inventory, err := store.NewWithOptions(cfg.DBPath, store.Options{SeedDemo: cfg.SeedDemoData})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if closeErr := inventory.Close(); closeErr != nil {
+			log.Printf("close store: %v", closeErr)
+		}
+	}()
+	if err := api.ValidateSSHCredentials(context.Background(), inventory, secretService); err != nil {
+		log.Fatal(err)
+	}
+
+	bus := monitor.NewEventBus()
+	refresher := monitor.NewRefresher(inventory, bus)
+	discoveryService := discovery.NewServiceWithOptions(discovery.Options{
+		NmapPath:            cfg.NmapPath,
+		AllowPublicNetworks: cfg.DiscoveryAllowPublic,
+	})
 	router, err := api.NewRouter(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback)
 	if err != nil {
 		log.Fatal(err)
