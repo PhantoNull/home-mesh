@@ -104,8 +104,8 @@ Create a local `.env` from `.env.example`.
 Required values:
 
 - `HOME_MESH_MASTER_KEY`
-- `HOME_MESH_SESSION_SECRET`
-- `HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD`
+- `HOME_MESH_SESSION_SECRET` with at least 32 bytes
+- `HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD` with at least 12 bytes on first start
 - optionally `HOME_MESH_SCAN_INTERVAL`
 - optionally `HOME_MESH_SSH_HOST_KEY_MODE`
 - optionally `HOME_MESH_NMAP_PATH`
@@ -116,9 +116,10 @@ Example:
 ```dotenv
 HOME_MESH_MASTER_KEY=replace-with-a-base64-encoded-32-byte-key
 HOME_MESH_SESSION_SECRET=replace-with-a-long-random-session-secret
+HOME_MESH_AUTH_DISABLED=false
 HOME_MESH_BOOTSTRAP_ADMIN_USERNAME=root
 HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password-for-first-start-only
-HOME_MESH_SSH_HOST_KEY_MODE=insecure
+HOME_MESH_SSH_HOST_KEY_MODE=known_hosts
 HOME_MESH_NMAP_PATH=nmap
 HOME_MESH_SCAN_INTERVAL=30s
 HOME_MESH_HTTP_ADDR=:8080
@@ -227,9 +228,10 @@ They are encrypted server-side using the configured master key. Without `HOME_ME
 
 ### Application Authentication
 
-Home Mesh can protect all backend APIs with a single application-level login.
-
-When `HOME_MESH_SESSION_SECRET` is set and an admin account exists in SQLite, the backend requires authentication for all protected `/api/*` routes.
+Home Mesh protects backend APIs with a single application-level login. Startup
+fails closed when `HOME_MESH_SESSION_SECRET` is missing or shorter than 32 bytes.
+An intentionally unauthenticated development runtime requires the explicit
+`HOME_MESH_AUTH_DISABLED=true` opt-out; never use that mode on a shared network.
 
 First-start bootstrap:
 
@@ -251,17 +253,16 @@ This protection applies server-side, so direct requests to the backend API are a
 
 ### SSH Host Key Mode
 
-Development default:
+The secure default is `HOME_MESH_SSH_HOST_KEY_MODE=known_hosts`. Compose reads
+host keys from `data/known_hosts`; populate that file with keys verified through
+a trusted channel before opening an SSH session.
 
-- `HOME_MESH_SSH_HOST_KEY_MODE=insecure`
-
-More secure option:
-
-- `HOME_MESH_SSH_HOST_KEY_MODE=known_hosts`
-
-When using `known_hosts`, the backend also needs:
+Native execution can override the default user known-hosts file with:
 
 - `HOME_MESH_SSH_KNOWN_HOSTS_PATH`
+
+`insecure` mode remains an explicit development-only escape hatch and disables
+server identity verification.
 
 ### Database
 

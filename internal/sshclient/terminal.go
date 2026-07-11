@@ -1,6 +1,7 @@
 package sshclient
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
@@ -17,18 +18,15 @@ type TerminalSession struct {
 }
 
 func StartPasswordTerminal(address string, username string, password string, cols int, rows int, timeout time.Duration, hostKeyCallback ssh.HostKeyCallback) (*TerminalSession, error) {
-	config := &ssh.ClientConfig{
-		User: username,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(password),
-		},
-		HostKeyCallback: hostKeyCallback,
-		Timeout:         timeout,
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return StartPasswordTerminalContext(ctx, address, username, password, cols, rows, timeout, hostKeyCallback)
+}
 
-	client, err := ssh.Dial("tcp", address, config)
+func StartPasswordTerminalContext(ctx context.Context, address string, username string, password string, cols int, rows int, connectTimeout time.Duration, hostKeyCallback ssh.HostKeyCallback) (*TerminalSession, error) {
+	client, err := dialPassword(ctx, address, username, password, connectTimeout, hostKeyCallback)
 	if err != nil {
-		return nil, fmt.Errorf("connect ssh: %w", err)
+		return nil, err
 	}
 
 	session, err := client.NewSession()

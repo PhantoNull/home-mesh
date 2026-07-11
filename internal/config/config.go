@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"time"
 )
 
@@ -15,6 +16,7 @@ type Config struct {
 	SSHHostKeyMode         string
 	KnownHostsPath         string
 	SessionSecret          string
+	AuthDisabled           bool
 	BootstrapAdminUsername string
 	BootstrapAdminPassword string
 	ScanInterval           time.Duration
@@ -31,10 +33,15 @@ func Load() Config {
 		SSHHostKeyMode:         getEnv("HOME_MESH_SSH_HOST_KEY_MODE", defaultSSHHostKeyMode()),
 		KnownHostsPath:         getEnv("HOME_MESH_SSH_KNOWN_HOSTS_PATH", defaultKnownHostsPath()),
 		SessionSecret:          getEnv("HOME_MESH_SESSION_SECRET", ""),
+		AuthDisabled:           explicitTrue("HOME_MESH_AUTH_DISABLED"),
 		BootstrapAdminUsername: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_USERNAME", "root"),
 		BootstrapAdminPassword: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD", ""),
 		ScanInterval:           parseDuration(getEnv("HOME_MESH_SCAN_INTERVAL", "30s")),
 	}
+}
+
+func explicitTrue(key string) bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv(key)), "true")
 }
 
 func defaultNmapPath() string {
@@ -46,10 +53,6 @@ func defaultNmapPath() string {
 }
 
 func defaultSSHHostKeyMode() string {
-	if getEnv("HOME_MESH_ENV", "development") == "development" {
-		return "insecure"
-	}
-
 	return "known_hosts"
 }
 

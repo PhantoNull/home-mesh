@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/PhantoNull/home-mesh/internal/config"
 	"github.com/PhantoNull/home-mesh/internal/store"
 )
 
@@ -35,6 +37,50 @@ func TestVerifyPasswordRejectsMalformedHash(t *testing.T) {
 
 	if verifyPassword("irrelevant", "not-a-valid-hash") {
 		t.Fatal("verifyPassword accepted malformed hash")
+	}
+}
+
+func TestVerifyPasswordRejectsUntrustedArgon2Parameters(t *testing.T) {
+	t.Parallel()
+
+	hash, err := hashPassword("s3cret-pass")
+	if err != nil {
+		t.Fatalf("hashPassword returned error: %v", err)
+	}
+	parts := strings.Split(hash, "$")
+	parts[2] = strconv.FormatUint(uint64(argon2Memory)+1, 10)
+
+	if verifyPassword("s3cret-pass", strings.Join(parts, "$")) {
+		t.Fatal("verifyPassword accepted untrusted Argon2 parameters")
+	}
+}
+
+func TestNewAuthManagerFailsClosedWithoutSessionSecret(t *testing.T) {
+	t.Parallel()
+
+	if _, err := newAuthManager(config.Config{}, nil); err == nil {
+		t.Fatal("expected missing session secret to fail closed")
+	}
+}
+
+func TestNewAuthManagerAllowsExplicitDisabledMode(t *testing.T) {
+	t.Parallel()
+
+	auth, err := newAuthManager(config.Config{AuthDisabled: true}, nil)
+	if err != nil {
+		t.Fatalf("newAuthManager returned error: %v", err)
+	}
+	if auth.enabled {
+		t.Fatal("expected explicit disabled mode")
+	}
+}
+
+func TestNewAuthManagerRejectsShortSessionSecret(t *testing.T) {
+	t.Parallel()
+
+	_, err := newAuthManager(config.Config{SessionSecret: "too-short"}, nil)
+	if err == nil {
+		t.Fatal("expected short session secret to be rejected")
 	}
 }
 

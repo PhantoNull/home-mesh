@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -22,6 +23,12 @@ import (
 )
 
 const sessionCookieName = "home_mesh_session"
+
+const (
+	minSessionSecretBytes = 32
+	minBootstrapPassword  = 12
+	argon2SaltLen         = 16
+)
 
 type authManager struct {
 	enabled       bool
@@ -155,9 +162,16 @@ const (
 )
 
 func newAuthManager(cfg config.Config, inventory *store.Store) (*authManager, error) {
+	if cfg.AuthDisabled {
+		return &authManager{enabled: false}, nil
+	}
+
 	sessionSecret := strings.TrimSpace(cfg.SessionSecret)
 	if sessionSecret == "" {
-		return &authManager{enabled: false}, nil
+		return nil, errors.New("HOME_MESH_SESSION_SECRET is required; set HOME_MESH_AUTH_DISABLED=true only for an intentionally unauthenticated runtime")
+	}
+	if len(sessionSecret) < minSessionSecretBytes {
+		return nil, fmt.Errorf("HOME_MESH_SESSION_SECRET must contain at least %d bytes", minSessionSecretBytes)
 	}
 
 	account, err := inventory.GetAdminAccount(context.Background())
@@ -168,11 +182,18 @@ func newAuthManager(cfg config.Config, inventory *store.Store) (*authManager, er
 		if bootstrapPassword == "" {
 			return nil, errors.New("HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD is required until the first admin account is created")
 		}
+		if len(bootstrapPassword) < minBootstrapPassword {
+			return nil, fmt.Errorf("HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD must contain at least %d bytes", minBootstrapPassword)
+		}
+		bootstrapUsername := strings.TrimSpace(cfg.BootstrapAdminUsername)
+		if bootstrapUsername == "" {
+			return nil, errors.New("HOME_MESH_BOOTSTRAP_ADMIN_USERNAME must not be empty")
+		}
 		hash, hashErr := hashPassword(bootstrapPassword)
 		if hashErr != nil {
 			return nil, hashErr
 		}
-		account, err = inventory.BootstrapAdminAccount(context.Background(), strings.TrimSpace(cfg.BootstrapAdminUsername), hash)
+		account, err = inventory.BootstrapAdminAccount(context.Background(), bootstrapUsername, hash)
 		if err != nil {
 			return nil, err
 		}
@@ -421,7 +442,13 @@ func verifyPassword(password string, encoded string) bool {
 	if err != nil {
 		return false
 	}
+	if timeCost != argon2Time || memoryCost != argon2Memory || threads != argon2Threads {
+		return false
+	}
+	if len(salt) != argon2SaltLen || len(expected) != argon2KeyLen {
+		return false
+	}
 
-	actual := argon2.IDKey([]byte(password), salt, uint32(timeCost), uint32(memoryCost), uint8(threads), uint32(len(expected)))
+	actual := argon2.IDKey([]byte(password), salt, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
 	return subtle.ConstantTimeCompare(actual, expected) == 1
 }
