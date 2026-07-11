@@ -1,9 +1,43 @@
-import { type ReactNode, useEffect, useRef, useState } from 'react'
+import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useRef, useState } from 'react'
+import {
+  ArrowDown,
+  ArrowUp,
+  ChevronDown,
+  ChevronUp,
+  Columns3,
+  ExternalLink,
+  History,
+  List,
+  LogOut,
+  Network,
+  Pencil,
+  Plus,
+  Power,
+  RefreshCw,
+  ScanLine,
+  SquareTerminal,
+  Trash2,
+  UserCircle,
+} from 'lucide-react'
+import DraggableModal from './DraggableModal'
+import RelationEditor, { type RelationDraft } from './RelationEditor'
+import { parseSSHServerMessage } from './ssh-events'
 import {
   parseDiscoveryCompleteEvent,
   parseDiscoveryErrorEvent,
   parseDiscoveryHostEvent,
 } from './discovery-events'
+import {
+  getSafePanelLink,
+  moveItemByOffset,
+  normalizePanelURL,
+  panelURLValidationError,
+  parseBulkRefreshResponse,
+  resolveSSHCapability,
+  statusClassName,
+  topologyEntityKey,
+  truncateTopologyLabel,
+} from './frontend-utils'
 import {
   type Action,
   type DiscoveryCapabilities,
@@ -32,7 +66,6 @@ import {
 type MetricCardProps = {
   title: string
   value: string
-  description: string
   accent: 'blue' | 'green' | 'amber'
 }
 
@@ -77,6 +110,7 @@ type SSHCredentialFormProps = {
 type SSHTerminalPaneProps = {
   deviceId: string
   enabled: boolean
+  unavailableReason?: string | null
   sessionKey: number
   onConnectionState: (message: string) => void
   onReconnect: () => void
@@ -92,15 +126,6 @@ type EndpointListProps = {
   onWake: (device: Device) => Promise<void>
   onDelete: (device: Device) => Promise<void>
   onReorder: (items: Device[]) => Promise<void>
-}
-
-type DraggableModalProps = {
-  label: string
-  title: string
-  meta?: ReactNode
-  widthClassName?: string
-  children: ReactNode
-  onClose: () => void
 }
 
 type CollapsibleSectionProps = {
@@ -131,10 +156,6 @@ function moveByIds<T extends { id: string }>(items: T[], fromId: string, toId: s
   return next
 }
 
-function getPanelLink(metadata?: Record<string, string>): string {
-  return metadata?.panelLink?.trim() ?? ''
-}
-
 function writeDragID(dataTransfer: DataTransfer, kind: string, id: string) {
   dataTransfer.effectAllowed = 'move'
   dataTransfer.setData('text/plain', id)
@@ -163,25 +184,12 @@ function isValidCIDR(value: string): boolean {
   return !(Number.isNaN(prefix) || prefix < 0 || prefix > 32)
 }
 
-function mergeRuntimeStatuses(snapshot: InventorySnapshot, previous: InventorySnapshot | null): InventorySnapshot {
-  if (!previous) {
-    return snapshot
+function createRelationID(): string {
+  if (typeof crypto.randomUUID === 'function') {
+    return `rel-${crypto.randomUUID()}`
   }
-
-  const deviceStatusByID = new Map(previous.devices.map((device) => [device.id, device.status]))
-  const nodeStatusByID = new Map(previous.networkNodes.map((node) => [node.id, node.status]))
-
-  return {
-    ...snapshot,
-    devices: snapshot.devices.map((device) => ({
-      ...device,
-      status: deviceStatusByID.get(device.id) ?? device.status,
-    })),
-    networkNodes: snapshot.networkNodes.map((node) => ({
-      ...node,
-      status: nodeStatusByID.get(node.id) ?? node.status,
-    })),
-  }
+  const entropy = crypto.getRandomValues(new Uint32Array(2))
+  return `rel-${Date.now().toString(36)}-${entropy[0].toString(36)}${entropy[1].toString(36)}`
 }
 
 function updateDeviceInSnapshot(snapshot: InventorySnapshot, device: Device): InventorySnapshot {
@@ -198,12 +206,11 @@ function updateNetworkNodeInSnapshot(snapshot: InventorySnapshot, node: NetworkN
   }
 }
 
-function MetricCard({ title, value, description, accent }: MetricCardProps) {
+function MetricCard({ title, value, accent }: MetricCardProps) {
   return (
     <article className={`metric-card metric-card--${accent}`}>
       <p className="metric-card__title">{title}</p>
       <strong className="metric-card__value">{value}</strong>
-      <p className="metric-card__description">{description}</p>
     </article>
   )
 }
@@ -213,20 +220,25 @@ function AuthPanel({ submitState, errorMessage, draft, onChange, onSubmit }: Aut
     <section className="feedback-panel auth-panel">
       <p className="section-label">Authentication</p>
       <h2>Sign in to Home Mesh</h2>
-      <p>This application requires a valid session before any inventory or control API can be accessed.</p>
       <form
         className="device-form"
-        autoComplete="off"
+        autoComplete="on"
         onSubmit={(event) => {
           event.preventDefault()
           void onSubmit()
         }}
       >
-        {errorMessage ? <div className="inline-error">{errorMessage}</div> : null}
+        {errorMessage ? <div className="inline-error" role="alert">{errorMessage}</div> : null}
         <div className="form-grid">
           <label className="form-field">
             <span>Username</span>
-            <input value={draft.username} onChange={(event) => onChange('username', event.target.value)} autoComplete="off" name="home-mesh-login-user" />
+            <input
+              value={draft.username}
+              onChange={(event) => onChange('username', event.target.value)}
+              autoComplete="username"
+              name="username"
+              required
+            />
           </label>
           <label className="form-field">
             <span>Password</span>
@@ -234,8 +246,9 @@ function AuthPanel({ submitState, errorMessage, draft, onChange, onSubmit }: Aut
               type="password"
               value={draft.password}
               onChange={(event) => onChange('password', event.target.value)}
-              autoComplete="new-password"
-              name="home-mesh-login-pass"
+              autoComplete="current-password"
+              name="password"
+              required
             />
           </label>
         </div>
@@ -246,105 +259,6 @@ function AuthPanel({ submitState, errorMessage, draft, onChange, onSubmit }: Aut
         </div>
       </form>
     </section>
-  )
-}
-
-function DraggableModal({ label, title, meta, widthClassName, children, onClose }: DraggableModalProps) {
-  const [position, setPosition] = useState<{ x: number; y: number } | null>(null)
-  const dragState = useRef<{ offsetX: number; offsetY: number } | null>(null)
-
-  useEffect(() => {
-    const handleMouseMove = (event: MouseEvent) => {
-      if (!dragState.current) {
-        return
-      }
-
-      setPosition({
-        x: event.clientX - dragState.current.offsetX,
-        y: event.clientY - dragState.current.offsetY,
-      })
-    }
-
-    const stopDragging = () => {
-      dragState.current = null
-    }
-
-    window.addEventListener('mousemove', handleMouseMove)
-    window.addEventListener('mouseup', stopDragging)
-
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove)
-      window.removeEventListener('mouseup', stopDragging)
-    }
-  }, [])
-
-  const className = widthClassName ? `modal-panel ${widthClassName}` : 'modal-panel'
-
-  return (
-    <div
-      className="modal-overlay"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) {
-          onClose()
-        }
-      }}
-    >
-      <section
-        className={className}
-        style={
-          position
-            ? {
-                left: `${position.x}px`,
-                top: `${position.y}px`,
-                transform: 'none',
-              }
-            : undefined
-        }
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <div
-          className="modal-panel__header"
-          onMouseDown={(event) => {
-            const target = event.target as HTMLElement
-            if (target.closest('button, input, textarea, select, a')) {
-              return
-            }
-
-            const panel = event.currentTarget.parentElement
-            if (!panel) {
-              return
-            }
-
-            const rect = panel.getBoundingClientRect()
-            dragState.current = {
-              offsetX: event.clientX - rect.left,
-              offsetY: event.clientY - rect.top,
-            }
-
-            setPosition({
-              x: rect.left,
-              y: rect.top,
-            })
-          }}
-        >
-          <div className="modal-panel__title-group">
-            <p className="section-label">{label}</p>
-            <h2>{title}</h2>
-            {meta ? <div className="modal-panel__meta">{meta}</div> : null}
-          </div>
-          <button
-            type="button"
-            className="icon-danger-button"
-            onClick={onClose}
-            aria-label={`Close ${title}`}
-            title={`Close ${title}`}
-          >
-            X
-          </button>
-        </div>
-        {children}
-      </section>
-    </div>
   )
 }
 
@@ -365,7 +279,7 @@ function CollapsibleSection({ label, title, defaultCollapsed = false, children }
           aria-label={collapsed ? `Expand ${title}` : `Collapse ${title}`}
           title={collapsed ? `Expand ${title}` : `Collapse ${title}`}
         >
-          {collapsed ? 'v' : '^'}
+          {collapsed ? <ChevronDown aria-hidden="true" /> : <ChevronUp aria-hidden="true" />}
         </button>
       </div>
       {!collapsed ? <div className="collapsible-section__content">{children}</div> : null}
@@ -382,7 +296,7 @@ function DeviceForm({ draft, submitState, errorMessage, submitLabel, onChange, o
         void onSubmit()
       }}
     >
-      {errorMessage ? <div className="inline-error">{errorMessage}</div> : null}
+      {errorMessage ? <div className="inline-error" role="alert">{errorMessage}</div> : null}
 
       <div className="form-grid">
         <label className="form-field">
@@ -411,7 +325,7 @@ function DeviceForm({ draft, submitState, errorMessage, submitLabel, onChange, o
         </label>
         <label className="form-field form-field--wide">
           <span>Panel link</span>
-          <input value={draft.panelLink} onChange={(event) => onChange('panelLink', event.target.value)} placeholder="https://device.local" />
+          <input type="url" inputMode="url" value={draft.panelLink} onChange={(event) => onChange('panelLink', event.target.value)} placeholder="https://device.local" />
         </label>
         <label className="form-field">
           <span>Segment id</span>
@@ -429,6 +343,7 @@ function DeviceForm({ draft, submitState, errorMessage, submitLabel, onChange, o
                   type="button"
                   className={selected ? 'tag-option tag-option--selected' : 'tag-option'}
                   onClick={() => onToggleTag(tag)}
+                  aria-pressed={selected}
                 >
                   {tag}
                 </button>
@@ -437,7 +352,6 @@ function DeviceForm({ draft, submitState, errorMessage, submitLabel, onChange, o
           </div>
         </label>
       </div>
-      <div className="form-note">MAC address can be entered manually. Panel link can be set manually and is auto-populated from HTTPS or HTTP when a management panel is detected.</div>
       <div className="form-actions">
         <button type="submit" className="action-button" disabled={submitState === 'saving'}>
           {submitState === 'saving' ? 'Saving...' : submitLabel}
@@ -456,7 +370,7 @@ function NetworkNodeForm({ draft, submitState, errorMessage, submitLabel, onChan
         void onSubmit()
       }}
     >
-      {errorMessage ? <div className="inline-error">{errorMessage}</div> : null}
+      {errorMessage ? <div className="inline-error" role="alert">{errorMessage}</div> : null}
 
       <div className="form-grid">
         <label className="form-field">
@@ -488,7 +402,7 @@ function NetworkNodeForm({ draft, submitState, errorMessage, submitLabel, onChan
         </label>
         <label className="form-field form-field--wide">
           <span>Panel link</span>
-          <input value={draft.panelLink} onChange={(event) => onChange('panelLink', event.target.value)} placeholder="https://router.local" />
+          <input type="url" inputMode="url" value={draft.panelLink} onChange={(event) => onChange('panelLink', event.target.value)} placeholder="https://router.local" />
         </label>
       </div>
       <div className="form-actions">
@@ -509,7 +423,7 @@ function NetworkSegmentForm({ draft, submitState, errorMessage, submitLabel, onC
         void onSubmit()
       }}
     >
-      {errorMessage ? <div className="inline-error">{errorMessage}</div> : null}
+      {errorMessage ? <div className="inline-error" role="alert">{errorMessage}</div> : null}
 
       <div className="form-grid">
         <label className="form-field">
@@ -563,7 +477,7 @@ function SSHCredentialForm({
         void onSubmit()
       }}
     >
-      {errorMessage ? <div className="inline-error">{errorMessage}</div> : null}
+      {errorMessage ? <div className="inline-error" role="alert">{errorMessage}</div> : null}
 
       <div className="form-grid">
         <label className="form-field">
@@ -599,12 +513,12 @@ function SSHCredentialForm({
   )
 }
 
-function SSHTerminalPane({ deviceId, enabled, sessionKey, onConnectionState, onReconnect }: SSHTerminalPaneProps) {
+function SSHTerminalPane({ deviceId, enabled, unavailableReason, sessionKey, onConnectionState, onReconnect }: SSHTerminalPaneProps) {
   const hostRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     if (!enabled || !hostRef.current) {
-      onConnectionState('Credentials required')
+      onConnectionState(unavailableReason ? 'SSH unavailable' : 'Credentials required')
       return
     }
 
@@ -665,7 +579,16 @@ function SSHTerminalPane({ deviceId, enabled, sessionKey, onConnectionState, onR
         }
 
         socket.onmessage = (event) => {
-          const message = JSON.parse(event.data) as { type: string; data?: string }
+          let message
+          try {
+            message = parseSSHServerMessage(event.data)
+          } catch (error) {
+            const text = error instanceof Error ? error.message : 'SSH terminal received an invalid message.'
+            onConnectionState('Protocol error')
+            terminal.writeln(`\r\n[error] ${text}`)
+            socket.close(1002, 'invalid server message')
+            return
+          }
           switch (message.type) {
             case 'output':
               terminal.write(message.data ?? '')
@@ -734,16 +657,18 @@ function SSHTerminalPane({ deviceId, enabled, sessionKey, onConnectionState, onR
       cancelled = true
       cleanup?.()
     }
-  }, [deviceId, enabled, onConnectionState, sessionKey])
+  }, [deviceId, enabled, onConnectionState, sessionKey, unavailableReason])
 
   if (!enabled) {
     return (
       <section className="ssh-console">
         <div className="modal-panel__heading">
           <p className="section-label">SSH console</p>
-          <h2>Credentials required</h2>
+          <h2>{unavailableReason ? 'SSH unavailable' : 'Credentials required'}</h2>
         </div>
-        <div className="form-note">Save SSH credentials for this device to open an interactive shell.</div>
+        <div className={unavailableReason ? 'inline-error' : 'form-note'} role={unavailableReason ? 'alert' : undefined}>
+          {unavailableReason ?? 'Save SSH credentials for this device to open an interactive shell.'}
+        </div>
       </section>
     )
   }
@@ -780,13 +705,13 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
 
   return (
     <div className="inventory-list inventory-list--cards">
-      {(previewDevices ?? []).map((device) => {
+      {(previewDevices ?? []).map((device, index) => {
         const canWake = Boolean(device.macAddress) && device.status !== 'online'
         const busy =
           actionState[device.id] === 'running' ||
           actionState[device.id] === 'deleting' ||
           actionState[device.id] === 'ssh'
-        const panelLink = getPanelLink(device.metadata)
+        const panelLink = getSafePanelLink(device.metadata)
 
         return (
           <article
@@ -832,12 +757,32 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
                   <button
                     type="button"
                     className="icon-button icon-button--small"
+                    onClick={() => void onReorder(moveItemByOffset(previewDevices, index, -1))}
+                    disabled={busy || index === 0}
+                    aria-label={`Move ${device.name} up`}
+                    title="Move up"
+                  >
+                    <ArrowUp aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button icon-button--small"
+                    onClick={() => void onReorder(moveItemByOffset(previewDevices, index, 1))}
+                    disabled={busy || index === previewDevices.length - 1}
+                    aria-label={`Move ${device.name} down`}
+                    title="Move down"
+                  >
+                    <ArrowDown aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button icon-button--small"
                     onClick={() => onEdit(device)}
                     disabled={busy}
                     aria-label={`Edit ${device.name}`}
                     title={`Edit ${device.name}`}
                   >
-                    ✎
+                    <Pencil aria-hidden="true" />
                   </button>
                   <button
                     type="button"
@@ -847,10 +792,10 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
                     aria-label={`Delete ${device.name}`}
                     title={`Delete ${device.name}`}
                   >
-                    {actionState[device.id] === 'deleting' ? '...' : 'X'}
+                    {actionState[device.id] === 'deleting' ? <span className="refresh-spinner" aria-hidden="true" /> : <Trash2 aria-hidden="true" />}
                   </button>
                   {refreshingItems[device.id] ? <span className="refresh-spinner" aria-label="Refreshing" title="Refreshing" /> : null}
-                  <span className={`status-pill status-pill--${device.status}`}>{device.status}</span>
+                  <span className={`status-pill status-pill--${statusClassName(device.status)}`}>{device.status}</span>
                 </div>
               </div>
               <p className="inventory-row__meta">
@@ -870,7 +815,7 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
               {panelLink ? (
                 <a className="action-button panel-button" href={panelLink} target="_blank" rel="noreferrer">
                   <span className="panel-button__icon" aria-hidden="true">
-                    {'\u{1F310}'}
+                    <ExternalLink aria-hidden="true" />
                   </span>
                   <span>Panel</span>
                 </a>
@@ -882,7 +827,7 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
                 disabled={busy}
               >
                 <span className="ssh-button__icon" aria-hidden="true">
-                  {'\u2328'}
+                  <SquareTerminal aria-hidden="true" />
                 </span>
                 <span>{actionState[device.id] === 'ssh' ? 'Loading...' : 'SSH'}</span>
               </button>
@@ -894,7 +839,7 @@ function EndpointList({ devices, actionState, sshConfigured, refreshingItems, on
                   disabled={busy}
                 >
                   <span className="wake-button__icon" aria-hidden="true">
-                    {'\u23F0'}
+                    <Power aria-hidden="true" />
                   </span>
                   <span>{actionState[device.id] === 'running' ? 'Sending...' : 'WoL'}</span>
                 </button>
@@ -944,8 +889,8 @@ function InfrastructureList({
 
   return (
     <div className="inventory-list inventory-list--cards">
-      {(previewNodes ?? []).map((node) => {
-        const panelLink = getPanelLink(node.metadata)
+      {(previewNodes ?? []).map((node, index) => {
+        const panelLink = getSafePanelLink(node.metadata)
 
         return (
           <article
@@ -991,12 +936,32 @@ function InfrastructureList({
                 <button
                   type="button"
                   className="icon-button icon-button--small"
+                  onClick={() => void onReorder(moveItemByOffset(previewNodes, index, -1))}
+                  disabled={actionState[node.id] === 'deleting' || index === 0}
+                  aria-label={`Move ${node.name} up`}
+                  title="Move up"
+                >
+                  <ArrowUp aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className="icon-button icon-button--small"
+                  onClick={() => void onReorder(moveItemByOffset(previewNodes, index, 1))}
+                  disabled={actionState[node.id] === 'deleting' || index === previewNodes.length - 1}
+                  aria-label={`Move ${node.name} down`}
+                  title="Move down"
+                >
+                  <ArrowDown aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className="icon-button icon-button--small"
                   onClick={() => onEdit(node)}
                   disabled={actionState[node.id] === 'deleting'}
                   aria-label={`Edit ${node.name}`}
                   title={`Edit ${node.name}`}
                 >
-                  ✎
+                  <Pencil aria-hidden="true" />
                 </button>
                 <button
                   type="button"
@@ -1006,10 +971,10 @@ function InfrastructureList({
                   aria-label={`Delete ${node.name}`}
                   title={`Delete ${node.name}`}
                 >
-                  {actionState[node.id] === 'deleting' ? '...' : 'X'}
+                  {actionState[node.id] === 'deleting' ? <span className="refresh-spinner" aria-hidden="true" /> : <Trash2 aria-hidden="true" />}
                 </button>
                 {refreshingItems[node.id] ? <span className="refresh-spinner" aria-label="Refreshing" title="Refreshing" /> : null}
-                <span className={`status-pill status-pill--${node.status}`}>{node.status}</span>
+                <span className={`status-pill status-pill--${statusClassName(node.status)}`}>{node.status}</span>
               </div>
             </div>
             <p className="inventory-row__meta">
@@ -1081,7 +1046,7 @@ function SegmentList({
 
   return (
     <div className="inventory-list inventory-list--cards">
-      {(previewSegments ?? []).map((segment) => (
+      {(previewSegments ?? []).map((segment, index) => (
         <article
           key={segment.id}
           className="inventory-row inventory-row--draggable"
@@ -1125,12 +1090,32 @@ function SegmentList({
                 <button
                   type="button"
                   className="icon-button icon-button--small"
+                  onClick={() => void onReorder(moveItemByOffset(previewSegments, index, -1))}
+                  disabled={actionState[segment.id] === 'deleting' || index === 0}
+                  aria-label={`Move ${segment.name} up`}
+                  title="Move up"
+                >
+                  <ArrowUp aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className="icon-button icon-button--small"
+                  onClick={() => void onReorder(moveItemByOffset(previewSegments, index, 1))}
+                  disabled={actionState[segment.id] === 'deleting' || index === previewSegments.length - 1}
+                  aria-label={`Move ${segment.name} down`}
+                  title="Move down"
+                >
+                  <ArrowDown aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  className="icon-button icon-button--small"
                   onClick={() => onEdit(segment)}
                   disabled={actionState[segment.id] === 'deleting'}
                   aria-label={`Edit ${segment.name}`}
                   title={`Edit ${segment.name}`}
                 >
-                  ✎
+                  <Pencil aria-hidden="true" />
                 </button>
                 <button
                   type="button"
@@ -1140,7 +1125,7 @@ function SegmentList({
                   aria-label={`Delete ${segment.name}`}
                   title={`Delete ${segment.name}`}
                 >
-                  {actionState[segment.id] === 'deleting' ? '...' : 'X'}
+                  {actionState[segment.id] === 'deleting' ? <span className="refresh-spinner" aria-hidden="true" /> : <Trash2 aria-hidden="true" />}
                 </button>
                 <span className="status-pill status-pill--mapped">{segment.segmentType}</span>
               </div>
@@ -1201,11 +1186,13 @@ function TopologyGraph({
   const buildLaneNodes = <T extends { id: string; name: string }>(
     items: T[],
     kind: 'segment' | 'node' | 'device',
+    entityKind: Relation['sourceKind'],
     subtitle: (item: T) => string,
   ) =>
     items.map((item, index) => ({
       id: item.id,
       kind,
+      entityKind,
       label: item.name,
       subtitle: subtitle(item),
       x: laneX[kind],
@@ -1213,9 +1200,9 @@ function TopologyGraph({
     }))
 
   const graphNodes = [
-    ...buildLaneNodes(networkSegments ?? [], 'segment', (segment) => segment.cidr || segment.segmentType || 'segment'),
-    ...buildLaneNodes(networkNodes ?? [], 'node', (node) => node.nodeType || 'node'),
-    ...buildLaneNodes(devices ?? [], 'device', (device) => device.ipAddress || device.hostname || 'device'),
+    ...buildLaneNodes(networkSegments ?? [], 'segment', 'networkSegment', (segment) => segment.cidr || segment.segmentType || 'segment'),
+    ...buildLaneNodes(networkNodes ?? [], 'node', 'networkNode', (node) => node.nodeType || 'node'),
+    ...buildLaneNodes(devices ?? [], 'device', 'device', (device) => device.ipAddress || device.hostname || 'device'),
   ]
 
   const nodeWidth = 208
@@ -1241,11 +1228,11 @@ function TopologyGraph({
       : { x: node.x, y: node.y - nodeHalfHeight, side: 'top' as const }
   }
 
-  const nodeLookup = new Map(graphNodes.map((node) => [node.id, node]))
+  const nodeLookup = new Map(graphNodes.map((node) => [topologyEntityKey(node.entityKind, node.id), node]))
   const graphEdges = (relations ?? [])
-    .map((relation) => {
-      const source = nodeLookup.get(relation.sourceId)
-      const target = nodeLookup.get(relation.targetId)
+    .map((relation, relationIndex) => {
+      const source = nodeLookup.get(topologyEntityKey(relation.sourceKind, relation.sourceId))
+      const target = nodeLookup.get(topologyEntityKey(relation.targetKind, relation.targetId))
       if (!source || !target) {
         return null
       }
@@ -1268,10 +1255,14 @@ function TopologyGraph({
 
       const c1 = controlPoint(start, 1)
       const c2 = controlPoint(end, 1)
+      const label = truncateTopologyLabel(relation.relationType, 22)
+      const crossesLanes = Math.abs(end.x - start.x) > nodeWidth
+      const labelX = crossesLanes ? (start.x + end.x) / 2 : start.x + nodeHalfWidth + 48
+      const labelY = (start.y + end.y) / 2 - 10 + (relationIndex % 2) * 16
 
       return {
         id: relation.id,
-        label: relation.relationType,
+        label,
         confidence: relation.confidence,
         x1: start.x,
         y1: start.y,
@@ -1281,6 +1272,8 @@ function TopologyGraph({
         c1y: c1.y,
         c2x: c2.x,
         c2y: c2.y,
+        labelX,
+        labelY,
       }
     })
     .filter(Boolean)
@@ -1296,7 +1289,7 @@ function TopologyGraph({
         <span className="topology-legend-pill topology-legend-pill--node">Network nodes</span>
         <span className="topology-legend-pill topology-legend-pill--device">Devices</span>
       </div>
-      <div className="topology-graph__canvas">
+      <div className="topology-graph__canvas" role="region" aria-label="Scrollable network topology" tabIndex={0}>
         <svg viewBox={`0 0 960 ${graphHeight}`} className="topology-graph__svg" role="img" aria-label="Network topology graph">
           <g>
             <text x="160" y="36" textAnchor="middle" className="topology-graph__lane-label">
@@ -1312,13 +1305,14 @@ function TopologyGraph({
 
           {graphEdges.map((edge) => (
             <g key={edge!.id}>
+              <title>{`${edge!.label}${edge!.confidence ? ` (${edge!.confidence})` : ''}`}</title>
               <path
                 d={`M ${edge!.x1} ${edge!.y1} C ${edge!.c1x} ${edge!.c1y}, ${edge!.c2x} ${edge!.c2y}, ${edge!.x2} ${edge!.y2}`}
                 className="topology-graph__edge"
               />
               <text
-                x={(edge!.x1 + edge!.x2) / 2}
-                y={(edge!.y1 + edge!.y2) / 2 - 8}
+                x={edge!.labelX}
+                y={edge!.labelY}
                 textAnchor="middle"
                 className="topology-graph__edge-label"
               >
@@ -1328,18 +1322,19 @@ function TopologyGraph({
           ))}
 
           {graphNodes.map((node) => (
-            <g key={node.id} transform={`translate(${node.x - nodeHalfWidth}, ${node.y - nodeHalfHeight})`}>
+            <g key={`${node.entityKind}:${node.id}`} transform={`translate(${node.x - nodeHalfWidth}, ${node.y - nodeHalfHeight})`}>
+              <title>{`${node.label}: ${node.subtitle}`}</title>
               <rect
                 width={nodeWidth}
                 height={nodeHeight}
-                rx="16"
+                rx="8"
                 className={`topology-graph__node topology-graph__node--${node.kind}`}
               />
               <text x="18" y="28" className="topology-graph__node-title">
-                {node.label}
+                {truncateTopologyLabel(node.label)}
               </text>
               <text x="18" y="49" className="topology-graph__node-subtitle">
-                {node.subtitle}
+                {truncateTopologyLabel(node.subtitle, 28)}
               </text>
             </g>
           ))}
@@ -1361,7 +1356,7 @@ function ActionList({ actions }: { actions: Action[] }) {
           <div>
             <div className="inventory-row__header">
               <strong>{action.actionType}</strong>
-              <span className={`status-pill status-pill--${action.status}`}>{action.status}</span>
+              <span className={`status-pill status-pill--${statusClassName(action.status)}`}>{action.status}</span>
             </div>
             <p className="inventory-row__meta">
               {(action.metadata?.deviceName || action.deviceId)} | {new Date(action.startedAt).toLocaleString()}
@@ -1501,6 +1496,8 @@ export default function App() {
   const [sshModalDevice, setSSHModalDevice] = useState<Device | null>(null)
   const [sshModalError, setSSHModalError] = useState<string | null>(null)
   const [sshHasStoredPassword, setSSHHasStoredPassword] = useState(false)
+  const [sshCapabilityAvailable, setSSHCapabilityAvailable] = useState(true)
+  const [sshUnavailableReason, setSSHUnavailableReason] = useState<string | null>(null)
   const [sshEditMode, setSSHEditMode] = useState(false)
   const [sshSubmitState, setSSHSubmitState] = useState<'idle' | 'loading' | 'saving'>('idle')
   const [sshSessionKey, setSSHSessionKey] = useState(0)
@@ -1517,6 +1514,9 @@ export default function App() {
   const [refreshingItems, setRefreshingItems] = useState<Record<string, boolean>>({})
   const [actionsState, setActionsState] = useState<'idle' | 'clearing'>('idle')
   const [isActionHistoryOpen, setIsActionHistoryOpen] = useState(false)
+  const [isRelationEditorOpen, setIsRelationEditorOpen] = useState(false)
+  const [relationSubmitState, setRelationSubmitState] = useState<'idle' | 'saving'>('idle')
+  const [relationError, setRelationError] = useState<string | null>(null)
   const [isDiscoveryOpen, setIsDiscoveryOpen] = useState(false)
   const [discoveryCapabilities, setDiscoveryCapabilities] = useState<DiscoveryCapabilities | null>(null)
   const [discoveryCIDR, setDiscoveryCIDR] = useState('')
@@ -1526,6 +1526,7 @@ export default function App() {
   const discoveryStreamRef = useRef<EventSource | null>(null)
   const discoveryRequestRef = useRef<AbortController | null>(null)
   const discoveryGenerationRef = useRef(0)
+  const sshRequestGenerationRef = useRef(0)
 
   useEffect(() => {
     stateRef.current = state
@@ -1617,6 +1618,20 @@ export default function App() {
     discoveryStreamRef.current = null
     setDiscoveryState('idle')
     setIsDiscoveryOpen(false)
+    setIsCreateDeviceOpen(false)
+    setEditingDeviceId(null)
+    setDeviceDraft({ ...initialDeviceDraft })
+    setIsNodeModalOpen(false)
+    setEditingNodeId(null)
+    setNodeDraft({ ...initialNetworkNodeDraft })
+    setIsSegmentModalOpen(false)
+    setEditingSegmentId(null)
+    setSegmentDraft({ ...initialNetworkSegmentDraft })
+    setIsActionHistoryOpen(false)
+    setIsRelationEditorOpen(false)
+    setModalError(null)
+    setRelationError(null)
+    closeSSHModal()
   }, [authState])
 
   useEffect(() => {
@@ -1680,6 +1695,11 @@ export default function App() {
           setIsRefreshing(false)
           setRefreshingItems({})
           break
+        case 'stream-reset':
+          setIsRefreshing(false)
+          setRefreshingItems({})
+          void loadInventory()
+          break
       }
     })
 
@@ -1694,10 +1714,7 @@ export default function App() {
       }
 
       const data = (await response.json()) as InventorySnapshot
-      setState((current) => ({
-        kind: 'ready',
-        data: mergeRuntimeStatuses(data, current.kind === 'ready' ? current.data : null),
-      }))
+      setState({ kind: 'ready', data })
     } catch (error) {
       setState({
         kind: 'error',
@@ -2003,54 +2020,21 @@ export default function App() {
     void loadInventory()
   }, [authState])
 
-  async function persistDeviceOrder(items: Device[]) {
-    for (const [index, item] of items.entries()) {
-      const response = await authFetch(`/api/devices/${item.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...item,
-          metadata: { ...(item.metadata ?? {}), displayOrder: String(index) },
-        }),
-      })
-      if (!response.ok) {
-        const payload = (await response.json()) as { error?: string }
-        throw new Error(payload.error ?? `Failed to persist device order for ${item.name}`)
-      }
-    }
-  }
-
-  async function persistNodeOrder(items: NetworkNode[]) {
-    for (const [index, item] of items.entries()) {
-      const response = await authFetch(`/api/network-nodes/${item.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...item,
-          metadata: { ...(item.metadata ?? {}), displayOrder: String(index) },
-        }),
-      })
-      if (!response.ok) {
-        const payload = (await response.json()) as { error?: string }
-        throw new Error(payload.error ?? `Failed to persist network node order for ${item.name}`)
-      }
-    }
-  }
-
-  async function persistSegmentOrder(items: NetworkSegment[]) {
-    for (const [index, item] of items.entries()) {
-      const response = await authFetch(`/api/network-segments/${item.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...item,
-          metadata: { ...(item.metadata ?? {}), displayOrder: String(index) },
-        }),
-      })
-      if (!response.ok) {
-        const payload = (await response.json()) as { error?: string }
-        throw new Error(payload.error ?? `Failed to persist network segment order for ${item.name}`)
-      }
+  async function persistInventoryOrder(
+    kind: 'device' | 'networkNode' | 'networkSegment',
+    items: Array<{ id: string; version: number }>,
+  ) {
+    const response = await authFetch('/api/inventory/order', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind,
+        items: items.map(({ id, version }) => ({ id, version })),
+      }),
+    })
+    if (!response.ok) {
+      const payload = (await response.json()) as { error?: string }
+      throw new Error(payload.error ?? `Failed to persist ${kind} order`)
     }
   }
 
@@ -2068,46 +2052,20 @@ export default function App() {
     setIsRefreshing(true)
     setRefreshingItems(Object.fromEntries([...deviceIDs, ...nodeIDs].map((id) => [id, true])))
 
-    let failed = false
     try {
-      await Promise.all([
-        ...currentState.data.devices.map(async (device) => {
-          try {
-            const response = await authFetch(`/api/devices/${device.id}/refresh`, { method: 'POST' })
-            if (!response.ok) throw new Error(`status ${response.status}`)
-            const refreshed = (await response.json()) as Device
-            setState((current) =>
-              current.kind === 'ready'
-                ? { kind: 'ready', data: updateDeviceInSnapshot(current.data, refreshed) }
-                : current,
-            )
-          } catch {
-            failed = true
-          } finally {
-            setRefreshingItems((current) => { const next = { ...current }; delete next[device.id]; return next })
-          }
-        }),
-        ...currentState.data.networkNodes.map(async (node) => {
-          try {
-            const response = await authFetch(`/api/network-nodes/${node.id}/refresh`, { method: 'POST' })
-            if (!response.ok) throw new Error(`status ${response.status}`)
-            const refreshed = (await response.json()) as NetworkNode
-            setState((current) =>
-              current.kind === 'ready'
-                ? { kind: 'ready', data: updateNetworkNodeInSnapshot(current.data, refreshed) }
-                : current,
-            )
-          } catch {
-            failed = true
-          } finally {
-            setRefreshingItems((current) => { const next = { ...current }; delete next[node.id]; return next })
-          }
-        }),
-      ])
+      const response = await authFetch('/api/devices/refresh', { method: 'POST' })
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string }
+        throw new Error(payload.error ?? `Refresh failed with status ${response.status}`)
+      }
+      const result = parseBulkRefreshResponse(await response.json())
+      setState({ kind: 'ready', data: result.snapshot })
       setToast({
-        kind: failed ? 'error' : 'success',
-        message: failed ? 'Refresh completed with some failed probes.' : 'Live status refresh completed.',
+        kind: result.summary.partial ? 'error' : 'success',
+        message: `Refresh ${result.summary.partial ? 'completed partially' : 'completed'}: ${result.summary.online} online, ${result.summary.degraded} degraded, ${result.summary.offline} offline, ${result.summary.unknown} unknown${result.summary.skipped > 0 ? `, ${result.summary.skipped} skipped` : ''}.`,
       })
+    } catch (error) {
+      setToast({ kind: 'error', message: error instanceof Error ? error.message : 'Live status refresh failed.' })
     } finally {
       setIsRefreshing(false)
       setRefreshingItems({})
@@ -2126,7 +2084,7 @@ export default function App() {
     )
 
     try {
-      await persistDeviceOrder(nextDevices)
+      await persistInventoryOrder('device', nextDevices)
       await loadInventory()
     } catch (error) {
       setToast({ kind: 'error', message: error instanceof Error ? error.message : 'Failed to reorder devices' })
@@ -2146,7 +2104,7 @@ export default function App() {
     )
 
     try {
-      await persistNodeOrder(nextNodes)
+      await persistInventoryOrder('networkNode', nextNodes)
       await loadInventory()
     } catch (error) {
       setToast({ kind: 'error', message: error instanceof Error ? error.message : 'Failed to reorder network nodes' })
@@ -2166,7 +2124,7 @@ export default function App() {
     )
 
     try {
-      await persistSegmentOrder(nextSegments)
+      await persistInventoryOrder('networkSegment', nextSegments)
       await loadInventory()
     } catch (error) {
       setToast({ kind: 'error', message: error instanceof Error ? error.message : 'Failed to reorder network segments' })
@@ -2174,13 +2132,105 @@ export default function App() {
     }
   }
 
+  async function saveRelation(draft: RelationDraft, relationId: string | null): Promise<boolean> {
+    setRelationError(null)
+    if (
+      draft.sourceKind === draft.targetKind &&
+      draft.sourceId === draft.targetId
+    ) {
+      setRelationError('Source and target must be different.')
+      return false
+    }
+    if (!draft.relationType.trim()) {
+      setRelationError('Relation type is required.')
+      return false
+    }
+
+    const existing =
+      relationId && stateRef.current.kind === 'ready'
+        ? stateRef.current.data.relations.find((relation) => relation.id === relationId)
+        : undefined
+    const id = relationId ?? createRelationID()
+    setRelationSubmitState('saving')
+    try {
+      const response = await authFetch(relationId ? `/api/relations/${relationId}` : '/api/relations', {
+        method: relationId ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id,
+          version: existing?.version,
+          ...draft,
+          relationType: draft.relationType.trim(),
+          confidence: draft.confidence || 'manual',
+          metadata: existing?.metadata ?? {},
+        }),
+      })
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string }
+        throw new Error(payload.error ?? `Relation save failed with status ${response.status}`)
+      }
+
+      await loadInventory()
+      setToast({ kind: 'success', message: `Relation ${relationId ? 'updated' : 'created'} successfully.` })
+      return true
+    } catch (error) {
+      setRelationError(error instanceof Error ? error.message : 'Relation save failed')
+      return false
+    } finally {
+      setRelationSubmitState('idle')
+    }
+  }
+
+  async function deleteRelation(relation: Relation) {
+    if (!window.confirm(`Delete the ${relation.relationType} relation?`)) {
+      return
+    }
+
+    setRelationError(null)
+    setRelationSubmitState('saving')
+    try {
+      const response = await authFetch(`/api/relations/${relation.id}`, {
+        method: 'DELETE',
+        headers: { 'If-Match': `"${relation.version}"` },
+      })
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string }
+        throw new Error(payload.error ?? `Relation delete failed with status ${response.status}`)
+      }
+      await loadInventory()
+      setToast({ kind: 'success', message: 'Relation deleted successfully.' })
+    } catch (error) {
+      setRelationError(error instanceof Error ? error.message : 'Relation delete failed')
+    } finally {
+      setRelationSubmitState('idle')
+    }
+  }
+
+  function closeSSHModal() {
+    sshRequestGenerationRef.current += 1
+    setSSHModalError(null)
+    setSSHModalDevice(null)
+    setSSHDraft({ ...initialSSHCredentialDraft })
+    setSSHHasStoredPassword(false)
+    setSSHCapabilityAvailable(true)
+    setSSHUnavailableReason(null)
+    setSSHEditMode(false)
+    setSSHSubmitState('idle')
+    setSSHSessionKey(0)
+    setSSHConnectionState('Idle')
+  }
+
   async function openSSHModal(device: Device) {
+    const generation = sshRequestGenerationRef.current + 1
+    sshRequestGenerationRef.current = generation
     setActionState((current) => ({ ...current, [device.id]: 'ssh' }))
     setSSHModalDevice(device)
     setSSHModalError(null)
     setSSHSubmitState('loading')
-    setSSHDraft(initialSSHCredentialDraft)
+    setSSHDraft({ ...initialSSHCredentialDraft })
     setSSHHasStoredPassword(false)
+    setSSHCapabilityAvailable(true)
+    setSSHUnavailableReason(null)
     setSSHEditMode(false)
     setSSHSessionKey(0)
     setSSHConnectionState('Loading credentials...')
@@ -2193,23 +2243,35 @@ export default function App() {
       }
 
       const credential = (await response.json()) as SSHCredential
+      if (sshRequestGenerationRef.current !== generation) {
+        return
+      }
+      const { available, reason: unavailableReason } = resolveSSHCapability(credential)
       setSSHDraft({
         username: credential.username ?? '',
         password: '',
         sshPort: credential.sshPort || '22',
       })
       setSSHHasStoredPassword(Boolean(credential.hasPassword))
-      setSSHEditMode(!credential.hasPassword)
-      setSSHConnectionState(Boolean(credential.hasPassword) ? 'Connecting...' : 'Credentials required')
-      if (credential.hasPassword) {
+      setSSHCapabilityAvailable(available)
+      setSSHUnavailableReason(unavailableReason)
+      setSSHEditMode(available && !credential.hasPassword)
+      setSSHConnectionState(
+        !available ? 'SSH unavailable' : credential.hasPassword ? 'Connecting...' : 'Credentials required',
+      )
+      if (available && credential.hasPassword) {
         setSSHSessionKey((current) => current + 1)
       }
-      setSSHConfigured((current) => ({ ...current, [device.id]: Boolean(credential.hasPassword) }))
+      setSSHConfigured((current) => ({ ...current, [device.id]: available && Boolean(credential.hasPassword) }))
     } catch (error) {
-      setSSHModalError(error instanceof Error ? error.message : 'Failed to load SSH credentials')
-      setSSHConnectionState('Credential load failed')
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHModalError(error instanceof Error ? error.message : 'Failed to load SSH credentials')
+        setSSHConnectionState('Credential load failed')
+      }
     } finally {
-      setSSHSubmitState('idle')
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHSubmitState('idle')
+      }
       setActionState((current) => {
         const next = { ...current }
         delete next[device.id]
@@ -2246,6 +2308,12 @@ export default function App() {
       setModalError('Device name is required.')
       return
     }
+    const panelError = panelURLValidationError(deviceDraft.panelLink)
+    if (panelError) {
+      setModalError(panelError)
+      return
+    }
+    const panelLink = normalizePanelURL(deviceDraft.panelLink)
 
     setDeviceSubmitState('saving')
     try {
@@ -2261,8 +2329,8 @@ export default function App() {
           macAddress: deviceDraft.macAddress.trim(),
           networkSegment: deviceDraft.networkSegment.trim(),
           tags: deviceDraft.tags.map((tag) => tag.trim()).filter(Boolean),
-          metadata: deviceDraft.panelLink.trim()
-            ? { panelLink: deviceDraft.panelLink.trim(), panelLinkSource: 'manual' }
+          metadata: panelLink
+            ? { panelLink, panelLinkSource: 'manual' }
             : {},
         }),
       })
@@ -2314,7 +2382,7 @@ export default function App() {
       deviceType: device.deviceType ?? '',
       ipAddress: device.ipAddress ?? '',
       macAddress: device.macAddress ?? '',
-      panelLink: getPanelLink(device.metadata),
+      panelLink: getSafePanelLink(device.metadata),
       networkSegment: device.networkSegment ?? '',
       tags: device.tags ?? [],
     })
@@ -2328,6 +2396,12 @@ export default function App() {
         setModalError('Device name is required.')
         return
       }
+      const panelError = panelURLValidationError(deviceDraft.panelLink)
+      if (panelError) {
+        setModalError(panelError)
+        return
+      }
+      const panelLink = normalizePanelURL(deviceDraft.panelLink)
 
       setDeviceSubmitState('saving')
       try {
@@ -2339,6 +2413,7 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             id: editingDeviceId,
+            version: currentDevice?.version,
             name: deviceDraft.name.trim(),
             hostname: deviceDraft.hostname.trim(),
             role: deviceDraft.role.trim(),
@@ -2350,8 +2425,8 @@ export default function App() {
             tags: deviceDraft.tags.map((tag) => tag.trim()).filter(Boolean),
             metadata: {
               ...(currentDevice?.metadata ?? {}),
-              ...(deviceDraft.panelLink.trim()
-                ? { panelLink: deviceDraft.panelLink.trim(), panelLinkSource: 'manual' }
+              ...(panelLink
+                ? { panelLink, panelLinkSource: 'manual' }
                 : { panelLink: '', panelLinkSource: '' }),
             },
           }),
@@ -2407,7 +2482,7 @@ export default function App() {
       managementIp: node.managementIp ?? '',
       vendor: node.vendor ?? '',
       model: node.model ?? '',
-      panelLink: getPanelLink(node.metadata),
+      panelLink: getSafePanelLink(node.metadata),
     })
     setIsNodeModalOpen(true)
   }
@@ -2418,6 +2493,12 @@ export default function App() {
       setModalError('Node name and type are required.')
       return
     }
+    const panelError = panelURLValidationError(nodeDraft.panelLink)
+    if (panelError) {
+      setModalError(panelError)
+      return
+    }
+    const panelLink = normalizePanelURL(nodeDraft.panelLink)
 
     setNodeSubmitState('saving')
     try {
@@ -2431,6 +2512,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           id: editingNodeId ?? undefined,
+          version: currentNode?.version,
           name: nodeDraft.name.trim(),
           nodeType: nodeDraft.nodeType.trim(),
           managementIp: nodeDraft.managementIp.trim(),
@@ -2441,8 +2523,8 @@ export default function App() {
           tags: currentNode?.tags ?? [],
           metadata: {
             ...(currentNode?.metadata ?? {}),
-            ...(nodeDraft.panelLink.trim()
-              ? { panelLink: nodeDraft.panelLink.trim(), panelLinkSource: 'manual' }
+            ...(panelLink
+              ? { panelLink, panelLinkSource: 'manual' }
               : { panelLink: '', panelLinkSource: '' }),
           },
         }),
@@ -2466,9 +2548,15 @@ export default function App() {
   }
 
   async function deleteNode(node: NetworkNode) {
+    if (!window.confirm(`Delete network node ${node.name}? Its topology relations will also be removed.`)) {
+      return
+    }
     setActionState((current) => ({ ...current, [node.id]: 'deleting' }))
     try {
-      const response = await authFetch(`/api/network-nodes/${node.id}`, { method: 'DELETE' })
+      const response = await authFetch(`/api/network-nodes/${node.id}`, {
+        method: 'DELETE',
+        headers: { 'If-Match': `"${node.version}"` },
+      })
       if (!response.ok) {
         const payload = (await response.json()) as { error?: string }
         throw new Error(payload.error ?? `Delete failed with status ${response.status}`)
@@ -2542,6 +2630,7 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             id: editingSegmentId ?? undefined,
+            version: currentSegment?.version,
             name: segmentDraft.name.trim(),
             segmentType: segmentDraft.segmentType.trim(),
             cidr: segmentDraft.cidr.trim(),
@@ -2571,9 +2660,15 @@ export default function App() {
   }
 
   async function deleteSegment(segment: NetworkSegment) {
+    if (!window.confirm(`Delete network segment ${segment.name}? Its topology relations will also be removed.`)) {
+      return
+    }
     setActionState((current) => ({ ...current, [segment.id]: 'deleting' }))
     try {
-      const response = await authFetch(`/api/network-segments/${segment.id}`, { method: 'DELETE' })
+      const response = await authFetch(`/api/network-segments/${segment.id}`, {
+        method: 'DELETE',
+        headers: { 'If-Match': `"${segment.version}"` },
+      })
       if (!response.ok) {
         const payload = (await response.json()) as { error?: string }
         throw new Error(payload.error ?? `Delete failed with status ${response.status}`)
@@ -2599,6 +2694,11 @@ export default function App() {
 
     setSSHModalError(null)
 
+    if (!sshCapabilityAvailable) {
+      setSSHModalError(sshUnavailableReason ?? 'SSH credential storage is unavailable.')
+      return
+    }
+
     if (!sshDraft.username.trim()) {
       setSSHModalError('SSH username is required.')
       return
@@ -2608,11 +2708,13 @@ export default function App() {
       return
     }
 
+    const device = sshModalDevice
+    const generation = sshRequestGenerationRef.current
     setSSHSubmitState('saving')
     try {
-      const response = await authFetch(`/api/devices/${sshModalDevice.id}/ssh-credential`, {
+      const response = await authFetch(`/api/devices/${device.id}/ssh-credential`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'If-Match': `"${device.version}"` },
         body: JSON.stringify({
           username: sshDraft.username.trim(),
           password: sshDraft.password,
@@ -2624,25 +2726,100 @@ export default function App() {
         const payload = (await response.json()) as { error?: string }
         throw new Error(payload.error ?? `SSH save failed with status ${response.status}`)
       }
+      const savedCredential = (await response.json()) as SSHCredential
 
-      setSSHConfigured((current) => ({ ...current, [sshModalDevice.id]: true }))
+      if (sshRequestGenerationRef.current !== generation) {
+        return
+      }
+      setSSHConfigured((current) => ({ ...current, [device.id]: true }))
       setSSHHasStoredPassword(true)
       setSSHEditMode(false)
       setSSHDraft((current) => ({ ...current, password: '' }))
       setSSHConnectionState('Connecting...')
       setSSHSessionKey((current) => current + 1)
-      setToast({ kind: 'success', message: `SSH credentials saved for ${sshModalDevice.name}.` })
+      setSSHModalDevice((current) =>
+        current && current.id === device.id
+          ? {
+              ...current,
+              version: current.version + 1,
+              metadata: { ...(current.metadata ?? {}), sshPort: savedCredential.sshPort || '22' },
+            }
+          : current,
+      )
+      await loadInventory()
+      setToast({ kind: 'success', message: `SSH credentials saved for ${device.name}.` })
     } catch (error) {
-      setSSHModalError(error instanceof Error ? error.message : 'Failed to save SSH credentials')
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHModalError(error instanceof Error ? error.message : 'Failed to save SSH credentials')
+      }
     } finally {
-      setSSHSubmitState('idle')
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHSubmitState('idle')
+      }
+    }
+  }
+
+  async function deleteSSHCredential() {
+    if (!sshModalDevice || !window.confirm(`Remove the stored SSH credentials for ${sshModalDevice.name}?`)) {
+      return
+    }
+
+    const device = sshModalDevice
+    const generation = sshRequestGenerationRef.current
+    setSSHModalError(null)
+    setSSHSubmitState('saving')
+    try {
+      const response = await authFetch(`/api/devices/${device.id}/ssh-credential`, {
+        method: 'DELETE',
+        headers: { 'If-Match': `"${device.version}"` },
+      })
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string }
+        throw new Error(payload.error ?? `SSH credential delete failed with status ${response.status}`)
+      }
+      if (sshRequestGenerationRef.current !== generation) {
+        return
+      }
+
+      setSSHConfigured((current) => ({ ...current, [device.id]: false }))
+      setSSHHasStoredPassword(false)
+      setSSHEditMode(true)
+      setSSHDraft({ ...initialSSHCredentialDraft })
+      setSSHConnectionState('Credentials required')
+      setSSHSessionKey((current) => current + 1)
+      setSSHModalDevice((current) => {
+        if (!current || current.id !== device.id) {
+          return current
+        }
+        const metadata = { ...(current.metadata ?? {}) }
+        delete metadata.sshPort
+        return { ...current, version: current.version + 1, metadata }
+      })
+      await loadInventory()
+      if (sshRequestGenerationRef.current === generation) {
+        setToast({ kind: 'success', message: `SSH credentials removed for ${device.name}.` })
+      }
+    } catch (error) {
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHModalError(error instanceof Error ? error.message : 'Failed to remove SSH credentials')
+      }
+    } finally {
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHSubmitState('idle')
+      }
     }
   }
 
   async function deleteDevice(device: Device) {
+    if (!window.confirm(`Delete device ${device.name}? Its credentials and topology relations will also be removed.`)) {
+      return
+    }
     setActionState((current) => ({ ...current, [device.id]: 'deleting' }))
     try {
-      const response = await authFetch(`/api/devices/${device.id}`, { method: 'DELETE' })
+      const response = await authFetch(`/api/devices/${device.id}`, {
+        method: 'DELETE',
+        headers: { 'If-Match': `"${device.version}"` },
+      })
       if (!response.ok) {
         const payload = (await response.json()) as { error?: string }
         throw new Error(payload.error ?? `Delete failed with status ${response.status}`)
@@ -2665,6 +2842,9 @@ export default function App() {
   }
 
   async function clearActionHistory() {
+    if (!window.confirm('Clear the entire action history?')) {
+      return
+    }
     setActionsState('clearing')
     try {
       const response = await authFetch('/api/actions', { method: 'DELETE' })
@@ -2690,6 +2870,34 @@ export default function App() {
       ? discoveryCapabilities?.suggestedCidrs ?? []
       : discoveryCapabilities?.localCidrs ?? []
 
+  function handleInventoryTabKey(event: ReactKeyboardEvent<HTMLButtonElement>) {
+    const panels = ['devices', 'nodes', 'segments'] as const
+    const currentIndex = panels.indexOf(visibleInventoryPanel)
+    let nextIndex = currentIndex
+    switch (event.key) {
+      case 'ArrowRight':
+      case 'ArrowDown':
+        nextIndex = (currentIndex + 1) % panels.length
+        break
+      case 'ArrowLeft':
+      case 'ArrowUp':
+        nextIndex = (currentIndex - 1 + panels.length) % panels.length
+        break
+      case 'Home':
+        nextIndex = 0
+        break
+      case 'End':
+        nextIndex = panels.length - 1
+        break
+      default:
+        return
+    }
+    event.preventDefault()
+    const nextPanel = panels[nextIndex]
+    setVisibleInventoryPanel(nextPanel)
+    window.requestAnimationFrame(() => document.getElementById(`inventory-tab-${nextPanel}`)?.focus())
+  }
+
   const content =
     authState === 'checking' ? (
       <section className="feedback-panel">
@@ -2711,19 +2919,16 @@ export default function App() {
           <MetricCard
             title="Endpoint devices"
             value={String(state.data.devices.length)}
-            description="Discovered and manually managed hosts currently present in the inventory."
             accent="green"
           />
           <MetricCard
             title="Infrastructure nodes"
             value={String(state.data.networkNodes.length)}
-            description="Routers, switches, and access points shaping the logical network map."
             accent="blue"
           />
           <MetricCard
             title="Segments and VLANs"
             value={String(state.data.networkSegments.length)}
-            description="Defined network segments available for topology mapping and isolation."
             accent="amber"
           />
         </div>
@@ -2732,36 +2937,41 @@ export default function App() {
           <div className="toolbar-panel__row">
             <div className="toolbar-panel__group">
               <button type="button" className="action-button" onClick={() => void refreshDevices()} disabled={isRefreshing}>
+                <RefreshCw aria-hidden="true" />
                 {isRefreshing ? 'Refreshing...' : 'Refresh now'}
               </button>
               <button type="button" className="action-button" onClick={() => void openDiscoveryModal()}>
+                <ScanLine aria-hidden="true" />
                 Scan Network
               </button>
-              <span className={`secondary-button secondary-button--active secondary-button--status secondary-button--status-${sseStatus}`} aria-live="polite">
-                {sseStatus === 'connected' ? 'Live: on' : sseStatus === 'connecting' ? 'Connecting…' : 'Live: off'}
+              <span
+                className={`secondary-button secondary-button--status secondary-button--status-${sseStatus}${sseStatus === 'connected' ? ' secondary-button--active' : ''}`}
+                role="status"
+                aria-live="polite"
+              >
+                {sseStatus === 'connected' ? 'Live: on' : sseStatus === 'connecting' ? 'Connecting...' : 'Live: off'}
               </span>
             </div>
             <div className="toolbar-panel__group toolbar-panel__group--right">
               <button type="button" className="action-button" onClick={() => setIsActionHistoryOpen(true)}>
+                <History aria-hidden="true" />
                 Action history
               </button>
             </div>
           </div>
-          <span className="toolbar-panel__hint">
-            Live refresh is server-driven. The server scans all devices on a background timer and pushes updates instantly via a persistent connection.
-          </span>
         </section>
 
         <div className="inventory-layout-toolbar">
-          <div className="layout-switch" role="tablist" aria-label="Inventory layout">
+          <div className="layout-switch" role="group" aria-label="Inventory layout">
             <button
               type="button"
               className={inventoryLayoutMode === 'columns' ? 'layout-switch__button layout-switch__button--active' : 'layout-switch__button'}
               onClick={() => setInventoryLayoutMode('columns')}
               aria-label="Show inventory sections as columns"
+              aria-pressed={inventoryLayoutMode === 'columns'}
               title="Columns"
             >
-              <span className="layout-switch__icon" aria-hidden="true">{'\u25A6'}</span>
+              <Columns3 className="layout-switch__icon" aria-hidden="true" />
               <span>Columns</span>
             </button>
             <button
@@ -2769,32 +2979,51 @@ export default function App() {
               className={inventoryLayoutMode === 'tabs' ? 'layout-switch__button layout-switch__button--active' : 'layout-switch__button'}
               onClick={() => setInventoryLayoutMode('tabs')}
               aria-label="Show one inventory section at a time"
+              aria-pressed={inventoryLayoutMode === 'tabs'}
               title="Tabs"
             >
-              <span className="layout-switch__icon" aria-hidden="true">{'\u2630'}</span>
+              <List className="layout-switch__icon" aria-hidden="true" />
               <span>Tabs</span>
             </button>
           </div>
           {inventoryLayoutMode === 'tabs' ? (
             <div className="inventory-layout-toolbar__tabs" role="tablist" aria-label="Inventory sections">
               <button
+                id="inventory-tab-devices"
                 type="button"
                 className={visibleInventoryPanel === 'devices' ? 'layout-tab layout-tab--active' : 'layout-tab'}
                 onClick={() => setVisibleInventoryPanel('devices')}
+                role="tab"
+                aria-selected={visibleInventoryPanel === 'devices'}
+                aria-controls="inventory-panel-devices"
+                tabIndex={visibleInventoryPanel === 'devices' ? 0 : -1}
+                onKeyDown={handleInventoryTabKey}
               >
                 Devices
               </button>
               <button
+                id="inventory-tab-nodes"
                 type="button"
                 className={visibleInventoryPanel === 'nodes' ? 'layout-tab layout-tab--active' : 'layout-tab'}
                 onClick={() => setVisibleInventoryPanel('nodes')}
+                role="tab"
+                aria-selected={visibleInventoryPanel === 'nodes'}
+                aria-controls="inventory-panel-nodes"
+                tabIndex={visibleInventoryPanel === 'nodes' ? 0 : -1}
+                onKeyDown={handleInventoryTabKey}
               >
                 Network nodes
               </button>
               <button
+                id="inventory-tab-segments"
                 type="button"
                 className={visibleInventoryPanel === 'segments' ? 'layout-tab layout-tab--active' : 'layout-tab'}
                 onClick={() => setVisibleInventoryPanel('segments')}
+                role="tab"
+                aria-selected={visibleInventoryPanel === 'segments'}
+                aria-controls="inventory-panel-segments"
+                tabIndex={visibleInventoryPanel === 'segments' ? 0 : -1}
+                onKeyDown={handleInventoryTabKey}
               >
                 Network segments
               </button>
@@ -2804,7 +3033,12 @@ export default function App() {
 
         <section className={inventoryLayoutMode === 'columns' ? 'overview-grid' : 'inventory-stack'}>
           {(inventoryLayoutMode === 'columns' || visibleInventoryPanel === 'devices') ? (
-          <article className="data-panel">
+          <article
+            className="data-panel"
+            id="inventory-panel-devices"
+            role={inventoryLayoutMode === 'tabs' ? 'tabpanel' : undefined}
+            aria-labelledby={inventoryLayoutMode === 'tabs' ? 'inventory-tab-devices' : undefined}
+          >
             <div className="data-panel__heading">
               <p className="section-label">Endpoints</p>
               <div className="panel-title-row">
@@ -2815,7 +3049,7 @@ export default function App() {
                   onClick={openCreateDeviceModal}
                   aria-label="Add device"
                 >
-                  +
+                  <Plus aria-hidden="true" />
                 </button>
               </div>
             </div>
@@ -2834,13 +3068,18 @@ export default function App() {
           ) : null}
 
           {(inventoryLayoutMode === 'columns' || visibleInventoryPanel === 'nodes') ? (
-          <article className="data-panel">
+          <article
+            className="data-panel"
+            id="inventory-panel-nodes"
+            role={inventoryLayoutMode === 'tabs' ? 'tabpanel' : undefined}
+            aria-labelledby={inventoryLayoutMode === 'tabs' ? 'inventory-tab-nodes' : undefined}
+          >
             <div className="data-panel__heading">
               <p className="section-label">Infrastructure</p>
               <div className="panel-title-row">
                 <h2>Network nodes</h2>
                 <button type="button" className="icon-button" onClick={openCreateNodeModal} aria-label="Add network node">
-                  +
+                  <Plus aria-hidden="true" />
                 </button>
               </div>
             </div>
@@ -2856,13 +3095,18 @@ export default function App() {
           ) : null}
 
           {(inventoryLayoutMode === 'columns' || visibleInventoryPanel === 'segments') ? (
-          <article className="data-panel">
+          <article
+            className="data-panel"
+            id="inventory-panel-segments"
+            role={inventoryLayoutMode === 'tabs' ? 'tabpanel' : undefined}
+            aria-labelledby={inventoryLayoutMode === 'tabs' ? 'inventory-tab-segments' : undefined}
+          >
             <div className="data-panel__heading">
               <p className="section-label">Segmentation</p>
               <div className="panel-title-row">
                 <h2>Network segments</h2>
                 <button type="button" className="icon-button" onClick={openCreateSegmentModal} aria-label="Add network segment">
-                  +
+                  <Plus aria-hidden="true" />
                 </button>
               </div>
             </div>
@@ -2880,7 +3124,20 @@ export default function App() {
         <article className="data-panel data-panel--full">
           <div className="data-panel__heading">
             <p className="section-label">Topology</p>
-            <h2>Topology graph</h2>
+            <div className="panel-title-row">
+              <h2>Topology graph</h2>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => {
+                  setRelationError(null)
+                  setIsRelationEditorOpen(true)
+                }}
+              >
+                <Network aria-hidden="true" />
+                Manage relations
+              </button>
+            </div>
           </div>
           <TopologyGraph
             devices={state.data.devices}
@@ -2895,6 +3152,16 @@ export default function App() {
         <p className="section-label">Inventory error</p>
         <h2>Backend data could not be loaded.</h2>
         <p>{state.message}</p>
+        <button
+          type="button"
+          className="action-button"
+          onClick={() => {
+            setState({ kind: 'loading' })
+            void loadInventory()
+          }}
+        >
+          Retry inventory
+        </button>
       </section>
     ) : (
       <section className="feedback-panel">
@@ -2917,21 +3184,22 @@ export default function App() {
               <span className="hero-logo__node hero-logo__node--left" />
               <span className="hero-logo__node hero-logo__node--right" />
             </div>
-            <p className="eyebrow">Home Mesh</p>
+            <div className="hero-brand__text">
+              <h1>Home Mesh</h1>
+              <p>Network operations</p>
+            </div>
           </div>
           <div className="hero-title-row">
-            <h1>Live network inventory for devices and infrastructure.</h1>
             {authState === 'authenticated' && authEnabled ? (
               <div className="hero-user-actions">
                 {authUsername ? (
                   <span className="hero-user-badge">
-                    <span className="hero-user-badge__icon" aria-hidden="true">
-                      {'\u25D4'}
-                    </span>
+                    <UserCircle className="hero-user-badge__icon" aria-hidden="true" />
                     <span>{authUsername}</span>
                   </span>
                 ) : null}
                 <button type="button" className="secondary-button" onClick={() => void logout()}>
+                  <LogOut aria-hidden="true" />
                   Logout
                 </button>
               </div>
@@ -3018,11 +3286,7 @@ export default function App() {
           label="SSH access"
           title={sshModalDevice.name}
           widthClassName="modal-panel--wide modal-panel--console"
-          onClose={() => {
-            setSSHModalError(null)
-            setSSHModalDevice(null)
-            setSSHSubmitState('idle')
-          }}
+          onClose={closeSSHModal}
         >
           <CollapsibleSection label="Device" title="Connection details">
             <div className="modal-device-meta">
@@ -3043,10 +3307,11 @@ export default function App() {
                 <span>{sshDraft.sshPort || sshModalDevice.metadata?.sshPort || '22'}</span>
               </p>
               <p className="form-note">Session state: {sshConnectionState}</p>
+              {sshModalError && !sshEditMode ? <div className="inline-error" role="alert">{sshModalError}</div> : null}
             </div>
             {!sshSessionConnected ? (
               <>
-              {sshHasStoredPassword ? (
+              {sshHasStoredPassword && sshCapabilityAvailable ? (
                 <div className="ssh-credential-banner">
                   <div>
                     <p className="section-label">Stored credentials</p>
@@ -3054,16 +3319,33 @@ export default function App() {
                       Username: <strong>{sshDraft.username || 'configured'}</strong>
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => setSSHEditMode((current) => !current)}
-                  >
-                    {sshEditMode ? 'Hide credentials' : 'Update credentials'}
-                  </button>
+                  <div className="ssh-credential-banner__actions">
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      disabled={sshSubmitState !== 'idle'}
+                      onClick={() => {
+                        setSSHModalError(null)
+                        setSSHDraft((current) => ({ ...current, password: '' }))
+                        setSSHEditMode((current) => !current)
+                      }}
+                    >
+                      {sshEditMode ? 'Hide credentials' : 'Update credentials'}
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-danger-button"
+                      disabled={sshSubmitState !== 'idle'}
+                      onClick={() => void deleteSSHCredential()}
+                      aria-label={`Remove SSH credentials for ${sshModalDevice.name}`}
+                      title="Remove SSH credentials"
+                    >
+                      <Trash2 aria-hidden="true" />
+                    </button>
+                  </div>
                 </div>
               ) : null}
-              {sshEditMode ? (
+              {sshCapabilityAvailable && sshEditMode ? (
                 <SSHCredentialForm
                   draft={sshDraft}
                   submitState={sshSubmitState}
@@ -3079,22 +3361,28 @@ export default function App() {
                       setSSHSubmitState('idle')
                       return
                     }
-                    setSSHModalError(null)
-                    setSSHModalDevice(null)
-                    setSSHSubmitState('idle')
+                    closeSSHModal()
                   }}
                 />
               ) : null}
               </>
             ) : null}
           </CollapsibleSection>
-          <SSHTerminalPane
-            deviceId={sshModalDevice.id}
-            enabled={sshHasStoredPassword}
-            sessionKey={sshSessionKey}
-            onConnectionState={setSSHConnectionState}
-            onReconnect={() => setSSHSessionKey((current) => current + 1)}
-          />
+          {sshSubmitState === 'loading' ? (
+            <div className="discovery-loading-state" role="status" aria-live="polite">
+              <span className="refresh-spinner" aria-hidden="true" />
+              <span>Checking SSH capability...</span>
+            </div>
+          ) : (
+            <SSHTerminalPane
+              deviceId={sshModalDevice.id}
+              enabled={sshCapabilityAvailable && sshHasStoredPassword && !sshEditMode}
+              unavailableReason={sshUnavailableReason}
+              sessionKey={sshSessionKey}
+              onConnectionState={setSSHConnectionState}
+              onReconnect={() => setSSHSessionKey((current) => current + 1)}
+            />
+          )}
         </DraggableModal>
       ) : null}
 
@@ -3115,10 +3403,34 @@ export default function App() {
               aria-label="Clear action history"
               title="Clear action history"
             >
-              {actionsState === 'clearing' ? '...' : '🗑'}
+              {actionsState === 'clearing' ? <span className="refresh-spinner" aria-hidden="true" /> : <Trash2 aria-hidden="true" />}
             </button>
           </div>
           <ActionList actions={state.data.actions} />
+        </DraggableModal>
+      ) : null}
+
+      {isRelationEditorOpen && state.kind === 'ready' ? (
+        <DraggableModal
+          label="Topology"
+          title="Manage relations"
+          widthClassName="modal-panel--wide"
+          onClose={() => {
+            setRelationError(null)
+            setRelationSubmitState('idle')
+            setIsRelationEditorOpen(false)
+          }}
+        >
+          <RelationEditor
+            devices={state.data.devices}
+            networkNodes={state.data.networkNodes}
+            networkSegments={state.data.networkSegments}
+            relations={state.data.relations}
+            busy={relationSubmitState === 'saving'}
+            errorMessage={relationError}
+            onSave={saveRelation}
+            onDelete={deleteRelation}
+          />
         </DraggableModal>
       ) : null}
 
@@ -3127,7 +3439,7 @@ export default function App() {
           <div className="discovery-modal">
             <div className="discovery-modal__controls">
               <div className="device-form">
-                {discoveryError ? <div className="inline-error">{discoveryError}</div> : null}
+                {discoveryError ? <div className="inline-error" role="alert">{discoveryError}</div> : null}
                 <div className="form-grid">
                   <label className="form-field">
                     <span>Provider</span>
@@ -3199,7 +3511,13 @@ export default function App() {
       ) : null}
 
       {toast ? (
-        <div className={`toast ${toast.kind === 'error' ? 'toast--error' : 'toast--success'}`}>{toast.message}</div>
+        <div
+          className={`toast ${toast.kind === 'error' ? 'toast--error' : 'toast--success'}`}
+          role={toast.kind === 'error' ? 'alert' : 'status'}
+          aria-live={toast.kind === 'error' ? 'assertive' : 'polite'}
+        >
+          {toast.message}
+        </div>
       ) : null}
     </main>
   )

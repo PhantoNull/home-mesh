@@ -1,5 +1,6 @@
 export type Device = {
   id: string
+  version: number
   name: string
   hostname: string
   role: string
@@ -14,6 +15,7 @@ export type Device = {
 
 export type NetworkNode = {
   id: string
+  version: number
   name: string
   nodeType: string
   managementIp: string
@@ -27,6 +29,7 @@ export type NetworkNode = {
 
 export type NetworkSegment = {
   id: string
+  version: number
   name: string
   segmentType: string
   cidr: string
@@ -38,12 +41,15 @@ export type NetworkSegment = {
 
 export type Relation = {
   id: string
+  version: number
   sourceKind: string
   sourceId: string
   targetKind: string
   targetId: string
   relationType: string
   confidence: string
+  metadata?: Record<string, string>
+  observedAt?: string
 }
 
 export type Action = {
@@ -62,6 +68,8 @@ export type SSHCredential = {
   hasPassword: boolean
   keyVersion: number
   sshPort: string
+  available?: boolean
+  unavailableReason?: string
 }
 
 export type InventorySnapshot = {
