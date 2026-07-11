@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -47,18 +48,6 @@ type sshCredentialResponse struct {
 
 type sshCommandPayload struct {
 	Command string `json:"command"`
-}
-
-type terminalClientMessage struct {
-	Type string `json:"type"`
-	Data string `json:"data,omitempty"`
-	Cols int    `json:"cols,omitempty"`
-	Rows int    `json:"rows,omitempty"`
-}
-
-type terminalServerMessage struct {
-	Type string `json:"type"`
-	Data string `json:"data,omitempty"`
 }
 
 type discoveryScanPayload struct {
@@ -589,95 +578,33 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			StartedAt: startedAt,
 		}
 
-		session, err := sshclient.StartPasswordTerminal(address, credential.Username, password, 120, 36, 10*time.Second, hostKeyCallback)
+		session, err := sshclient.StartPasswordTerminalContext(r.Context(), address, credential.Username, password, 120, 36, 10*time.Second, hostKeyCallback)
 		if err != nil {
 			actionRecord.Status = "failed"
 			actionRecord.FinishedAt = time.Now().UTC()
 			actionRecord.ResultSummary = err.Error()
-			_, _ = inventory.AddAction(r.Context(), actionRecord)
+			actionRecord.Metadata["terminationReason"] = "connect_error"
+			if recordErr := recordTerminalAction(r.Context(), inventory, actionRecord); recordErr != nil {
+				log.Printf("record SSH terminal action %s: %v", actionRecord.ID, recordErr)
+			}
+			_ = socket.SetWriteDeadline(time.Now().Add(terminalWriteTimeout))
 			_ = socket.WriteJSON(terminalServerMessage{Type: "error", Data: err.Error()})
 			_ = socket.Close()
 			return
 		}
-		defer session.Close()
-		defer socket.Close()
 
-		send := make(chan terminalServerMessage, 32)
-		writerDone := make(chan struct{})
-		go func() {
-			defer close(writerDone)
-			for message := range send {
-				if err := socket.WriteJSON(message); err != nil {
-					return
-				}
-			}
-		}()
-
-		send <- terminalServerMessage{Type: "status", Data: "connected"}
-
-		streamDone := make(chan struct{}, 2)
-		for _, reader := range []io.Reader{session.Stdout(), session.Stderr()} {
-			go func(reader io.Reader) {
-				defer func() { streamDone <- struct{}{} }()
-				buffer := make([]byte, 2048)
-				for {
-					n, readErr := reader.Read(buffer)
-					if n > 0 {
-						send <- terminalServerMessage{Type: "output", Data: string(buffer[:n])}
-					}
-					if readErr != nil {
-						return
-					}
-				}
-			}(reader)
-		}
-
-		readDone := make(chan struct{})
-		go func() {
-			defer close(readDone)
-			defer session.Close()
-			for {
-				var message terminalClientMessage
-				if err := socket.ReadJSON(&message); err != nil {
-					return
-				}
-
-				switch message.Type {
-				case "input":
-					if _, err := session.Write([]byte(message.Data)); err != nil {
-						send <- terminalServerMessage{Type: "error", Data: err.Error()}
-						return
-					}
-				case "resize":
-					if err := session.Resize(message.Cols, message.Rows); err != nil {
-						send <- terminalServerMessage{Type: "error", Data: err.Error()}
-						return
-					}
-				case "ping":
-					send <- terminalServerMessage{Type: "pong"}
-				case "close":
-					return
-				}
-			}
-		}()
-
-		waitErr := session.Wait()
-		<-readDone
-		<-streamDone
-		<-streamDone
-
+		result := runTerminalBridge(r.Context(), socket, session)
 		actionRecord.FinishedAt = time.Now().UTC()
-		if waitErr != nil && !strings.Contains(strings.ToLower(waitErr.Error()), "closed") {
+		actionRecord.Metadata["terminationReason"] = result.TerminationReason
+		if result.Err != nil {
 			actionRecord.Status = "failed"
-			actionRecord.ResultSummary = waitErr.Error()
-			send <- terminalServerMessage{Type: "error", Data: waitErr.Error()}
+			actionRecord.ResultSummary = result.Err.Error()
 		} else {
 			actionRecord.ResultSummary = "Interactive SSH session closed."
 		}
-		_, _ = inventory.AddAction(r.Context(), actionRecord)
-		send <- terminalServerMessage{Type: "status", Data: "closed"}
-		close(send)
-		<-writerDone
+		if recordErr := recordTerminalAction(r.Context(), inventory, actionRecord); recordErr != nil {
+			log.Printf("record SSH terminal action %s: %v", actionRecord.ID, recordErr)
+		}
 	})
 
 	mux.HandleFunc("/api/network-nodes", func(w http.ResponseWriter, r *http.Request) {

@@ -47,6 +47,46 @@ func TestDialPasswordBoundsStalledHandshake(t *testing.T) {
 	}
 }
 
+func TestDialPasswordCancellationInterruptsStalledHandshake(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- connection
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, dialErr := dialPassword(ctx, listener.Addr().String(), "user", "password", 5*time.Second, ssh.InsecureIgnoreHostKey())
+		result <- dialErr
+	}()
+
+	select {
+	case connection := <-accepted:
+		defer connection.Close()
+	case <-time.After(time.Second):
+		t.Fatal("server did not accept test connection")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context cancellation, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not interrupt SSH handshake")
+	}
+}
+
 func TestBoundedOutputConsumesAndTruncates(t *testing.T) {
 	output := newBoundedOutput(5)
 

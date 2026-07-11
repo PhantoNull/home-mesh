@@ -79,12 +79,16 @@ func dialPassword(ctx context.Context, address string, username string, password
 	if err != nil {
 		return nil, fmt.Errorf("connect ssh: %w", err)
 	}
+	stopCloseOnCancel := context.AfterFunc(ctx, func() {
+		_ = connection.Close()
+	})
 
 	deadline := time.Now().Add(connectTimeout)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}
 	if err := connection.SetDeadline(deadline); err != nil {
+		stopCloseOnCancel()
 		_ = connection.Close()
 		return nil, fmt.Errorf("set ssh handshake deadline: %w", err)
 	}
@@ -98,12 +102,17 @@ func dialPassword(ctx context.Context, address string, username string, password
 	}
 
 	clientConnection, channels, requests, err := ssh.NewClientConn(connection, address, config)
+	closeOnCancelStopped := stopCloseOnCancel()
 	if err != nil {
 		_ = connection.Close()
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("connect ssh: %w", ctx.Err())
 		}
 		return nil, fmt.Errorf("connect ssh: %w", err)
+	}
+	if !closeOnCancelStopped || ctx.Err() != nil {
+		_ = clientConnection.Close()
+		return nil, fmt.Errorf("connect ssh: %w", ctx.Err())
 	}
 	if err := connection.SetDeadline(time.Time{}); err != nil {
 		_ = clientConnection.Close()
