@@ -10,8 +10,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/PhantoNull/home-mesh/internal/store"
 )
 
 func TestTerminalBridgeRemoteExitDoesNotWaitForBrowser(t *testing.T) {
@@ -134,26 +132,6 @@ func TestTerminalBridgeRejectsOversizedClientCommands(t *testing.T) {
 				t.Fatal("invalid client command reached the SSH session")
 			}
 		})
-	}
-}
-
-func TestRecordTerminalActionUsesDetachedBoundedContext(t *testing.T) {
-	requestContext, cancel := context.WithCancel(context.Background())
-	cancel()
-	recorder := &fakeTerminalActionRecorder{}
-	action := store.Action{ID: "action-1"}
-
-	if err := recordTerminalAction(requestContext, recorder, action); err != nil {
-		t.Fatalf("record terminal action: %v", err)
-	}
-	if recorder.calls.Load() != 1 {
-		t.Fatalf("AddAction calls = %d, want 1", recorder.calls.Load())
-	}
-	if recorder.contextCanceled.Load() {
-		t.Fatal("audit inherited request cancellation")
-	}
-	if !recorder.hasDeadline.Load() {
-		t.Fatal("audit context did not have a deadline")
 	}
 }
 
@@ -361,18 +339,4 @@ func (s *fakeTerminalSocket) messages() []terminalServerMessage {
 	s.writesMu.Lock()
 	defer s.writesMu.Unlock()
 	return append([]terminalServerMessage(nil), s.writes...)
-}
-
-type fakeTerminalActionRecorder struct {
-	calls           atomic.Int32
-	contextCanceled atomic.Bool
-	hasDeadline     atomic.Bool
-}
-
-func (r *fakeTerminalActionRecorder) AddAction(ctx context.Context, action store.Action) (store.Action, error) {
-	r.calls.Add(1)
-	r.contextCanceled.Store(ctx.Err() != nil)
-	_, hasDeadline := ctx.Deadline()
-	r.hasDeadline.Store(hasDeadline)
-	return action, nil
 }

@@ -1,20 +1,81 @@
 package actions
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"time"
+)
+
+const (
+	defaultWakeAddress = "255.255.255.255:9"
+	defaultWakeTimeout = 3 * time.Second
 )
 
 func SendWakeOnLAN(macAddress string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultWakeTimeout)
+	defer cancel()
+	return SendWakeOnLANContext(ctx, macAddress)
+}
+
+func SendWakeOnLANContext(ctx context.Context, macAddress string) error {
+	return sendWakeOnLANTo(ctx, macAddress, defaultWakeAddress)
+}
+
+func sendWakeOnLANTo(ctx context.Context, macAddress string, destination string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	payload, err := magicPacket(macAddress)
+	if err != nil {
+		return err
+	}
+	address, err := net.ResolveUDPAddr("udp4", destination)
+	if err != nil {
+		return fmt.Errorf("resolve wake-on-lan destination: %w", err)
+	}
+	if address.IP == nil || address.IP.To4() == nil || address.Port < 1 || address.Port > 65535 {
+		return errors.New("wake-on-lan destination must be an IPv4 address with a valid port")
+	}
+
+	conn, err := net.ListenUDP("udp4", nil)
+	if err != nil {
+		return fmt.Errorf("open udp broadcast socket: %w", err)
+	}
+	defer conn.Close()
+	if err := enableSocketBroadcast(conn); err != nil {
+		return fmt.Errorf("enable udp broadcast: %w", err)
+	}
+
+	deadline := time.Now().Add(defaultWakeTimeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return fmt.Errorf("set wake-on-lan deadline: %w", err)
+	}
+	stopCloseOnCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCloseOnCancel()
+
+	if _, err := conn.WriteToUDP(payload, address); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("send magic packet to %s: %w", strings.ToUpper(macAddress), err)
+	}
+	return nil
+}
+
+func magicPacket(macAddress string) ([]byte, error) {
 	hardwareAddr, err := net.ParseMAC(macAddress)
 	if err != nil {
-		return fmt.Errorf("parse mac address: %w", err)
+		return nil, fmt.Errorf("parse mac address: %w", err)
 	}
 
 	if len(hardwareAddr) != 6 {
-		return errors.New("wake-on-lan requires a 6-byte MAC address")
+		return nil, errors.New("wake-on-lan requires a 6-byte MAC address")
 	}
 
 	payload := make([]byte, 0, 102)
@@ -22,23 +83,5 @@ func SendWakeOnLAN(macAddress string) error {
 	for i := 0; i < 16; i++ {
 		payload = append(payload, hardwareAddr...)
 	}
-
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{
-		IP:   net.IPv4bcast,
-		Port: 9,
-	})
-	if err != nil {
-		return fmt.Errorf("open udp broadcast socket: %w", err)
-	}
-	defer conn.Close()
-
-	if err := conn.SetWriteBuffer(len(payload)); err != nil {
-		return fmt.Errorf("set write buffer: %w", err)
-	}
-
-	if _, err := conn.Write(payload); err != nil {
-		return fmt.Errorf("send magic packet to %s: %w", strings.ToUpper(macAddress), err)
-	}
-
-	return nil
+	return payload, nil
 }

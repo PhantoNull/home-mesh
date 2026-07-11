@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/PhantoNull/home-mesh/internal/secrets"
 	"github.com/PhantoNull/home-mesh/internal/sshclient"
 	"github.com/PhantoNull/home-mesh/internal/store"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 )
@@ -136,7 +138,17 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 	mux.HandleFunc("/api/actions", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			actionHistory, err := inventory.ListActions(r.Context())
+			limit, err := parseBoundedQueryInt(r, "limit", 200, 1, 500)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			offset, err := parseBoundedQueryInt(r, "offset", 0, 0, 100_000)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			actionHistory, err := inventory.ListActionsPage(r.Context(), limit, offset)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load actions"})
 				return
@@ -301,36 +313,46 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 
 		startedAt := time.Now().UTC()
 		actionRecord := store.Action{
-			ID:            generateActionID("wake_on_lan", id, startedAt),
-			DeviceID:      id,
-			ActionType:    "wake_on_lan",
-			Status:        "completed",
-			ResultSummary: "Magic packet sent successfully.",
+			ID:         generateActionID("wake_on_lan"),
+			DeviceID:   id,
+			ActionType: "wake_on_lan",
 			Metadata: map[string]string{
 				"deviceName": device.Name,
 				"macAddress": device.MACAddress,
 			},
-			StartedAt:  startedAt,
-			FinishedAt: startedAt,
+			StartedAt: startedAt,
 		}
 
-		if err := actions.SendWakeOnLAN(device.MACAddress); err != nil {
-			actionRecord.Status = "failed"
-			actionRecord.ResultSummary = err.Error()
+		actionResult, err := executeAuditedAction(r.Context(), inventory, actionRecord, func() auditedOperationOutcome {
+			sendErr := actions.SendWakeOnLANContext(r.Context(), device.MACAddress)
+			if sendErr != nil {
+				return auditedOperationOutcome{
+					Err:           sendErr,
+					ResultSummary: "Wake-on-LAN failed.",
+					Metadata:      map[string]string{"terminationReason": "send_error"},
+				}
+			}
+			return auditedOperationOutcome{
+				ResultSummary: "Magic packet sent successfully.",
+				Metadata:      map[string]string{"terminationReason": "packet_sent"},
+			}
+		})
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to start wake action"})
+			return
+		}
+		if actionResult.FinalAuditErr != nil {
+			log.Printf("finalize wake action %s: %v", actionResult.Action.ID, actionResult.FinalAuditErr)
 		}
 
-		recorded, recordErr := inventory.AddAction(r.Context(), actionRecord)
-		if recordErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist wake action"})
+		response := actionResponse(actionResult.Action, actionResult.FinalAuditErr == nil)
+		if actionResult.OperationErr != nil {
+			response["error"] = actionResult.OperationErr.Error()
+			writeJSON(w, http.StatusBadGateway, response)
 			return
 		}
 
-		if actionRecord.Status == "failed" {
-			writeJSON(w, http.StatusBadGateway, recorded)
-			return
-		}
-
-		writeJSON(w, http.StatusCreated, recorded)
+		writeJSON(w, http.StatusCreated, response)
 	})
 	mux.HandleFunc("/api/devices/{id}/ssh-credential", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
@@ -478,47 +500,65 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 
 		startedAt := time.Now().UTC()
 		actionRecord := store.Action{
-			ID:         generateActionID("ssh_command", id, startedAt),
+			ID:         generateActionID("ssh_command"),
 			DeviceID:   id,
 			ActionType: "ssh_command",
-			Status:     "completed",
 			Metadata: map[string]string{
-				"deviceName": device.Name,
-				"address":    address,
-				"command":    commandText,
+				"deviceName":  device.Name,
+				"address":     address,
+				"commandHash": sshCommandAuditHash(commandText),
 			},
 			StartedAt: startedAt,
 		}
 
-		result, runErr := sshclient.RunPasswordCommand(address, credential.Username, password, commandText, 10*time.Second, hostKeyCallback)
-		actionRecord.FinishedAt = time.Now().UTC()
-		actionRecord.Metadata["output"] = result.Output
-
-		if runErr != nil {
-			actionRecord.Status = "failed"
-			actionRecord.ResultSummary = summarizeOutput(result.Output, runErr.Error())
-		} else {
-			actionRecord.ResultSummary = summarizeOutput(result.Output, "SSH command completed.")
-		}
-
-		recorded, recordErr := inventory.AddAction(r.Context(), actionRecord)
-		if recordErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist ssh action"})
+		var result sshclient.Result
+		actionResult, err := executeAuditedAction(r.Context(), inventory, actionRecord, func() auditedOperationOutcome {
+			commandContext, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			defer cancel()
+			var runErr error
+			result, runErr = sshclient.RunPasswordCommandContext(
+				commandContext,
+				address,
+				credential.Username,
+				password,
+				commandText,
+				10*time.Second,
+				sshclient.DefaultMaxCommandOutput,
+				hostKeyCallback,
+			)
+			summary := "SSH command completed."
+			if runErr != nil {
+				summary = "SSH command failed."
+			}
+			return auditedOperationOutcome{
+				Err:           runErr,
+				ResultSummary: summary,
+				Metadata:      sshCommandCompletionMetadata(result, runErr),
+			}
+		})
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to start ssh action"})
 			return
+		}
+		if actionResult.FinalAuditErr != nil {
+			log.Printf("finalize SSH command action %s: %v", actionResult.Action.ID, actionResult.FinalAuditErr)
 		}
 
 		response := map[string]any{
-			"id":            recorded.ID,
-			"deviceId":      recorded.DeviceID,
-			"status":        recorded.Status,
-			"resultSummary": recorded.ResultSummary,
-			"command":       commandText,
-			"output":        result.Output,
-			"startedAt":     recorded.StartedAt,
-			"finishedAt":    recorded.FinishedAt,
+			"id":              actionResult.Action.ID,
+			"deviceId":        actionResult.Action.DeviceID,
+			"status":          actionResult.Action.Status,
+			"resultSummary":   actionResult.Action.ResultSummary,
+			"command":         commandText,
+			"output":          result.Output,
+			"outputTruncated": result.Truncated,
+			"startedAt":       actionResult.Action.StartedAt,
+			"finishedAt":      actionResult.Action.FinishedAt,
+			"auditPersisted":  actionResult.FinalAuditErr == nil,
 		}
 
-		if recorded.Status == "failed" {
+		if actionResult.OperationErr != nil {
+			response["error"] = actionResult.OperationErr.Error()
 			writeJSON(w, http.StatusBadGateway, response)
 			return
 		}
@@ -569,25 +609,32 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 
 		startedAt := time.Now().UTC()
 		actionRecord := store.Action{
-			ID:         generateActionID("ssh_terminal", id, startedAt),
+			ID:         generateActionID("ssh_terminal"),
 			DeviceID:   id,
 			ActionType: "ssh_terminal",
-			Status:     "completed",
 			Metadata: map[string]string{
 				"deviceName": device.Name,
 				"address":    address,
 			},
 			StartedAt: startedAt,
 		}
+		actionRecord, err = startAuditedAction(r.Context(), inventory, actionRecord)
+		if err != nil {
+			log.Printf("start SSH terminal audit %s: %v", actionRecord.ID, err)
+			_ = socket.SetWriteDeadline(time.Now().Add(terminalWriteTimeout))
+			_ = socket.WriteJSON(terminalServerMessage{Type: "error", Data: "SSH terminal audit is unavailable."})
+			_ = socket.Close()
+			return
+		}
 
 		session, err := sshclient.StartPasswordTerminalContext(r.Context(), address, credential.Username, password, 120, 36, 10*time.Second, hostKeyCallback)
 		if err != nil {
-			actionRecord.Status = "failed"
-			actionRecord.FinishedAt = time.Now().UTC()
-			actionRecord.ResultSummary = err.Error()
-			actionRecord.Metadata["terminationReason"] = "connect_error"
-			if recordErr := recordTerminalAction(r.Context(), inventory, actionRecord); recordErr != nil {
-				log.Printf("record SSH terminal action %s: %v", actionRecord.ID, recordErr)
+			if _, auditErr := finishAuditedAction(r.Context(), inventory, actionRecord, auditedOperationOutcome{
+				Err:           err,
+				ResultSummary: "Interactive SSH session failed to connect.",
+				Metadata:      map[string]string{"terminationReason": "connect_error"},
+			}); auditErr != nil {
+				log.Printf("finalize SSH terminal action %s: %v", actionRecord.ID, auditErr)
 			}
 			_ = socket.SetWriteDeadline(time.Now().Add(terminalWriteTimeout))
 			_ = socket.WriteJSON(terminalServerMessage{Type: "error", Data: err.Error()})
@@ -596,16 +643,16 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		}
 
 		result := runTerminalBridge(r.Context(), socket, session)
-		actionRecord.FinishedAt = time.Now().UTC()
-		actionRecord.Metadata["terminationReason"] = result.TerminationReason
+		resultSummary := "Interactive SSH session closed."
 		if result.Err != nil {
-			actionRecord.Status = "failed"
-			actionRecord.ResultSummary = result.Err.Error()
-		} else {
-			actionRecord.ResultSummary = "Interactive SSH session closed."
+			resultSummary = "Interactive SSH session failed."
 		}
-		if recordErr := recordTerminalAction(r.Context(), inventory, actionRecord); recordErr != nil {
-			log.Printf("record SSH terminal action %s: %v", actionRecord.ID, recordErr)
+		if _, auditErr := finishAuditedAction(r.Context(), inventory, actionRecord, auditedOperationOutcome{
+			Err:           result.Err,
+			ResultSummary: resultSummary,
+			Metadata:      map[string]string{"terminationReason": result.TerminationReason},
+		}); auditErr != nil {
+			log.Printf("finalize SSH terminal action %s: %v", actionRecord.ID, auditErr)
 		}
 	})
 
@@ -1124,23 +1171,23 @@ func handleStoreError(w http.ResponseWriter, err error, message string) bool {
 	return true
 }
 
-func generateActionID(actionType string, deviceID string, startedAt time.Time) string {
+func generateActionID(actionType string) string {
 	sanitizedAction := strings.ReplaceAll(actionType, " ", "_")
-	return sanitizedAction + "-" + deviceID + "-" + startedAt.Format("20060102T150405.000000000")
+	return sanitizedAction + "-" + uuid.NewString()
 }
 
-func summarizeOutput(output string, fallback string) string {
-	trimmed := strings.TrimSpace(output)
-	if trimmed == "" {
-		return fallback
+func actionResponse(action store.Action, auditPersisted bool) map[string]any {
+	return map[string]any{
+		"id":             action.ID,
+		"deviceId":       action.DeviceID,
+		"actionType":     action.ActionType,
+		"status":         action.Status,
+		"resultSummary":  action.ResultSummary,
+		"metadata":       action.Metadata,
+		"startedAt":      action.StartedAt,
+		"finishedAt":     action.FinishedAt,
+		"auditPersisted": auditPersisted,
 	}
-
-	lines := strings.Split(trimmed, "\n")
-	if len(lines[0]) <= 180 {
-		return lines[0]
-	}
-
-	return lines[0][:180]
 }
 
 func resolveSSHAddress(device store.Device) (string, error) {
@@ -1189,6 +1236,18 @@ func joinMethods(methods []string) string {
 	}
 
 	return result
+}
+
+func parseBoundedQueryInt(r *http.Request, name string, fallback int, minimum int, maximum int) (int, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < minimum || value > maximum {
+		return 0, fmt.Errorf("%s must be an integer between %d and %d", name, minimum, maximum)
+	}
+	return value, nil
 }
 
 func filterDiscoveryResults(ctx context.Context, inventory *store.Store, result discovery.ScanResult) ([]discovery.HostMatch, []discoverySegmentCandidate, error) {

@@ -45,6 +45,38 @@ func TestNormalizeSSHPort(t *testing.T) {
 	}
 }
 
+func TestParseBoundedQueryInt(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name    string
+		query   string
+		want    int
+		wantErr bool
+	}{
+		{name: "default", want: 200},
+		{name: "valid", query: "?limit=25", want: 25},
+		{name: "below minimum", query: "?limit=0", wantErr: true},
+		{name: "above maximum", query: "?limit=501", wantErr: true},
+		{name: "not an integer", query: "?limit=all", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			request := httptest.NewRequest(http.MethodGet, "/api/actions"+test.query, nil)
+			got, err := parseBoundedQueryInt(request, "limit", 200, 1, 500)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("expected query validation error")
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("value = %d, error = %v", got, err)
+			}
+		})
+	}
+}
+
 func TestIsSameOrigin(t *testing.T) {
 	t.Parallel()
 

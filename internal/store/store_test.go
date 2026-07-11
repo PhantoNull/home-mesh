@@ -140,6 +140,42 @@ func TestOrphanSSHCredentialIsQuarantinedWithoutDataLoss(t *testing.T) {
 	}
 }
 
+func TestMigrationRedactsLegacySSHActionPlaintext(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-action.db")
+	legacy := createLegacyDatabase(t, dbPath)
+	now := time.Now().UTC()
+	if _, err := legacy.Exec(`
+		INSERT INTO actions (
+			id, device_id, action_type, status, result_summary, metadata_json,
+			started_at, finished_at
+		) VALUES (?, ?, 'ssh_command', 'completed', ?, ?, ?, ?)
+	`, "legacy-action", "device-a", "secret output first line", `{"command":"cat /secret","output":"secret output","address":"192.0.2.1:22"}`, now, now); err != nil {
+		t.Fatalf("insert legacy SSH action: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := openTestStore(t, dbPath, Options{})
+	actions, err := store.ListActions(context.Background())
+	if err != nil || len(actions) != 1 {
+		t.Fatalf("list migrated actions = %+v, %v", actions, err)
+	}
+	action := actions[0]
+	if action.ResultSummary != "SSH command completed." {
+		t.Fatalf("result summary = %q", action.ResultSummary)
+	}
+	if _, exists := action.Metadata["command"]; exists {
+		t.Fatalf("legacy command remains in metadata: %v", action.Metadata)
+	}
+	if _, exists := action.Metadata["output"]; exists {
+		t.Fatalf("legacy output remains in metadata: %v", action.Metadata)
+	}
+	if action.Metadata["address"] != "192.0.2.1:22" {
+		t.Fatalf("non-sensitive metadata was not preserved: %v", action.Metadata)
+	}
+}
+
 func TestDemoSeedIsOptInAndTransactional(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "seeded.db")
 	store := openTestStore(t, dbPath, Options{SeedDemo: true})
@@ -321,6 +357,84 @@ func TestUpsertSSHCredentialAndPortIsAtomic(t *testing.T) {
 	storedDevice, err := store.GetDevice(ctx, device.ID)
 	if err != nil || storedDevice.Metadata["sshPort"] != "2222" {
 		t.Fatalf("stored device %+v, error %v", storedDevice, err)
+	}
+}
+
+func TestUpdateActionFinalizesExistingAuditRecord(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "actions.db"), Options{})
+	ctx := context.Background()
+	startedAt := time.Now().UTC().Add(-time.Second)
+	action := Action{
+		ID:         "action-a",
+		DeviceID:   "device-a",
+		ActionType: "wake_on_lan",
+		Status:     "running",
+		Metadata:   map[string]string{"target": "device-a"},
+		StartedAt:  startedAt,
+	}
+	if _, err := store.AddAction(ctx, action); err != nil {
+		t.Fatalf("add running action: %v", err)
+	}
+
+	action.Status = "completed"
+	action.ResultSummary = "Wake packet sent."
+	action.FinishedAt = time.Now().UTC()
+	if _, err := store.UpdateAction(ctx, action); err != nil {
+		t.Fatalf("finalize action: %v", err)
+	}
+	actions, err := store.ListActions(ctx)
+	if err != nil || len(actions) != 1 {
+		t.Fatalf("list actions = %+v, %v", actions, err)
+	}
+	if actions[0].Status != "completed" || actions[0].FinishedAt.IsZero() || actions[0].ResultSummary != "Wake packet sent." {
+		t.Fatalf("final action = %+v", actions[0])
+	}
+
+	missing := action
+	missing.ID = "missing"
+	if _, err := store.UpdateAction(ctx, missing); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing action update error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestActionPaginationAndRetentionAreBounded(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "action-history.db"), Options{})
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+	for index := 0; index < 6; index++ {
+		if _, err := store.AddAction(ctx, Action{
+			ID:         fmt.Sprintf("action-%d", index),
+			ActionType: "test",
+			Status:     "completed",
+			StartedAt:  base.Add(time.Duration(index) * time.Minute),
+			FinishedAt: base.Add(time.Duration(index) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, err := store.ListActionsPage(ctx, 2, 1)
+	if err != nil || len(page) != 2 || page[0].ID != "action-4" || page[1].ID != "action-3" {
+		t.Fatalf("action page = %+v, %v", page, err)
+	}
+	if _, err := store.ListActionsPage(ctx, 2, -1); err == nil {
+		t.Fatal("expected negative offset to be rejected")
+	}
+
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pruneActions(ctx, tx, 3); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := store.ListActionsPage(ctx, 10, 0)
+	if err != nil || len(remaining) != 3 || remaining[0].ID != "action-5" || remaining[2].ID != "action-3" {
+		t.Fatalf("retained actions = %+v, %v", remaining, err)
 	}
 }
 

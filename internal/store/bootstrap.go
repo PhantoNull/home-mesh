@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const latestSchemaVersion = 2
+const latestSchemaVersion = 3
 
 type migration struct {
 	version    int
@@ -145,6 +145,24 @@ var schemaMigrations = []migration{
 				ON relations(source_kind, source_id);
 			CREATE INDEX IF NOT EXISTS idx_relations_target_endpoint
 				ON relations(target_kind, target_id);
+		`},
+	},
+	{
+		version: 3,
+		name:    "redact legacy SSH action payloads",
+		statements: []string{`
+			UPDATE actions
+			SET metadata_json = CASE
+					WHEN json_valid(metadata_json) THEN json_remove(metadata_json, '$.command', '$.output')
+					ELSE '{}'
+				END,
+				result_summary = CASE status
+					WHEN 'completed' THEN 'SSH command completed.'
+					WHEN 'failed' THEN 'SSH command failed.'
+					WHEN 'running' THEN 'SSH command is running.'
+					ELSE 'SSH command finished.'
+				END
+			WHERE action_type = 'ssh_command';
 		`},
 	},
 }

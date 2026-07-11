@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/PhantoNull/home-mesh/internal/store"
 	"github.com/gorilla/websocket"
 )
 
@@ -26,7 +25,6 @@ const (
 	terminalReadTimeout       = 40 * time.Second
 	terminalWriteTimeout      = 10 * time.Second
 	terminalFinalFlushTimeout = 500 * time.Millisecond
-	terminalAuditTimeout      = 3 * time.Second
 )
 
 var (
@@ -62,10 +60,6 @@ type terminalSocket interface {
 	SetReadDeadline(time.Time) error
 	SetWriteDeadline(time.Time) error
 	Close() error
-}
-
-type terminalActionRecorder interface {
-	AddAction(context.Context, store.Action) (store.Action, error)
 }
 
 type terminalBridgeResult struct {
@@ -441,11 +435,4 @@ func isNormalTerminalDisconnect(err error) bool {
 		return true
 	}
 	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived)
-}
-
-func recordTerminalAction(ctx context.Context, recorder terminalActionRecorder, action store.Action) error {
-	auditContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalAuditTimeout)
-	defer cancel()
-	_, err := recorder.AddAction(auditContext, action)
-	return err
 }

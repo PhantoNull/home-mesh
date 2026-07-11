@@ -22,6 +22,12 @@ var (
 	ErrInvalidRelationEndpoint = errors.New("invalid relation endpoint")
 )
 
+const (
+	defaultActionPageSize = 200
+	maxActionPageSize     = 500
+	maxRetainedActions    = 5000
+)
+
 type Store struct {
 	db *sql.DB
 }
@@ -617,11 +623,25 @@ func (s *Store) DeleteRelation(ctx context.Context, id string) error {
 }
 
 func (s *Store) ListActions(ctx context.Context) ([]Action, error) {
+	return s.ListActionsPage(ctx, defaultActionPageSize, 0)
+}
+
+func (s *Store) ListActionsPage(ctx context.Context, limit int, offset int) ([]Action, error) {
+	if limit <= 0 {
+		limit = defaultActionPageSize
+	}
+	if limit > maxActionPageSize {
+		limit = maxActionPageSize
+	}
+	if offset < 0 {
+		return nil, errors.New("action offset must not be negative")
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, device_id, action_type, status, result_summary, metadata_json, started_at, finished_at
 		FROM actions
 		ORDER BY started_at DESC, id DESC
-	`)
+		LIMIT ? OFFSET ?
+	`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -645,7 +665,13 @@ func (s *Store) AddAction(ctx context.Context, action Action) (Action, error) {
 		return Action{}, err
 	}
 
-	_, err = s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Action{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO actions (
 			id, device_id, action_type, status, result_summary, metadata_json, started_at, finished_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -653,7 +679,52 @@ func (s *Store) AddAction(ctx context.Context, action Action) (Action, error) {
 	if err != nil {
 		return Action{}, err
 	}
+	if err := pruneActions(ctx, tx, maxRetainedActions); err != nil {
+		return Action{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Action{}, err
+	}
 
+	return action, nil
+}
+
+func pruneActions(ctx context.Context, tx *sql.Tx, retain int) error {
+	if retain < 0 {
+		return errors.New("action retention must not be negative")
+	}
+	_, err := tx.ExecContext(ctx, `
+		DELETE FROM actions
+		WHERE id IN (
+			SELECT id FROM actions
+			ORDER BY started_at DESC, id DESC
+			LIMIT -1 OFFSET ?
+		)
+	`, retain)
+	return err
+}
+
+func (s *Store) UpdateAction(ctx context.Context, action Action) (Action, error) {
+	_, metadataJSON, err := marshalJSONFields(nil, action.Metadata)
+	if err != nil {
+		return Action{}, err
+	}
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE actions
+		SET device_id = ?, action_type = ?, status = ?, result_summary = ?,
+			metadata_json = ?, started_at = ?, finished_at = ?
+		WHERE id = ?
+	`, action.DeviceID, action.ActionType, action.Status, action.ResultSummary,
+		metadataJSON, action.StartedAt, action.FinishedAt, action.ID)
+	if err != nil {
+		return Action{}, err
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return Action{}, err
+	} else if rows == 0 {
+		return Action{}, ErrNotFound
+	}
 	return action, nil
 }
 
