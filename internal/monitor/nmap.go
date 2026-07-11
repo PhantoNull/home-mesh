@@ -152,8 +152,16 @@ func parseNmapXML(data []byte) (map[string]nmapScanResult, error) {
 	if err := xml.Unmarshal(data, &run); err != nil {
 		return nil, fmt.Errorf("parse nmap xml: %w", err)
 	}
-	if run.RunStats.Finished.Exit != "" && run.RunStats.Finished.Exit != "success" {
-		return nil, fmt.Errorf("nmap reported %s: %s", run.RunStats.Finished.Exit, run.RunStats.Finished.ErrorMsg)
+	exit := strings.TrimSpace(run.RunStats.Finished.Exit)
+	if exit == "" {
+		return nil, fmt.Errorf("nmap XML is incomplete: missing runstats finished exit=success")
+	}
+	if exit != "success" {
+		message := strings.TrimSpace(run.RunStats.Finished.ErrorMsg)
+		if message == "" {
+			return nil, fmt.Errorf("nmap reported exit=%s", exit)
+		}
+		return nil, fmt.Errorf("nmap reported exit=%s: %s", exit, message)
 	}
 
 	results := make(map[string]nmapScanResult, len(run.Hosts))
@@ -174,11 +182,16 @@ func parseNmapXML(data []byte) (map[string]nmapScanResult, error) {
 		}
 
 		for _, hostname := range host.Hostnames.List {
-			if hostname.Type == "PTR" || result.Hostname == "" {
-				result.Hostname = strings.TrimSuffix(hostname.Name, ".")
-				if hostname.Type == "PTR" {
-					break
-				}
+			name, ok := canonicalObservedHostname(hostname.Name)
+			if !ok {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(hostname.Type), "PTR") {
+				result.Hostname = name
+				break
+			}
+			if result.Hostname == "" {
+				result.Hostname = name
 			}
 		}
 
@@ -205,7 +218,11 @@ func normalizeNmapResult(result nmapScanResult) (nmapScanResult, bool) {
 	}
 	result.IP = canonicalIP
 	result.MAC = strings.ToUpper(strings.TrimSpace(result.MAC))
-	result.Hostname = strings.TrimSuffix(strings.TrimSpace(result.Hostname), ".")
+	if hostname, ok := canonicalObservedHostname(result.Hostname); ok {
+		result.Hostname = hostname
+	} else {
+		result.Hostname = ""
+	}
 	validPorts := result.OpenPorts[:0]
 	for _, port := range result.OpenPorts {
 		if port >= 1 && port <= 65535 {
@@ -216,6 +233,28 @@ func normalizeNmapResult(result nmapScanResult) (nmapScanResult, bool) {
 	slices.Sort(result.OpenPorts)
 	result.OpenPorts = slices.Compact(result.OpenPorts)
 	return result, true
+}
+
+func canonicalObservedHostname(value string) (string, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimSuffix(value, ".")
+	if value == "" || len(value) > 253 {
+		return "", false
+	}
+	if address, err := netip.ParseAddr(value); err == nil && address.IsValid() {
+		return "", false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+				return "", false
+			}
+		}
+	}
+	return value, true
 }
 
 func canonicalIPv4List(values []string) ([]string, error) {

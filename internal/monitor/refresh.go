@@ -30,16 +30,19 @@ const (
 	singleScanTimeout  = 10 * time.Second
 	targetProbeTimeout = 10 * time.Second
 	dnsLookupTimeout   = 2 * time.Second
+	maxBatchScanPorts  = 64
 )
 
 type RefreshSummary struct {
-	Checked     int `json:"checked"`
-	Updated     int `json:"updated"`
-	Online      int `json:"online"`
-	Degraded    int `json:"degraded"`
-	Offline     int `json:"offline"`
-	Unknown     int `json:"unknown"`
-	MACResolved int `json:"macResolved"`
+	Checked     int  `json:"checked"`
+	Updated     int  `json:"updated"`
+	Skipped     int  `json:"skipped"`
+	Online      int  `json:"online"`
+	Degraded    int  `json:"degraded"`
+	Offline     int  `json:"offline"`
+	Unknown     int  `json:"unknown"`
+	MACResolved int  `json:"macResolved"`
+	Partial     bool `json:"partial"`
 }
 
 type RefreshResult struct {
@@ -156,7 +159,7 @@ func (r *Refresher) scanAndPublish(ctx context.Context) {
 		log.Printf("background refresh failed: %v", err)
 		r.bus.publishJSON(EventScanComplete, map[string]any{
 			"checked": 0, "updated": 0, "online": 0, "degraded": 0,
-			"offline": 0, "unknown": len(devices) + len(nodes), "nmapUsed": false,
+			"offline": 0, "unknown": len(devices) + len(nodes), "skipped": 0, "partial": false, "nmapUsed": false,
 			"error": "refresh failed",
 		})
 		return
@@ -170,13 +173,14 @@ func (r *Refresher) scanAndPublish(ctx context.Context) {
 	}
 	r.bus.publishJSON(EventScanComplete, map[string]any{
 		"checked": result.Summary.Checked, "updated": result.Summary.Updated,
+		"skipped": result.Summary.Skipped, "partial": result.Summary.Partial,
 		"online": result.Summary.Online, "degraded": result.Summary.Degraded,
 		"offline": result.Summary.Offline, "unknown": result.Summary.Unknown,
 		"nmapUsed": result.NmapUsed,
 	})
 	log.Printf(
-		"background refresh completed: checked=%d updated=%d online=%d degraded=%d offline=%d unknown=%d nmap_used=%t",
-		result.Summary.Checked, result.Summary.Updated, result.Summary.Online,
+		"background refresh completed: checked=%d updated=%d skipped=%d online=%d degraded=%d offline=%d unknown=%d nmap_used=%t",
+		result.Summary.Checked, result.Summary.Updated, result.Summary.Skipped, result.Summary.Online,
 		result.Summary.Degraded, result.Summary.Offline, result.Summary.Unknown, result.NmapUsed,
 	)
 }
@@ -245,6 +249,8 @@ func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Devic
 	targets := make([]target, 0, len(devices)+len(nodes))
 	ips := make([]string, 0, len(devices)+len(nodes))
 	seenIPs := make(map[string]struct{}, len(devices)+len(nodes))
+	targetDevices := make([]store.Device, 0, len(devices))
+	targetNodes := make([]store.NetworkNode, 0, len(nodes))
 
 	for index := range refreshedDevices {
 		refreshedDevices[index].Status = "unknown"
@@ -256,6 +262,7 @@ func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Devic
 			continue
 		}
 		targets = append(targets, target{ip: ip, isDevice: true, index: index})
+		targetDevices = append(targetDevices, refreshedDevices[index])
 		if _, exists := seenIPs[ip]; !exists {
 			seenIPs[ip] = struct{}{}
 			ips = append(ips, ip)
@@ -268,6 +275,7 @@ func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Devic
 			continue
 		}
 		targets = append(targets, target{ip: ip, index: index})
+		targetNodes = append(targetNodes, refreshedNodes[index])
 		if _, exists := seenIPs[ip]; !exists {
 			seenIPs[ip] = struct{}{}
 			ips = append(ips, ip)
@@ -278,7 +286,7 @@ func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Devic
 	nmapUsed := len(ips) > 0
 	if nmapUsed {
 		scanCtx, cancel := context.WithTimeout(ctx, batchScanTimeout)
-		results, err := r.nmapScan(scanCtx, r.nmapPath, ips, allCandidatePorts())
+		results, err := r.nmapScan(scanCtx, r.nmapPath, ips, batchCandidatePorts(targetDevices, targetNodes))
 		cancel()
 		if err != nil {
 			return RefreshResult{}, &nmapExecutionError{err: err}
@@ -297,35 +305,59 @@ func (r *Refresher) batchScanWithNmap(ctx context.Context, devices []store.Devic
 	}
 
 	summary := RefreshSummary{Checked: len(devices) + len(nodes)}
-	for index, device := range refreshedDevices {
-		updated, err := persistIfChanged(ctx, r.store, devices[index], device)
+	resultDevices := make([]store.Device, 0, len(refreshedDevices))
+	for index := range refreshedDevices {
+		observedMAC := refreshedDevices[index].MACAddress
+		macResolved := refreshedDevices[index].MACAddress != "" && refreshedDevices[index].MACAddress != devices[index].MACAddress
+		updated, err := persistIfChanged(ctx, r.store, devices[index], &refreshedDevices[index])
 		if err != nil {
-			return RefreshResult{}, err
+			if !isSkippableRefreshError(err) {
+				return RefreshResult{}, err
+			}
+			summary.Skipped++
+			summary.Partial = true
+			if errors.Is(err, store.ErrConflict) {
+				resultDevices = append(resultDevices, refreshedDevices[index])
+			}
+			continue
 		}
+		resultDevices = append(resultDevices, refreshedDevices[index])
 		if updated {
 			summary.Updated++
 		}
-		if device.MACAddress != "" && device.MACAddress != devices[index].MACAddress {
+		if macResolved && updated && refreshedDevices[index].MACAddress == observedMAC {
 			summary.MACResolved++
 		}
-		accumulateStatus(&summary, device.Status)
+		accumulateStatus(&summary, refreshedDevices[index].Status)
 	}
-	for index, node := range refreshedNodes {
-		updated, err := persistNodeIfChanged(ctx, r.store, nodes[index], node)
+	resultNodes := make([]store.NetworkNode, 0, len(refreshedNodes))
+	for index := range refreshedNodes {
+		observedMAC := refreshedNodes[index].MACAddress
+		macResolved := refreshedNodes[index].MACAddress != "" && refreshedNodes[index].MACAddress != nodes[index].MACAddress
+		updated, err := persistNodeIfChanged(ctx, r.store, nodes[index], &refreshedNodes[index])
 		if err != nil {
-			return RefreshResult{}, err
+			if !isSkippableRefreshError(err) {
+				return RefreshResult{}, err
+			}
+			summary.Skipped++
+			summary.Partial = true
+			if errors.Is(err, store.ErrConflict) {
+				resultNodes = append(resultNodes, refreshedNodes[index])
+			}
+			continue
 		}
+		resultNodes = append(resultNodes, refreshedNodes[index])
 		if updated {
 			summary.Updated++
 		}
-		if node.MACAddress != "" && node.MACAddress != nodes[index].MACAddress {
+		if macResolved && updated && refreshedNodes[index].MACAddress == observedMAC {
 			summary.MACResolved++
 		}
-		accumulateStatus(&summary, node.Status)
+		accumulateStatus(&summary, refreshedNodes[index].Status)
 	}
 
 	return RefreshResult{
-		Summary: summary, Devices: refreshedDevices, NetworkNodes: refreshedNodes, NmapUsed: nmapUsed,
+		Summary: summary, Devices: resultDevices, NetworkNodes: resultNodes, NmapUsed: nmapUsed,
 	}, nil
 }
 
@@ -334,8 +366,8 @@ func applyNmapToDevice(device store.Device, result nmapScanResult) store.Device 
 	if result.MAC != "" {
 		device.MACAddress = result.MAC
 	}
-	if result.Hostname != "" && strings.TrimSpace(device.Hostname) == "" {
-		device.Hostname = result.Hostname
+	if hostname, ok := canonicalObservedHostname(result.Hostname); ok && strings.TrimSpace(device.Hostname) == "" {
+		device.Hostname = hostname
 	}
 	setReachabilityMetadata(device.Metadata, coalesce(device.Hostname, device.IPAddress), result.OpenPorts)
 
@@ -392,6 +424,8 @@ func (r *Refresher) refreshDevicesParallel(ctx context.Context, devices []store.
 		updated     bool
 		status      string
 		macResolved bool
+		skipped     bool
+		include     bool
 	}
 	results := make([]result, len(devices))
 	if len(devices) == 0 {
@@ -421,6 +455,12 @@ func (r *Refresher) refreshDevicesParallel(ctx context.Context, devices []store.
 
 				device, updated, status, macResolved, err := refresh(workCtx, cloneDevice(devices[index]))
 				if err != nil {
+					if isSkippableRefreshError(err) {
+						results[index] = result{
+							device: device, skipped: true, include: errors.Is(err, store.ErrConflict),
+						}
+						continue
+					}
 					workMu.Lock()
 					if firstErr == nil {
 						firstErr = err
@@ -429,7 +469,7 @@ func (r *Refresher) refreshDevicesParallel(ctx context.Context, devices []store.
 					workMu.Unlock()
 					return
 				}
-				results[index] = result{device: device, updated: updated, status: status, macResolved: macResolved}
+				results[index] = result{device: device, updated: updated, status: status, macResolved: macResolved, include: true}
 			}
 		}()
 	}
@@ -438,10 +478,17 @@ func (r *Refresher) refreshDevicesParallel(ctx context.Context, devices []store.
 		return nil, RefreshSummary{}, firstErr
 	}
 
-	refreshed := make([]store.Device, len(results))
+	refreshed := make([]store.Device, 0, len(results))
 	summary := RefreshSummary{Checked: len(results)}
-	for index, current := range results {
-		refreshed[index] = current.device
+	for _, current := range results {
+		if current.include {
+			refreshed = append(refreshed, current.device)
+		}
+		if current.skipped {
+			summary.Skipped++
+			summary.Partial = true
+			continue
+		}
 		if current.updated {
 			summary.Updated++
 		}
@@ -461,6 +508,8 @@ func (r *Refresher) refreshNodesParallel(ctx context.Context, nodes []store.Netw
 		updated     bool
 		status      string
 		macResolved bool
+		skipped     bool
+		include     bool
 	}
 	results := make([]result, len(nodes))
 	if len(nodes) == 0 {
@@ -490,6 +539,12 @@ func (r *Refresher) refreshNodesParallel(ctx context.Context, nodes []store.Netw
 
 				node, updated, status, macResolved, err := refresh(workCtx, cloneNetworkNode(nodes[index]))
 				if err != nil {
+					if isSkippableRefreshError(err) {
+						results[index] = result{
+							node: node, skipped: true, include: errors.Is(err, store.ErrConflict),
+						}
+						continue
+					}
 					workMu.Lock()
 					if firstErr == nil {
 						firstErr = err
@@ -498,7 +553,7 @@ func (r *Refresher) refreshNodesParallel(ctx context.Context, nodes []store.Netw
 					workMu.Unlock()
 					return
 				}
-				results[index] = result{node: node, updated: updated, status: status, macResolved: macResolved}
+				results[index] = result{node: node, updated: updated, status: status, macResolved: macResolved, include: true}
 			}
 		}()
 	}
@@ -507,10 +562,17 @@ func (r *Refresher) refreshNodesParallel(ctx context.Context, nodes []store.Netw
 		return nil, RefreshSummary{}, firstErr
 	}
 
-	refreshed := make([]store.NetworkNode, len(results))
+	refreshed := make([]store.NetworkNode, 0, len(results))
 	summary := RefreshSummary{Checked: len(results)}
-	for index, current := range results {
-		refreshed[index] = current.node
+	for _, current := range results {
+		if current.include {
+			refreshed = append(refreshed, current.node)
+		}
+		if current.skipped {
+			summary.Skipped++
+			summary.Partial = true
+			continue
+		}
 		if current.updated {
 			summary.Updated++
 		}
@@ -601,7 +663,7 @@ func (r *Refresher) refreshDeviceWithNmap(ctx context.Context, device store.Devi
 	}
 	if !ok {
 		device.Status = "unknown"
-		updated, err := persistIfChanged(ctx, r.store, original, device)
+		updated, err := persistIfChanged(ctx, r.store, original, &device)
 		return device, updated, device.Status, false, err
 	}
 
@@ -612,8 +674,10 @@ func (r *Refresher) refreshDeviceWithNmap(ctx context.Context, device store.Devi
 		return store.Device{}, false, "unknown", false, &nmapExecutionError{err: err}
 	}
 	device = applyNmapToDevice(device, result)
+	observedMAC := device.MACAddress
 	macResolved := device.MACAddress != "" && device.MACAddress != original.MACAddress
-	updated, err := persistIfChanged(ctx, r.store, original, device)
+	updated, err := persistIfChanged(ctx, r.store, original, &device)
+	macResolved = macResolved && updated && device.MACAddress == observedMAC
 	return device, updated, device.Status, macResolved, err
 }
 
@@ -626,7 +690,7 @@ func (r *Refresher) refreshDeviceFallback(ctx context.Context, device store.Devi
 	}
 	if !ok {
 		device.Status = "unknown"
-		updated, err := persistIfChanged(ctx, r.store, original, device)
+		updated, err := persistIfChanged(ctx, r.store, original, &device)
 		return device, updated, device.Status, false, err
 	}
 
@@ -636,29 +700,37 @@ func (r *Refresher) refreshDeviceFallback(ctx context.Context, device store.Devi
 	ports := candidatePorts(device)
 	if pingOK {
 		ports = []int{443, 80}
+		if sshPort, ok := configuredSSHPort(device); ok && sshPort != 443 && sshPort != 80 {
+			ports = append(ports, sshPort)
+		}
 	}
 	tcpOpen, tcpRefused, openPorts, tcpErr := r.probes.probeTCPPorts(probeCtx, targetIP, ports)
-	if tcpErr != nil && probeCtx.Err() == nil {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return store.Device{}, false, "unknown", false, ctxErr
+	}
+	probeTimedOut := errors.Is(probeCtx.Err(), context.DeadlineExceeded) || errors.Is(tcpErr, context.DeadlineExceeded)
+	if tcpErr != nil && !probeTimedOut {
 		return store.Device{}, false, "unknown", false, tcpErr
 	}
-	if probeCtx.Err() != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return store.Device{}, false, "unknown", false, ctxErr
-		}
+	if probeTimedOut && !pingOK && !tcpOpen && !tcpRefused {
 		unknown := cloneDevice(original)
 		unknown.Status = "unknown"
-		updated, persistErr := persistIfChanged(ctx, r.store, original, unknown)
+		updated, persistErr := persistIfChanged(ctx, r.store, original, &unknown)
 		return unknown, updated, unknown.Status, false, persistErr
 	}
 
 	hasARP := false
-	if macAddress, lookupErr := r.probes.lookupMAC(probeCtx, targetIP); lookupErr == nil && macAddress != "" {
-		hasARP = true
-		device.MACAddress = macAddress
-	}
-	if (pingOK || tcpOpen) && strings.TrimSpace(device.Hostname) == "" {
-		if hostname, lookupErr := r.probes.reverseLookup(probeCtx, targetIP); lookupErr == nil {
-			device.Hostname = hostname
+	if !probeTimedOut {
+		if macAddress, lookupErr := r.probes.lookupMAC(probeCtx, targetIP); lookupErr == nil && macAddress != "" {
+			hasARP = true
+			device.MACAddress = macAddress
+		}
+		if (pingOK || tcpOpen) && strings.TrimSpace(device.Hostname) == "" {
+			if hostname, lookupErr := r.probes.reverseLookup(probeCtx, targetIP); lookupErr == nil {
+				if canonical, ok := canonicalObservedHostname(hostname); ok {
+					device.Hostname = canonical
+				}
+			}
 		}
 	}
 	setReachabilityMetadata(device.Metadata, coalesce(device.Hostname, targetIP), parsePorts(openPorts))
@@ -671,8 +743,10 @@ func (r *Refresher) refreshDeviceFallback(ctx context.Context, device store.Devi
 	default:
 		device.Status = "offline"
 	}
+	observedMAC := device.MACAddress
 	macResolved := device.MACAddress != "" && device.MACAddress != original.MACAddress
-	updated, err := persistIfChanged(ctx, r.store, original, device)
+	updated, err := persistIfChanged(ctx, r.store, original, &device)
+	macResolved = macResolved && updated && device.MACAddress == observedMAC
 	return device, updated, device.Status, macResolved, err
 }
 
@@ -699,7 +773,7 @@ func (r *Refresher) refreshNetworkNodeWithNmap(ctx context.Context, node store.N
 	targetIP, ok := canonicalNodeTarget(&node)
 	if !ok {
 		node.Status = "unknown"
-		updated, err := persistNodeIfChanged(ctx, r.store, original, node)
+		updated, err := persistNodeIfChanged(ctx, r.store, original, &node)
 		return node, updated, node.Status, false, err
 	}
 
@@ -710,8 +784,10 @@ func (r *Refresher) refreshNetworkNodeWithNmap(ctx context.Context, node store.N
 		return store.NetworkNode{}, false, "unknown", false, &nmapExecutionError{err: err}
 	}
 	node = applyNmapToNode(node, result)
+	observedMAC := node.MACAddress
 	macResolved := node.MACAddress != "" && node.MACAddress != original.MACAddress
-	updated, err := persistNodeIfChanged(ctx, r.store, original, node)
+	updated, err := persistNodeIfChanged(ctx, r.store, original, &node)
+	macResolved = macResolved && updated && node.MACAddress == observedMAC
 	return node, updated, node.Status, macResolved, err
 }
 
@@ -721,7 +797,7 @@ func (r *Refresher) refreshNetworkNodeFallback(ctx context.Context, node store.N
 	targetIP, ok := canonicalNodeTarget(&node)
 	if !ok {
 		node.Status = "unknown"
-		updated, err := persistNodeIfChanged(ctx, r.store, original, node)
+		updated, err := persistNodeIfChanged(ctx, r.store, original, &node)
 		return node, updated, node.Status, false, err
 	}
 
@@ -733,23 +809,26 @@ func (r *Refresher) refreshNetworkNodeFallback(ctx context.Context, node store.N
 		ports = []int{443, 80}
 	}
 	tcpOpen, tcpRefused, openPorts, tcpErr := r.probes.probeTCPPorts(probeCtx, targetIP, ports)
-	if tcpErr != nil && probeCtx.Err() == nil {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return store.NetworkNode{}, false, "unknown", false, ctxErr
+	}
+	probeTimedOut := errors.Is(probeCtx.Err(), context.DeadlineExceeded) || errors.Is(tcpErr, context.DeadlineExceeded)
+	if tcpErr != nil && !probeTimedOut {
 		return store.NetworkNode{}, false, "unknown", false, tcpErr
 	}
-	if probeCtx.Err() != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return store.NetworkNode{}, false, "unknown", false, ctxErr
-		}
+	if probeTimedOut && !pingOK && !tcpOpen && !tcpRefused {
 		unknown := cloneNetworkNode(original)
 		unknown.Status = "unknown"
-		updated, persistErr := persistNodeIfChanged(ctx, r.store, original, unknown)
+		updated, persistErr := persistNodeIfChanged(ctx, r.store, original, &unknown)
 		return unknown, updated, unknown.Status, false, persistErr
 	}
 
 	hasARP := false
-	if macAddress, lookupErr := r.probes.lookupMAC(probeCtx, targetIP); lookupErr == nil && macAddress != "" {
-		hasARP = true
-		node.MACAddress = macAddress
+	if !probeTimedOut {
+		if macAddress, lookupErr := r.probes.lookupMAC(probeCtx, targetIP); lookupErr == nil && macAddress != "" {
+			hasARP = true
+			node.MACAddress = macAddress
+		}
 	}
 	setReachabilityMetadata(node.Metadata, targetIP, parsePorts(openPorts))
 
@@ -761,26 +840,38 @@ func (r *Refresher) refreshNetworkNodeFallback(ctx context.Context, node store.N
 	default:
 		node.Status = "offline"
 	}
+	observedMAC := node.MACAddress
 	macResolved := node.MACAddress != "" && node.MACAddress != original.MACAddress
-	updated, err := persistNodeIfChanged(ctx, r.store, original, node)
+	updated, err := persistNodeIfChanged(ctx, r.store, original, &node)
+	macResolved = macResolved && updated && node.MACAddress == observedMAC
 	return node, updated, node.Status, macResolved, err
 }
 
 func (r *Refresher) canonicalDeviceTarget(ctx context.Context, device *store.Device) (string, bool, error) {
-	candidate := strings.TrimSpace(device.IPAddress)
-	if hostname := strings.TrimSpace(device.Hostname); hostname != "" {
-		resolved, err := r.probes.resolveIPv4(ctx, hostname)
-		if err == nil {
-			candidate = resolved
-		} else if ctxErr := ctx.Err(); ctxErr != nil {
+	if candidate := strings.TrimSpace(device.IPAddress); candidate != "" {
+		canonical, err := canonicalIPv4(candidate)
+		if err != nil {
+			return "", false, nil
+		}
+		device.IPAddress = canonical
+		return canonical, true, nil
+	}
+
+	hostname := strings.TrimSpace(device.Hostname)
+	if hostname == "" {
+		return "", false, nil
+	}
+	resolved, err := r.probes.resolveIPv4(ctx, hostname)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", false, ctxErr
 		}
+		return "", false, nil
 	}
-	canonical, err := canonicalIPv4(candidate)
+	canonical, err := canonicalIPv4(resolved)
 	if err != nil {
 		return "", false, nil
 	}
-	device.IPAddress = canonical
 	return canonical, true, nil
 }
 
@@ -793,22 +884,153 @@ func canonicalNodeTarget(node *store.NetworkNode) (string, bool) {
 	return canonical, true
 }
 
-func persistIfChanged(ctx context.Context, inventory *store.Store, original store.Device, current store.Device) (bool, error) {
-	persisted := cloneDevice(current)
+func persistIfChanged(ctx context.Context, inventory *store.Store, original store.Device, current *store.Device) (bool, error) {
+	persisted := cloneDevice(*current)
 	if devicesEqual(original, persisted) {
+		latest, err := inventory.GetDevice(ctx, original.ID)
+		if err != nil {
+			return false, err
+		}
+		*current = cloneDevice(latest)
 		return false, nil
 	}
-	_, err := inventory.UpdateDevice(ctx, persisted)
-	return err == nil, err
+
+	updated, err := inventory.UpdateDevice(ctx, persisted)
+	if err == nil {
+		*current = cloneDevice(updated)
+		return true, nil
+	}
+	if !errors.Is(err, store.ErrConflict) {
+		return false, err
+	}
+
+	latest, err := inventory.GetDevice(ctx, original.ID)
+	if err != nil {
+		return false, err
+	}
+	if latest.IPAddress != original.IPAddress || latest.Hostname != original.Hostname {
+		*current = cloneDevice(latest)
+		return false, nil
+	}
+	merged := mergeObservedDevice(original, persisted, latest)
+	if devicesEqual(latest, merged) {
+		*current = cloneDevice(latest)
+		return false, nil
+	}
+	updated, err = inventory.UpdateDevice(ctx, merged)
+	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			latest, latestErr := inventory.GetDevice(ctx, original.ID)
+			if latestErr != nil {
+				return false, latestErr
+			}
+			*current = cloneDevice(latest)
+		}
+		return false, err
+	}
+	*current = cloneDevice(updated)
+	return true, nil
 }
 
-func persistNodeIfChanged(ctx context.Context, inventory *store.Store, original store.NetworkNode, current store.NetworkNode) (bool, error) {
-	persisted := cloneNetworkNode(current)
+func persistNodeIfChanged(ctx context.Context, inventory *store.Store, original store.NetworkNode, current *store.NetworkNode) (bool, error) {
+	persisted := cloneNetworkNode(*current)
 	if networkNodesEqual(original, persisted) {
+		latest, err := inventory.GetNetworkNode(ctx, original.ID)
+		if err != nil {
+			return false, err
+		}
+		*current = cloneNetworkNode(latest)
 		return false, nil
 	}
-	_, err := inventory.UpdateNetworkNode(ctx, persisted)
-	return err == nil, err
+
+	updated, err := inventory.UpdateNetworkNode(ctx, persisted)
+	if err == nil {
+		*current = cloneNetworkNode(updated)
+		return true, nil
+	}
+	if !errors.Is(err, store.ErrConflict) {
+		return false, err
+	}
+
+	latest, err := inventory.GetNetworkNode(ctx, original.ID)
+	if err != nil {
+		return false, err
+	}
+	if latest.ManagementIP != original.ManagementIP {
+		*current = cloneNetworkNode(latest)
+		return false, nil
+	}
+	merged := mergeObservedNetworkNode(original, persisted, latest)
+	if networkNodesEqual(latest, merged) {
+		*current = cloneNetworkNode(latest)
+		return false, nil
+	}
+	updated, err = inventory.UpdateNetworkNode(ctx, merged)
+	if err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			latest, latestErr := inventory.GetNetworkNode(ctx, original.ID)
+			if latestErr != nil {
+				return false, latestErr
+			}
+			*current = cloneNetworkNode(latest)
+		}
+		return false, err
+	}
+	*current = cloneNetworkNode(updated)
+	return true, nil
+}
+
+func mergeObservedDevice(original store.Device, observed store.Device, latest store.Device) store.Device {
+	merged := cloneDevice(latest)
+	merged.Status = observed.Status
+	if latest.IPAddress == original.IPAddress {
+		merged.IPAddress = observed.IPAddress
+	}
+	if latest.Hostname == original.Hostname {
+		merged.Hostname = observed.Hostname
+	}
+	if latest.MACAddress == original.MACAddress {
+		merged.MACAddress = observed.MACAddress
+	}
+	mergeObservedMetadata(original.Metadata, observed.Metadata, merged.Metadata)
+	return merged
+}
+
+func mergeObservedNetworkNode(original store.NetworkNode, observed store.NetworkNode, latest store.NetworkNode) store.NetworkNode {
+	merged := cloneNetworkNode(latest)
+	merged.Status = observed.Status
+	if latest.ManagementIP == original.ManagementIP {
+		merged.ManagementIP = observed.ManagementIP
+	}
+	if latest.MACAddress == original.MACAddress {
+		merged.MACAddress = observed.MACAddress
+	}
+	mergeObservedMetadata(original.Metadata, observed.Metadata, merged.Metadata)
+	return merged
+}
+
+func mergeObservedMetadata(original map[string]string, observed map[string]string, merged map[string]string) {
+	if metadataValueEqual(original, merged, "lastReachablePorts") {
+		applyObservedMetadataValue(observed, merged, "lastReachablePorts")
+	}
+	if metadataValueEqual(original, merged, "panelLink") && metadataValueEqual(original, merged, "panelLinkSource") {
+		applyObservedMetadataValue(observed, merged, "panelLink")
+		applyObservedMetadataValue(observed, merged, "panelLinkSource")
+	}
+}
+
+func metadataValueEqual(left map[string]string, right map[string]string, key string) bool {
+	leftValue, leftExists := left[key]
+	rightValue, rightExists := right[key]
+	return leftExists == rightExists && (!leftExists || leftValue == rightValue)
+}
+
+func applyObservedMetadataValue(observed map[string]string, merged map[string]string, key string) {
+	if value, exists := observed[key]; exists {
+		merged[key] = value
+	} else {
+		delete(merged, key)
+	}
 }
 
 func devicesEqual(left store.Device, right store.Device) bool {
@@ -871,12 +1093,18 @@ func cloneNetworkNodes(nodes []store.NetworkNode) []store.NetworkNode {
 }
 
 func mergeSummaries(left RefreshSummary, right RefreshSummary) RefreshSummary {
+	skipped := left.Skipped + right.Skipped
 	return RefreshSummary{
 		Checked: left.Checked + right.Checked, Updated: left.Updated + right.Updated,
+		Skipped: skipped, Partial: left.Partial || right.Partial || skipped > 0,
 		Online: left.Online + right.Online, Degraded: left.Degraded + right.Degraded,
 		Offline: left.Offline + right.Offline, Unknown: left.Unknown + right.Unknown,
 		MACResolved: left.MACResolved + right.MACResolved,
 	}
+}
+
+func isSkippableRefreshError(err error) bool {
+	return errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrConflict)
 }
 
 func accumulateStatus(summary *RefreshSummary, status string) {
@@ -1056,13 +1284,16 @@ func candidatePorts(device store.Device) []int {
 	ports := make([]int, 0)
 	add := func(values ...int) {
 		for _, value := range values {
-			if value > 0 && !seen[value] {
+			if value > 0 && value <= 65535 && !seen[value] {
 				seen[value] = true
 				ports = append(ports, value)
 			}
 		}
 	}
 	add(443, 80, 22, 445)
+	if sshPort, ok := configuredSSHPort(device); ok {
+		add(sshPort)
+	}
 	deviceType := strings.ToLower(device.DeviceType)
 	role := strings.ToLower(device.Role)
 	if strings.Contains(deviceType, "nas") || strings.Contains(role, "storage") {
@@ -1080,12 +1311,52 @@ func candidatePorts(device store.Device) []int {
 	return ports
 }
 
+func configuredSSHPort(device store.Device) (int, bool) {
+	port, err := strconv.Atoi(strings.TrimSpace(device.Metadata["sshPort"]))
+	return port, err == nil && port >= 1 && port <= 65535
+}
+
+func batchCandidatePorts(devices []store.Device, nodes []store.NetworkNode) []int {
+	ports := allCandidatePorts()
+	seen := make(map[int]struct{}, len(ports))
+	for _, port := range ports {
+		seen[port] = struct{}{}
+	}
+	extras := make(map[int]struct{})
+	collect := func(candidates []int) {
+		for _, port := range candidates {
+			if port < 1 || port > 65535 {
+				continue
+			}
+			if _, exists := seen[port]; !exists {
+				extras[port] = struct{}{}
+			}
+		}
+	}
+	for _, device := range devices {
+		collect(candidatePorts(device))
+	}
+	for _, node := range nodes {
+		collect(candidatePortsForNode(node))
+	}
+	sortedExtras := make([]int, 0, len(extras))
+	for port := range extras {
+		sortedExtras = append(sortedExtras, port)
+	}
+	slices.Sort(sortedExtras)
+	remaining := max(0, maxBatchScanPorts-len(ports))
+	if len(sortedExtras) > remaining {
+		sortedExtras = sortedExtras[:remaining]
+	}
+	return append(ports, sortedExtras...)
+}
+
 func candidatePortsForNode(node store.NetworkNode) []int {
 	seen := map[int]bool{}
 	ports := make([]int, 0)
 	add := func(values ...int) {
 		for _, value := range values {
-			if value > 0 && !seen[value] {
+			if value > 0 && value <= 65535 && !seen[value] {
 				seen[value] = true
 				ports = append(ports, value)
 			}

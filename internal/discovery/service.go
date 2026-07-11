@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os/exec"
 	"runtime"
 	"sort"
@@ -20,6 +21,7 @@ var (
 	ErrNmapUnavailable   = errors.New("nmap is not available")
 	ErrScanInProgress    = errors.New("discovery scan already in progress")
 	ErrNetworkNotAllowed = errors.New("discovery network is not private or link-local")
+	errNmapCompletion    = errors.New("nmap XML did not report successful completion")
 )
 
 type Options struct {
@@ -80,6 +82,15 @@ type nmapXMLHostnames struct {
 type nmapXMLHostname struct {
 	Name string `xml:"name,attr"`
 	Type string `xml:"type,attr"`
+}
+
+type nmapXMLRunStats struct {
+	Finished nmapXMLFinished `xml:"finished"`
+}
+
+type nmapXMLFinished struct {
+	Exit     string `xml:"exit,attr"`
+	ErrorMsg string `xml:"errormsg,attr"`
 }
 
 func NewService(nmapPath string) *Service {
@@ -278,6 +289,13 @@ func (s *Service) scanTargetCIDR(ctx context.Context, targetCIDR string, hostsBy
 	}
 
 	if err := scanNmapXMLStream(stdout, emit); err != nil {
+		if errors.Is(err, errNmapCompletion) {
+			<-stderrDone
+			if waitErr := cmd.Wait(); waitErr != nil {
+				return nmapProcessError(ctx, targetCIDR, waitErr, stderrBuffer.String())
+			}
+			return err
+		}
 		_ = cmd.Process.Kill()
 		<-stderrDone
 		_ = cmd.Wait()
@@ -285,45 +303,84 @@ func (s *Service) scanTargetCIDR(ctx context.Context, targetCIDR string, hostsBy
 	}
 	<-stderrDone
 	if err := cmd.Wait(); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return fmt.Errorf("nmap scan canceled for %s: %w", targetCIDR, ctxErr)
-		}
-		stderrText := strings.TrimSpace(stderrBuffer.String())
-		if stderrText != "" {
-			return fmt.Errorf("nmap scan failed for %s: %w: %s", targetCIDR, err, stderrText)
-		}
-		return fmt.Errorf("nmap scan failed for %s: %w", targetCIDR, err)
+		return nmapProcessError(ctx, targetCIDR, err, stderrBuffer.String())
 	}
 
 	return nil
 }
 
+func nmapProcessError(ctx context.Context, targetCIDR string, processErr error, stderr string) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("nmap scan canceled for %s: %w", targetCIDR, ctxErr)
+	}
+	if stderr = strings.TrimSpace(stderr); stderr != "" {
+		return fmt.Errorf("nmap scan failed for %s: %w: %s", targetCIDR, processErr, stderr)
+	}
+	return fmt.Errorf("nmap scan failed for %s: %w", targetCIDR, processErr)
+}
+
 func scanNmapXMLStream(reader io.Reader, emit func(HostMatch) error) error {
 	decoder := xml.NewDecoder(reader)
+	rootSeen := false
+	runStatsSeen := false
+	var finished nmapXMLFinished
 	for {
 		token, err := decoder.Token()
 		if errors.Is(err, io.EOF) {
-			return nil
+			switch {
+			case !rootSeen:
+				return fmt.Errorf("%w: missing nmaprun document", errNmapCompletion)
+			case !runStatsSeen || strings.TrimSpace(finished.Exit) == "":
+				return fmt.Errorf("%w: missing runstats finished exit=success", errNmapCompletion)
+			case strings.TrimSpace(finished.Exit) != "success":
+				message := strings.TrimSpace(finished.ErrorMsg)
+				if message == "" {
+					return fmt.Errorf("%w: nmap reported exit=%s", errNmapCompletion, strings.TrimSpace(finished.Exit))
+				}
+				return fmt.Errorf("%w: nmap reported exit=%s: %s", errNmapCompletion, strings.TrimSpace(finished.Exit), message)
+			default:
+				return nil
+			}
 		}
 		if err != nil {
 			return fmt.Errorf("parse nmap XML: %w", err)
 		}
 
 		start, ok := token.(xml.StartElement)
-		if !ok || start.Name.Local != "host" {
-			continue
-		}
-
-		var xmlHost nmapXMLHost
-		if err := decoder.DecodeElement(&xmlHost, &start); err != nil {
-			return fmt.Errorf("parse nmap XML host: %w", err)
-		}
-		host, ok := hostMatchFromXML(xmlHost)
 		if !ok {
 			continue
 		}
-		if err := emit(host); err != nil {
-			return err
+		if !rootSeen {
+			if start.Name.Local != "nmaprun" {
+				return fmt.Errorf("parse nmap XML: expected nmaprun root, got %s", start.Name.Local)
+			}
+			rootSeen = true
+			continue
+		}
+
+		switch start.Name.Local {
+		case "host":
+			var xmlHost nmapXMLHost
+			if err := decoder.DecodeElement(&xmlHost, &start); err != nil {
+				return fmt.Errorf("parse nmap XML host: %w", err)
+			}
+			host, ok := hostMatchFromXML(xmlHost)
+			if !ok {
+				continue
+			}
+			if err := emit(host); err != nil {
+				return err
+			}
+		case "runstats":
+			if runStatsSeen {
+				return fmt.Errorf("parse nmap XML: duplicate runstats")
+			}
+			var runStats nmapXMLRunStats
+			if err := decoder.DecodeElement(&runStats, &start); err != nil {
+				return fmt.Errorf("parse nmap XML runstats: %w", err)
+			}
+			runStatsSeen = true
+			finished = runStats.Finished
 		}
 	}
 }
@@ -354,20 +411,42 @@ func hostMatchFromXML(xmlHost nmapXMLHost) (HostMatch, bool) {
 	}
 
 	for _, hostname := range xmlHost.Hostnames.Names {
-		name := strings.TrimSuffix(strings.TrimSpace(hostname.Name), ".")
-		if name == "" {
+		name, ok := canonicalObservedHostname(hostname.Name)
+		if !ok {
 			continue
-		}
-		if host.Hostname == "" {
-			host.Hostname = name
 		}
 		if strings.EqualFold(strings.TrimSpace(hostname.Type), "PTR") {
 			host.Hostname = name
 			break
 		}
+		if host.Hostname == "" {
+			host.Hostname = name
+		}
 	}
 
 	return host, true
+}
+
+func canonicalObservedHostname(value string) (string, bool) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimSuffix(value, ".")
+	if value == "" || len(value) > 253 {
+		return "", false
+	}
+	if address, err := netip.ParseAddr(value); err == nil && address.IsValid() {
+		return "", false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+				return "", false
+			}
+		}
+	}
+	return value, true
 }
 
 func mergeHostMatch(existing HostMatch, current HostMatch) HostMatch {

@@ -67,7 +67,7 @@ func TestScanNmapXMLStreamEmitsCompletedHostsBeforeDocumentEnds(t *testing.T) {
 		t.Fatal("completed XML host was not emitted incrementally")
 	}
 
-	_, err = io.WriteString(writer, `<host><status state="down"/><address addr="192.168.1.20" addrtype="ipv4"/></host><host><status state="up"/><address addr="2001:db8::1" addrtype="ipv6"/></host><host><status state="up"/><address addr="192.168.1.30" addrtype="ipv4"/></host></nmaprun>`)
+	_, err = io.WriteString(writer, `<host><status state="down"/><address addr="192.168.1.20" addrtype="ipv4"/></host><host><status state="up"/><address addr="2001:db8::1" addrtype="ipv6"/></host><host><status state="up"/><address addr="192.168.1.30" addrtype="ipv4"/></host><runstats><finished exit="success"/></runstats></nmaprun>`)
 	if err != nil {
 		t.Fatalf("write remaining XML: %v", err)
 	}
@@ -90,6 +90,67 @@ func TestScanNmapXMLStreamEmitsCompletedHostsBeforeDocumentEnds(t *testing.T) {
 	case host := <-hosts:
 		t.Fatalf("unexpected extra streamed host: %+v", host)
 	default:
+	}
+}
+
+func TestScanNmapXMLStreamRequiresSuccessfulCompletionAfterStreamingHosts(t *testing.T) {
+	tests := []struct {
+		name        string
+		xml         string
+		wantEmitted int
+	}{
+		{name: "empty", xml: ""},
+		{name: "missing runstats", xml: `<nmaprun><host><status state="up"/><address addr="192.0.2.1" addrtype="ipv4"/></host></nmaprun>`, wantEmitted: 1},
+		{name: "failed run", xml: `<nmaprun><host><status state="up"/><address addr="192.0.2.1" addrtype="ipv4"/></host><runstats><finished exit="error" errormsg="scan failed"/></runstats></nmaprun>`, wantEmitted: 1},
+		{name: "truncated", xml: `<nmaprun><host><status state="up"/><address addr="192.0.2.1" addrtype="ipv4"/></host>`, wantEmitted: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			emitted := 0
+			err := scanNmapXMLStream(strings.NewReader(test.xml), func(HostMatch) error {
+				emitted++
+				return nil
+			})
+			if err == nil {
+				t.Fatal("scanNmapXMLStream returned nil error")
+			}
+			if emitted != test.wantEmitted {
+				t.Fatalf("emitted %d hosts, want %d", emitted, test.wantEmitted)
+			}
+		})
+	}
+}
+
+func TestHostMatchCanonicalizesAndDiscardsInvalidHostnames(t *testing.T) {
+	tests := []struct {
+		name      string
+		hostnames []nmapXMLHostname
+		want      string
+	}{
+		{
+			name: "canonical fallback survives invalid PTR",
+			hostnames: []nmapXMLHostname{
+				{Name: "Router.Home.ARPA.", Type: "user"},
+				{Name: "bad_name", Type: "PTR"},
+			},
+			want: "router.home.arpa",
+		},
+		{
+			name:      "IP literal is discarded",
+			hostnames: []nmapXMLHostname{{Name: "192.0.2.99", Type: "PTR"}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			host, ok := hostMatchFromXML(nmapXMLHost{
+				Status:    nmapXMLStatus{State: "up"},
+				Addresses: []nmapXMLAddress{{Address: "192.0.2.1", Type: "ipv4"}},
+				Hostnames: nmapXMLHostnames{Names: test.hostnames},
+			})
+			if !ok || host.Hostname != test.want {
+				t.Fatalf("host = %+v, ok=%t", host, ok)
+			}
+		})
 	}
 }
 
@@ -260,6 +321,14 @@ func TestScanCIDRReturnsEveryNmapExitError(t *testing.T) {
 	}
 }
 
+func TestScanCIDRRejectsSuccessfulProcessWithoutNmapCompletion(t *testing.T) {
+	service := newNmapHelperService(t, "incomplete", nil)
+	_, err := service.ScanCIDR(context.Background(), "192.0.2.0/24")
+	if !errors.Is(err, errNmapCompletion) {
+		t.Fatalf("ScanCIDR error = %v, want completion error", err)
+	}
+}
+
 func TestScanCIDRRejectsUnsupportedNetworksBeforeStartingNmap(t *testing.T) {
 	tests := []string{
 		"2001:db8::/64",
@@ -415,8 +484,11 @@ func TestNmapHelperProcess(t *testing.T) {
     <hostnames><hostname name="host-10.example" type="PTR"/></hostnames>
   </host>
   <host><status state="up"/><address addr="192.0.2.10" addrtype="ipv4"/></host>
+  <runstats><finished exit="success"/></runstats>
 </nmaprun>
 `)
+	case "incomplete":
+		fmt.Print(`<nmaprun><host><status state="up"/><address addr="192.0.2.10" addrtype="ipv4"/></host></nmaprun>`)
 	case "block":
 		time.Sleep(time.Minute)
 	case "exit-silent":

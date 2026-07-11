@@ -53,6 +53,58 @@ func TestParseNmapXMLRejectsFailedRun(t *testing.T) {
 	}
 }
 
+func TestParseNmapXMLRequiresCompleteSuccessfulRun(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		xml  string
+	}{
+		{name: "empty", xml: ""},
+		{name: "truncated", xml: `<nmaprun><host><status state="up"/></host>`},
+		{name: "missing runstats", xml: `<nmaprun><host><status state="up"/></host></nmaprun>`},
+		{name: "missing finished", xml: `<nmaprun><runstats/></nmaprun>`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parseNmapXML([]byte(test.xml)); err == nil {
+				t.Fatal("parseNmapXML returned nil error")
+			}
+		})
+	}
+}
+
+func TestParseNmapXMLCanonicalizesAndDiscardsInvalidHostnames(t *testing.T) {
+	t.Parallel()
+
+	results, err := parseNmapXML([]byte(`
+<nmaprun>
+  <host>
+    <status state="up" />
+    <address addr="192.0.2.10" addrtype="ipv4" />
+    <hostnames>
+      <hostname name="Fallback.EXAMPLE." type="user" />
+      <hostname name="bad_name" type="PTR" />
+    </hostnames>
+  </host>
+  <host>
+    <status state="up" />
+    <address addr="192.0.2.11" addrtype="ipv4" />
+    <hostnames><hostname name="192.0.2.99" type="PTR" /></hostnames>
+  </host>
+  <runstats><finished exit="success" /></runstats>
+</nmaprun>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := results["192.0.2.10"].Hostname; got != "fallback.example" {
+		t.Fatalf("canonical hostname = %q", got)
+	}
+	if got := results["192.0.2.11"].Hostname; got != "" {
+		t.Fatalf("invalid PTR hostname = %q", got)
+	}
+}
+
 func TestCanonicalIPv4RejectsCommandOptionsAndNormalizesMappedAddress(t *testing.T) {
 	t.Parallel()
 
