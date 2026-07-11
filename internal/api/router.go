@@ -91,13 +91,18 @@ var errSSETransport = errors.New("sse transport failure")
 
 const maxJSONBodyBytes int64 = 1 << 20
 
+const (
+	synchronousOperationTimeout = 2*time.Minute + 15*time.Second
+	synchronousWriteTimeout     = synchronousOperationTimeout + 15*time.Second
+)
+
 var errJSONBodyTooLarge = errors.New("request body exceeds maximum size")
 
-func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
+func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (*Router, error) {
 	return newRouter(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback, newSSHConcurrencyLimits(maxConcurrentSSHCommands, maxConcurrentSSHTerminals))
 }
 
-func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback, sshLimits *sshConcurrencyLimits) (http.Handler, error) {
+func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback, sshLimits *sshConcurrencyLimits) (*Router, error) {
 	requests, err := newRequestMetadata(cfg.TrustedProxyCIDRs, cfg.AllowedHosts)
 	if err != nil {
 		return nil, err
@@ -111,6 +116,7 @@ func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 	if err != nil {
 		return nil, err
 	}
+	terminalConnections := newTerminalConnectionTracker()
 
 	mux.HandleFunc("/api/auth/session", auth.handleSession)
 	mux.HandleFunc("/api/auth/login", auth.handleLogin)
@@ -614,6 +620,13 @@ func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			return
 		}
 
+		releaseConnection, ok := terminalConnections.acquire()
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "server is shutting down"})
+			return
+		}
+		defer releaseConnection()
+
 		socket, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -917,7 +930,10 @@ func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		})
 	})
 
-	return withOriginPolicy(requests, auth.middleware(mux)), nil
+	return &Router{
+		handler:             withOriginPolicy(requests, auth.middleware(mux)),
+		terminalConnections: terminalConnections,
+	}, nil
 }
 
 func handleInventoryRefresh(inventory *store.Store, refresher inventoryRefresher) http.HandlerFunc {
@@ -926,14 +942,30 @@ func handleInventoryRefresh(inventory *store.Store, refresher inventoryRefresher
 			methodNotAllowed(w, http.MethodPost)
 			return
 		}
+		r, finish := withSynchronousOperationDeadline(w, r)
+		defer finish()
 
 		result, err := refresher.RefreshAll(r.Context())
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "inventory refresh timed out"})
+				return
+			}
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to refresh devices"})
 			return
 		}
 		snapshot, err := inventory.Snapshot(r.Context())
 		if err != nil {
+			if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+				writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "inventory refresh timed out"})
+				return
+			}
+			if errors.Is(r.Context().Err(), context.Canceled) {
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load refreshed inventory"})
 			return
 		}
@@ -1015,6 +1047,8 @@ func handleDiscoveryScan(inventory *store.Store, discoveryService discoveryScann
 			methodNotAllowed(w, http.MethodPost)
 			return
 		}
+		r, finish := withSynchronousOperationDeadline(w, r)
+		defer finish()
 
 		var payload discoveryScanPayload
 		if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid discovery payload") {
@@ -1035,6 +1069,13 @@ func handleDiscoveryScan(inventory *store.Store, discoveryService discoveryScann
 
 		filteredHosts, segmentCandidates, err := filterDiscoveryResults(r.Context(), inventory, result)
 		if err != nil {
+			if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+				writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "discovery scan timed out"})
+				return
+			}
+			if errors.Is(r.Context().Err(), context.Canceled) {
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to compare discovery results with inventory"})
 			return
 		}
@@ -1047,6 +1088,15 @@ func handleDiscoveryScan(inventory *store.Store, discoveryService discoveryScann
 			SegmentCandidates: segmentCandidates,
 		})
 	}
+}
+
+func withSynchronousOperationDeadline(w http.ResponseWriter, r *http.Request) (*http.Request, func()) {
+	controller := http.NewResponseController(w)
+	if err := controller.SetWriteDeadline(time.Now().Add(synchronousWriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		log.Printf("extend synchronous response write deadline: %v", err)
+	}
+	operationContext, cancel := context.WithTimeout(r.Context(), synchronousOperationTimeout)
+	return r.WithContext(operationContext), cancel
 }
 
 func writeAndFlushSSEJSON(w http.ResponseWriter, eventName string, payload any) error {

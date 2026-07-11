@@ -15,17 +15,18 @@ import (
 )
 
 const (
-	terminalReadLimit         = 32 << 10
-	terminalMaxInputBytes     = 16 << 10
-	terminalMaxCols           = 500
-	terminalMaxRows           = 200
-	terminalOutputChunkBytes  = 4 << 10
-	terminalOutboundCapacity  = 64
-	terminalCommandCapacity   = 16
-	terminalClientCapacity    = 16
-	terminalReadTimeout       = 40 * time.Second
-	terminalWriteTimeout      = 10 * time.Second
-	terminalFinalFlushTimeout = 500 * time.Millisecond
+	terminalReadLimit          = 32 << 10
+	terminalMaxInputBytes      = 16 << 10
+	terminalMaxCols            = 500
+	terminalMaxRows            = 200
+	terminalOutputChunkBytes   = 4 << 10
+	terminalOutboundCapacity   = 64
+	terminalCommandCapacity    = 16
+	terminalClientCapacity     = 16
+	terminalReadTimeout        = 40 * time.Second
+	terminalWriteTimeout       = 10 * time.Second
+	terminalOutputDrainTimeout = 250 * time.Millisecond
+	terminalFinalFlushTimeout  = 500 * time.Millisecond
 )
 
 var (
@@ -67,6 +68,7 @@ type terminalBridgeResult struct {
 	Err               error
 	TerminationReason string
 	notifyClient      bool
+	drainOutput       bool
 }
 
 type terminalWriteRequest struct {
@@ -100,25 +102,30 @@ type terminalBridge struct {
 	waitDone       chan error
 	writerDone     chan error
 
-	workers         sync.WaitGroup
-	stopSessionOnce sync.Once
-	closeSocketOnce sync.Once
-	shutdownOnce    sync.Once
+	workers           sync.WaitGroup
+	outputMu          sync.Mutex
+	outputReaders     int
+	outputReadersDone chan struct{}
+	outputSealed      bool
+	stopSessionOnce   sync.Once
+	closeSocketOnce   sync.Once
+	shutdownOnce      sync.Once
 }
 
 func runTerminalBridge(ctx context.Context, socket terminalSocket, session terminalSession) terminalBridgeResult {
 	bridgeContext, cancel := context.WithCancel(ctx)
 	bridge := &terminalBridge{
-		ctx:            bridgeContext,
-		cancel:         cancel,
-		socket:         socket,
-		session:        session,
-		outbound:       make(chan terminalWriteRequest, terminalOutboundCapacity),
-		clientEvents:   make(chan terminalClientEvent, terminalClientCapacity),
-		sessionCommand: make(chan terminalSessionCommand, terminalCommandCapacity),
-		workerErrors:   make(chan error, 1),
-		waitDone:       make(chan error, 1),
-		writerDone:     make(chan error, 1),
+		ctx:               bridgeContext,
+		cancel:            cancel,
+		socket:            socket,
+		session:           session,
+		outbound:          make(chan terminalWriteRequest, terminalOutboundCapacity),
+		clientEvents:      make(chan terminalClientEvent, terminalClientCapacity),
+		sessionCommand:    make(chan terminalSessionCommand, terminalCommandCapacity),
+		workerErrors:      make(chan error, 1),
+		waitDone:          make(chan error, 1),
+		writerDone:        make(chan error, 1),
+		outputReadersDone: make(chan struct{}),
 	}
 	defer func() {
 		bridge.shutdown()
@@ -136,6 +143,9 @@ func runTerminalBridge(ctx context.Context, socket terminalSocket, session termi
 	}
 
 	result := bridge.coordinate()
+	if result.drainOutput {
+		bridge.drainSessionOutput()
+	}
 	bridge.stopSession()
 	if result.notifyClient {
 		messages := make([]terminalServerMessage, 0, 2)
@@ -149,6 +159,14 @@ func runTerminalBridge(ctx context.Context, socket terminalSocket, session termi
 }
 
 func (b *terminalBridge) startWorkers() {
+	readers := []io.Reader{b.session.Stdout(), b.session.Stderr()}
+	b.outputMu.Lock()
+	b.outputReaders = len(readers)
+	if b.outputReaders == 0 {
+		close(b.outputReadersDone)
+	}
+	b.outputMu.Unlock()
+
 	b.workers.Add(1)
 	go b.writeSocket()
 	b.workers.Add(1)
@@ -157,7 +175,7 @@ func (b *terminalBridge) startWorkers() {
 	go b.writeSession()
 	b.workers.Add(1)
 	go b.waitSession()
-	for _, reader := range []io.Reader{b.session.Stdout(), b.session.Stderr()} {
+	for _, reader := range readers {
 		b.workers.Add(1)
 		go b.readSessionOutput(reader)
 	}
@@ -178,9 +196,9 @@ func (b *terminalBridge) coordinate() terminalBridgeResult {
 				return terminalBridgeResult{Err: ctxErr, TerminationReason: "context_cancelled"}
 			}
 			if isNormalTerminalWait(err) {
-				return terminalBridgeResult{TerminationReason: "remote_exit", notifyClient: true}
+				return terminalBridgeResult{TerminationReason: "remote_exit", notifyClient: true, drainOutput: true}
 			}
-			return terminalBridgeResult{Err: fmt.Errorf("remote SSH session failed: %w", err), TerminationReason: "remote_error", notifyClient: true}
+			return terminalBridgeResult{Err: fmt.Errorf("remote SSH session failed: %w", err), TerminationReason: "remote_error", notifyClient: true, drainOutput: true}
 		case event := <-b.clientEvents:
 			if ctxErr := b.ctx.Err(); ctxErr != nil {
 				return terminalBridgeResult{Err: ctxErr, TerminationReason: "context_cancelled"}
@@ -313,24 +331,19 @@ func completeTerminalWrite(request terminalWriteRequest, err error) {
 
 func (b *terminalBridge) readSessionOutput(reader io.Reader) {
 	defer b.workers.Done()
+	defer b.finishOutputReader()
 	buffer := make([]byte, terminalOutputChunkBytes)
 	decoder := terminalUTF8Decoder{}
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
 			output := decoder.Decode(buffer[:n], false)
-			if output != "" && !b.tryEnqueue(terminalServerMessage{Type: "output", Data: output}) {
-				if b.ctx.Err() == nil {
-					b.reportWorkerError(errTerminalOutputBackpressure)
-				}
+			if output != "" && !b.tryEnqueueOutput(output) {
 				return
 			}
 		}
 		if err != nil {
-			if output := decoder.Decode(nil, true); output != "" && !b.tryEnqueue(terminalServerMessage{Type: "output", Data: output}) {
-				if b.ctx.Err() == nil {
-					b.reportWorkerError(errTerminalOutputBackpressure)
-				}
+			if output := decoder.Decode(nil, true); output != "" && !b.tryEnqueueOutput(output) {
 				return
 			}
 			if !errors.Is(err, io.EOF) && b.ctx.Err() == nil {
@@ -339,6 +352,44 @@ func (b *terminalBridge) readSessionOutput(reader io.Reader) {
 			return
 		}
 	}
+}
+
+func (b *terminalBridge) tryEnqueueOutput(output string) bool {
+	b.outputMu.Lock()
+	defer b.outputMu.Unlock()
+	if b.outputSealed {
+		return false
+	}
+	if b.tryEnqueue(terminalServerMessage{Type: "output", Data: output}) {
+		return true
+	}
+	if b.ctx.Err() == nil {
+		b.reportWorkerError(errTerminalOutputBackpressure)
+	}
+	return false
+}
+
+func (b *terminalBridge) finishOutputReader() {
+	b.outputMu.Lock()
+	defer b.outputMu.Unlock()
+	b.outputReaders--
+	if b.outputReaders == 0 {
+		close(b.outputReadersDone)
+	}
+}
+
+func (b *terminalBridge) drainSessionOutput() {
+	timer := time.NewTimer(terminalOutputDrainTimeout)
+	defer timer.Stop()
+	select {
+	case <-b.outputReadersDone:
+	case <-timer.C:
+	}
+
+	// Enqueue and seal share this mutex so late readers cannot write behind the final status.
+	b.outputMu.Lock()
+	b.outputSealed = true
+	b.outputMu.Unlock()
 }
 
 func (d *terminalUTF8Decoder) Decode(chunk []byte, final bool) string {

@@ -24,19 +24,26 @@ func StartPasswordTerminal(address string, username string, password string, col
 }
 
 func StartPasswordTerminalContext(ctx context.Context, address string, username string, password string, cols int, rows int, connectTimeout time.Duration, hostKeyCallback ssh.HostKeyCallback) (*TerminalSession, error) {
-	client, err := dialPassword(ctx, address, username, password, connectTimeout, hostKeyCallback)
+	setupCtx, cancelSetup := sshSetupContext(ctx, connectTimeout)
+	defer cancelSetup()
+
+	client, err := dialPassword(setupCtx, address, username, password, connectTimeout, hostKeyCallback)
 	if err != nil {
 		return nil, err
 	}
+	setupCancellation := closeClientOnCancellation(setupCtx, client)
+	defer setupCancellation.Stop()
 
 	session, err := client.NewSession()
 	if err != nil {
+		setupCancellation.Stop()
 		_ = client.Close()
-		return nil, fmt.Errorf("create ssh session: %w", err)
+		return nil, fmt.Errorf("create ssh session: %w", preferContextError(setupCtx, err))
 	}
 
 	stdin, err := session.StdinPipe()
 	if err != nil {
+		setupCancellation.Stop()
 		_ = session.Close()
 		_ = client.Close()
 		return nil, fmt.Errorf("open ssh stdin: %w", err)
@@ -44,6 +51,7 @@ func StartPasswordTerminalContext(ctx context.Context, address string, username 
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
+		setupCancellation.Stop()
 		_ = session.Close()
 		_ = client.Close()
 		return nil, fmt.Errorf("open ssh stdout: %w", err)
@@ -51,6 +59,7 @@ func StartPasswordTerminalContext(ctx context.Context, address string, username 
 
 	stderr, err := session.StderrPipe()
 	if err != nil {
+		setupCancellation.Stop()
 		_ = session.Close()
 		_ = client.Close()
 		return nil, fmt.Errorf("open ssh stderr: %w", err)
@@ -70,12 +79,19 @@ func StartPasswordTerminalContext(ctx context.Context, address string, username 
 	}
 
 	if err := session.RequestPty("xterm-256color", rows, cols, modes); err != nil {
+		setupCancellation.Stop()
 		_ = session.Close()
 		_ = client.Close()
-		return nil, fmt.Errorf("request pty: %w", err)
+		return nil, fmt.Errorf("request pty: %w", preferContextError(setupCtx, err))
 	}
 
 	if err := session.Shell(); err != nil {
+		setupCancellation.Stop()
+		_ = session.Close()
+		_ = client.Close()
+		return nil, fmt.Errorf("start shell: %w", preferContextError(setupCtx, err))
+	}
+	if err := finishSSHSetup(setupCtx, setupCancellation); err != nil {
 		_ = session.Close()
 		_ = client.Close()
 		return nil, fmt.Errorf("start shell: %w", err)

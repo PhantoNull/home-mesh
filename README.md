@@ -357,8 +357,14 @@ or segment memberships instead of silently accepting them.
   state.
 - `PUT /api/inventory/order` applies a complete, versioned ordering atomically.
 - JSON request bodies are limited to 1 MiB.
+- Synchronous full refresh and discovery requests have a 2 minute 15 second
+  operation budget and return `504` on timeout; their response write deadline is
+  extended separately so valid long scans can still deliver JSON.
 - SSH command and terminal workloads have independent global concurrency limits;
   saturation returns `429` with `Retry-After`.
+- Shutdown rejects new SSH terminal upgrades, gives active streams an initial
+  8-second drain window, then cancels and waits for terminal audit completion
+  before closing SQLite.
 
 ### Discovery And Background Scanning
 

@@ -36,6 +36,111 @@ func TestTerminalBridgeRemoteExitDoesNotWaitForBrowser(t *testing.T) {
 	}
 }
 
+func TestTerminalBridgeDrainsRemoteOutputBeforeClosed(t *testing.T) {
+	releaseStdout := make(chan struct{})
+	releaseStderr := make(chan struct{})
+	stdout := newDelayedTerminalReader("final stdout", releaseStdout)
+	stderr := newDelayedTerminalReader("final stderr", releaseStderr)
+	session := newFakeTerminalSession(stdout, stderr)
+	socket := newFakeTerminalSocket()
+	resultDone := runTerminalBridgeAsync(context.Background(), socket, session)
+
+	for name, started := range map[string]<-chan struct{}{
+		"stdout": stdout.started,
+		"stderr": stderr.started,
+	} {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("terminal %s reader did not start", name)
+		}
+	}
+	go func() {
+		<-session.waitReturned
+		time.Sleep(50 * time.Millisecond)
+		close(releaseStdout)
+		time.Sleep(50 * time.Millisecond)
+		close(releaseStderr)
+	}()
+	session.waitResult <- nil
+
+	result := awaitTerminalResult(t, resultDone)
+	if result.Err != nil || result.TerminationReason != "remote_exit" {
+		t.Fatalf("result = %+v, want clean remote exit", result)
+	}
+	messages := socket.messages()
+	closed := terminalServerMessage{Type: "status", Data: "closed"}
+	assertTerminalMessageBefore(t, messages, terminalServerMessage{Type: "status", Data: "connected"}, closed)
+	assertTerminalMessageBefore(t, messages, terminalServerMessage{Type: "output", Data: "final stdout"}, closed)
+	assertTerminalMessageBefore(t, messages, terminalServerMessage{Type: "output", Data: "final stderr"}, closed)
+}
+
+func TestTerminalBridgeBoundsOutputDrainWhenReaderWaitsForClose(t *testing.T) {
+	session := newFakeTerminalSession(bytes.NewReader(nil), bytes.NewReader(nil))
+	stdout := newCloseAwareTerminalReader(session.closed)
+	session.stdout = stdout
+	socket := newFakeTerminalSocket()
+	resultDone := runTerminalBridgeAsync(context.Background(), socket, session)
+
+	select {
+	case <-stdout.started:
+	case <-time.After(time.Second):
+		t.Fatal("terminal stdout reader did not start")
+	}
+	startedAt := time.Now()
+	session.waitResult <- nil
+
+	result := awaitTerminalResult(t, resultDone)
+	if result.Err != nil || result.TerminationReason != "remote_exit" {
+		t.Fatalf("result = %+v, want clean remote exit", result)
+	}
+	elapsed := time.Since(startedAt)
+	if elapsed < terminalOutputDrainTimeout/2 {
+		t.Fatalf("terminal bridge skipped bounded output drain: stopped after %s", elapsed)
+	}
+	if elapsed > terminalOutputDrainTimeout+time.Second {
+		t.Fatalf("terminal bridge exceeded bounded output drain: stopped after %s", elapsed)
+	}
+	select {
+	case <-stdout.returned:
+	default:
+		t.Fatal("terminal stdout reader remained blocked after bridge shutdown")
+	}
+	assertTerminalMessage(t, socket.messages(), terminalServerMessage{Type: "status", Data: "closed"})
+}
+
+func TestTerminalBridgeDrainsOutputBeforeRemoteErrorAndClosed(t *testing.T) {
+	releaseStderr := make(chan struct{})
+	stderr := newDelayedTerminalReader("remote failure detail", releaseStderr)
+	session := newFakeTerminalSession(bytes.NewReader(nil), stderr)
+	socket := newFakeTerminalSocket()
+	resultDone := runTerminalBridgeAsync(context.Background(), socket, session)
+
+	select {
+	case <-stderr.started:
+	case <-time.After(time.Second):
+		t.Fatal("terminal stderr reader did not start")
+	}
+	go func() {
+		<-session.waitReturned
+		time.Sleep(50 * time.Millisecond)
+		close(releaseStderr)
+	}()
+	waitErr := errors.New("exit status 1")
+	session.waitResult <- waitErr
+
+	result := awaitTerminalResult(t, resultDone)
+	if !errors.Is(result.Err, waitErr) || result.TerminationReason != "remote_error" {
+		t.Fatalf("result = %+v, want remote error", result)
+	}
+	messages := socket.messages()
+	output := terminalServerMessage{Type: "output", Data: "remote failure detail"}
+	errorMessage := terminalServerMessage{Type: "error", Data: "remote SSH session failed: exit status 1"}
+	closed := terminalServerMessage{Type: "status", Data: "closed"}
+	assertTerminalMessageBefore(t, messages, output, errorMessage)
+	assertTerminalMessageBefore(t, messages, errorMessage, closed)
+}
+
 func TestTerminalBridgeBrowserExitClosesAndReapsSSH(t *testing.T) {
 	session := newFakeTerminalSession(bytes.NewReader(nil), bytes.NewReader(nil))
 	socket := newFakeTerminalSocket()
@@ -191,13 +296,81 @@ func assertTerminalMessage(t *testing.T, messages []terminalServerMessage, want 
 	t.Fatalf("messages = %+v, missing %+v", messages, want)
 }
 
+func assertTerminalMessageBefore(t *testing.T, messages []terminalServerMessage, before terminalServerMessage, after terminalServerMessage) {
+	t.Helper()
+	beforeIndex := -1
+	afterIndex := -1
+	for index, message := range messages {
+		if beforeIndex == -1 && message == before {
+			beforeIndex = index
+		}
+		if afterIndex == -1 && message == after {
+			afterIndex = index
+		}
+	}
+	if beforeIndex == -1 || afterIndex == -1 || beforeIndex >= afterIndex {
+		t.Fatalf("messages = %+v, want %+v before %+v", messages, before, after)
+	}
+}
+
+type closeAwareTerminalReader struct {
+	closed       <-chan struct{}
+	started      chan struct{}
+	returned     chan struct{}
+	startedOnce  sync.Once
+	returnedOnce sync.Once
+}
+
+func newCloseAwareTerminalReader(closed <-chan struct{}) *closeAwareTerminalReader {
+	return &closeAwareTerminalReader{
+		closed:   closed,
+		started:  make(chan struct{}),
+		returned: make(chan struct{}),
+	}
+}
+
+func (r *closeAwareTerminalReader) Read([]byte) (int, error) {
+	r.startedOnce.Do(func() { close(r.started) })
+	<-r.closed
+	r.returnedOnce.Do(func() { close(r.returned) })
+	return 0, io.EOF
+}
+
+type delayedTerminalReader struct {
+	data        []byte
+	release     <-chan struct{}
+	started     chan struct{}
+	startedOnce sync.Once
+	sent        bool
+}
+
+func newDelayedTerminalReader(data string, release <-chan struct{}) *delayedTerminalReader {
+	return &delayedTerminalReader{
+		data:    []byte(data),
+		release: release,
+		started: make(chan struct{}),
+	}
+}
+
+func (r *delayedTerminalReader) Read(buffer []byte) (int, error) {
+	r.startedOnce.Do(func() { close(r.started) })
+	<-r.release
+	if r.sent {
+		return 0, io.EOF
+	}
+	r.sent = true
+	return copy(buffer, r.data), nil
+}
+
 type fakeTerminalSession struct {
 	stdout io.Reader
 	stderr io.Reader
 
-	waitResult chan error
-	closed     chan struct{}
-	closeOnce  sync.Once
+	waitResult     chan error
+	waitReturned   chan struct{}
+	closed         chan struct{}
+	closeOnce      sync.Once
+	waitReturnOnce sync.Once
 
 	waitCalls   atomic.Int32
 	closeCalls  atomic.Int32
@@ -207,10 +380,11 @@ type fakeTerminalSession struct {
 
 func newFakeTerminalSession(stdout io.Reader, stderr io.Reader) *fakeTerminalSession {
 	return &fakeTerminalSession{
-		stdout:     stdout,
-		stderr:     stderr,
-		waitResult: make(chan error, 1),
-		closed:     make(chan struct{}),
+		stdout:       stdout,
+		stderr:       stderr,
+		waitResult:   make(chan error, 1),
+		waitReturned: make(chan struct{}),
+		closed:       make(chan struct{}),
 	}
 }
 
@@ -241,6 +415,7 @@ func (s *fakeTerminalSession) Wait() error {
 	s.waitCalls.Add(1)
 	select {
 	case err := <-s.waitResult:
+		s.waitReturnOnce.Do(func() { close(s.waitReturned) })
 		return err
 	case <-s.closed:
 		return net.ErrClosed

@@ -22,6 +22,11 @@ import (
 	"github.com/PhantoNull/home-mesh/internal/store"
 )
 
+const (
+	gracefulStreamDrainDelay = 8 * time.Second
+	gracefulShutdownTimeout  = 15 * time.Second
+)
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -107,9 +112,13 @@ func run() error {
 
 	select {
 	case err := <-serverErrors:
+		router.BeginDrain()
 		cancelBackground()
 		cancelService()
 		background.Wait()
+		if drainErr := router.WaitForDrain(context.Background()); drainErr != nil {
+			return fmt.Errorf("drain SSH terminals after server failure: %w", drainErr)
+		}
 		if err != nil {
 			return fmt.Errorf("serve HTTP: %w", err)
 		}
@@ -117,32 +126,49 @@ func run() error {
 	case <-signalCtx.Done():
 		log.Println("shutting down server...")
 	}
+	router.BeginDrain()
 	cancelBackground()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
 	defer cancel()
 
 	shutdownDone := make(chan error, 1)
 	go func() { shutdownDone <- server.Shutdown(shutdownCtx) }()
-	drainTimer := time.NewTimer(8 * time.Second)
-	var shutdownErr error
-	select {
-	case shutdownErr = <-shutdownDone:
-		if !drainTimer.Stop() {
-			<-drainTimer.C
+	terminalDrainDone := make(chan error, 1)
+	go func() { terminalDrainDone <- router.WaitForDrain(context.Background()) }()
+
+	drainTimer := time.NewTimer(gracefulStreamDrainDelay)
+	shutdownChannel := (<-chan error)(shutdownDone)
+	terminalDrainChannel := (<-chan error)(terminalDrainDone)
+	drainTimerChannel := (<-chan time.Time)(drainTimer.C)
+	shutdownDeadline := shutdownCtx.Done()
+	var shutdownErr, terminalDrainErr error
+	for shutdownChannel != nil || terminalDrainChannel != nil {
+		select {
+		case shutdownErr = <-shutdownChannel:
+			shutdownChannel = nil
+		case terminalDrainErr = <-terminalDrainChannel:
+			terminalDrainChannel = nil
+		case <-drainTimerChannel:
+			// Long-lived streams and hijacked terminals observe base-context
+			// cancellation after ordinary requests get an initial drain window.
+			cancelService()
+			drainTimerChannel = nil
+		case <-shutdownDeadline:
+			cancelService()
+			_ = server.Close()
+			shutdownDeadline = nil
 		}
-	case <-drainTimer.C:
-		// Long-lived streams observe the base-context cancellation after ordinary
-		// requests have had most of the shutdown window to complete.
-		cancelService()
-		shutdownErr = <-shutdownDone
+	}
+	if drainTimerChannel != nil && !drainTimer.Stop() {
+		<-drainTimer.C
 	}
 	cancelService()
-	if shutdownErr != nil {
-		_ = server.Close()
-	}
 	background.Wait()
 	serveErr := <-serverErrors
+	if terminalDrainErr != nil {
+		return fmt.Errorf("drain SSH terminals: %w", terminalDrainErr)
+	}
 	if shutdownErr != nil {
 		return fmt.Errorf("server shutdown: %w", shutdownErr)
 	}
