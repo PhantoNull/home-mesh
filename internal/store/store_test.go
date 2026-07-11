@@ -302,8 +302,8 @@ func TestRelationEndpointsAreValidatedAndDeletedWithEntity(t *testing.T) {
 	}
 
 	invalid := []Relation{
-		{ID: "bad-kind", SourceKind: "device", SourceID: device.ID, TargetKind: "unknown", TargetID: node.ID},
-		{ID: "bad-id", SourceKind: "device", SourceID: "missing", TargetKind: "networkNode", TargetID: node.ID},
+		{ID: "bad-kind", SourceKind: "device", SourceID: device.ID, TargetKind: "unknown", TargetID: node.ID, RelationType: "connected_to"},
+		{ID: "bad-id", SourceKind: "device", SourceID: "missing", TargetKind: "networkNode", TargetID: node.ID, RelationType: "connected_to"},
 	}
 	for _, relation := range invalid {
 		if _, err := store.AddRelation(ctx, relation); !errors.Is(err, ErrInvalidRelationEndpoint) {
@@ -312,9 +312,9 @@ func TestRelationEndpointsAreValidatedAndDeletedWithEntity(t *testing.T) {
 	}
 
 	valid := []Relation{
-		{ID: "device-node", SourceKind: "device", SourceID: device.ID, TargetKind: "networkNode", TargetID: node.ID},
-		{ID: "segment-device", SourceKind: "networkSegment", SourceID: segment.ID, TargetKind: "device", TargetID: device.ID},
-		{ID: "unrelated", SourceKind: "networkNode", SourceID: node.ID, TargetKind: "networkSegment", TargetID: segment.ID},
+		{ID: "device-node", SourceKind: "device", SourceID: device.ID, TargetKind: "networkNode", TargetID: node.ID, RelationType: "connected_to"},
+		{ID: "segment-device", SourceKind: "networkSegment", SourceID: segment.ID, TargetKind: "device", TargetID: device.ID, RelationType: "member_of_segment"},
+		{ID: "unrelated", SourceKind: "networkNode", SourceID: node.ID, TargetKind: "networkSegment", TargetID: segment.ID, RelationType: "connected_to"},
 	}
 	for _, relation := range valid {
 		if _, err := store.AddRelation(ctx, relation); err != nil {

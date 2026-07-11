@@ -19,7 +19,9 @@ import (
 
 var (
 	ErrNotFound                = errors.New("not found")
-	ErrInvalidRelationEndpoint = errors.New("invalid relation endpoint")
+	ErrValidation              = errors.New("validation failed")
+	ErrConflict                = errors.New("version conflict")
+	ErrInvalidRelationEndpoint = fmt.Errorf("%w: invalid relation endpoint", ErrValidation)
 )
 
 const (
@@ -193,7 +195,7 @@ func (s *Store) Snapshot(ctx context.Context) (InventorySnapshot, error) {
 
 func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, hostname, role, device_type, ip_address, mac_address, network_segment, status, tags_json, metadata_json, created_at, updated_at
+		SELECT id, version, name, hostname, role, device_type, ip_address, mac_address, network_segment, status, tags_json, metadata_json, created_at, updated_at
 		FROM devices
 		ORDER BY name
 	`)
@@ -223,9 +225,12 @@ func (s *Store) AddDevice(ctx context.Context, device Device) (Device, error) {
 	if strings.TrimSpace(device.ID) == "" {
 		device.ID = "dev-" + uuid.NewString()
 	}
-	if strings.TrimSpace(device.Status) == "" {
-		device.Status = "unknown"
+	var err error
+	device, err = canonicalizeDevice(device)
+	if err != nil {
+		return Device{}, err
 	}
+	device.Version = 1
 	device.CreatedAt = now
 	device.UpdatedAt = now
 
@@ -234,14 +239,25 @@ func (s *Store) AddDevice(ctx context.Context, device Device) (Device, error) {
 		return Device{}, err
 	}
 
-	_, err = s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Device{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := validateDeviceNetworkSegment(ctx, tx, device.NetworkSegment); err != nil {
+		return Device{}, err
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO devices (
-			id, name, hostname, role, device_type, ip_address, mac_address, network_segment, status, tags_json, metadata_json, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			id, version, name, hostname, role, device_type, ip_address, mac_address, network_segment, status, tags_json, metadata_json, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		device.ID, device.Name, device.Hostname, device.Role, device.DeviceType, device.IPAddress, device.MACAddress, device.NetworkSegment, device.Status, tagsJSON, metadataJSON, device.CreatedAt, device.UpdatedAt,
+		device.ID, device.Version, device.Name, device.Hostname, device.Role, device.DeviceType, device.IPAddress, device.MACAddress, device.NetworkSegment, device.Status, tagsJSON, metadataJSON, device.CreatedAt, device.UpdatedAt,
 	)
 	if err != nil {
+		return Device{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return Device{}, err
 	}
 
@@ -250,7 +266,7 @@ func (s *Store) AddDevice(ctx context.Context, device Device) (Device, error) {
 
 func (s *Store) GetDevice(ctx context.Context, id string) (Device, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, hostname, role, device_type, ip_address, mac_address, network_segment, status, tags_json, metadata_json, created_at, updated_at
+		SELECT id, version, name, hostname, role, device_type, ip_address, mac_address, network_segment, status, tags_json, metadata_json, created_at, updated_at
 		FROM devices
 		WHERE id = ?
 	`, id)
@@ -264,42 +280,69 @@ func (s *Store) GetDevice(ctx context.Context, id string) (Device, error) {
 }
 
 func (s *Store) UpdateDevice(ctx context.Context, device Device) (Device, error) {
+	var err error
+	device, err = canonicalizeExistingDevice(device)
+	if err != nil {
+		return Device{}, err
+	}
 	current, err := s.GetDevice(ctx, device.ID)
 	if err != nil {
 		return Device{}, err
 	}
+	if device.Version != current.Version {
+		return Device{}, ErrConflict
+	}
 
 	device.CreatedAt = current.CreatedAt
 	device.UpdatedAt = time.Now().UTC()
+	device.Version = current.Version + 1
 
 	tagsJSON, metadataJSON, err := marshalJSONFields(device.Tags, device.Metadata)
 	if err != nil {
 		return Device{}, err
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Device{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := validateDeviceNetworkSegment(ctx, tx, device.NetworkSegment); err != nil {
+		return Device{}, err
+	}
+	result, err := tx.ExecContext(ctx, `
 		UPDATE devices
-		SET name = ?, hostname = ?, role = ?, device_type = ?, ip_address = ?, mac_address = ?, network_segment = ?, status = ?, tags_json = ?, metadata_json = ?, updated_at = ?
-		WHERE id = ?
-	`, device.Name, device.Hostname, device.Role, device.DeviceType, device.IPAddress, device.MACAddress, device.NetworkSegment, device.Status, tagsJSON, metadataJSON, device.UpdatedAt, device.ID)
+		SET version = ?, name = ?, hostname = ?, role = ?, device_type = ?, ip_address = ?, mac_address = ?, network_segment = ?, status = ?, tags_json = ?, metadata_json = ?, updated_at = ?
+		WHERE id = ? AND version = ?
+	`, device.Version, device.Name, device.Hostname, device.Role, device.DeviceType, device.IPAddress, device.MACAddress, device.NetworkSegment, device.Status, tagsJSON, metadataJSON, device.UpdatedAt, device.ID, current.Version)
 	if err != nil {
 		return Device{}, err
 	}
 
-	if rows, err := result.RowsAffected(); err == nil && rows == 0 {
-		return Device{}, ErrNotFound
+	if rows, err := result.RowsAffected(); err != nil {
+		return Device{}, err
+	} else if rows == 0 {
+		return Device{}, ErrConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return Device{}, err
 	}
 
 	return device, nil
 }
 
 func (s *Store) DeleteDevice(ctx context.Context, id string) error {
-	return s.deleteEntity(ctx, "device", id)
+	return s.deleteEntity(ctx, "device", id, nil)
+}
+
+// DeleteDeviceVersioned deletes a device only when version matches the stored row.
+func (s *Store) DeleteDeviceVersioned(ctx context.Context, id string, version int64) error {
+	return s.deleteEntity(ctx, "device", id, &version)
 }
 
 func (s *Store) ListNetworkNodes(ctx context.Context) ([]NetworkNode, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, node_type, management_ip, mac_address, vendor, model, status, tags_json, metadata_json, created_at, updated_at
+		SELECT id, version, name, node_type, management_ip, mac_address, vendor, model, status, tags_json, metadata_json, created_at, updated_at
 		FROM network_nodes
 		ORDER BY name
 	`)
@@ -329,6 +372,12 @@ func (s *Store) AddNetworkNode(ctx context.Context, node NetworkNode) (NetworkNo
 	if strings.TrimSpace(node.ID) == "" {
 		node.ID = "node-" + uuid.NewString()
 	}
+	var err error
+	node, err = canonicalizeNetworkNode(node)
+	if err != nil {
+		return NetworkNode{}, err
+	}
+	node.Version = 1
 	node.CreatedAt = now
 	node.UpdatedAt = now
 
@@ -339,10 +388,10 @@ func (s *Store) AddNetworkNode(ctx context.Context, node NetworkNode) (NetworkNo
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO network_nodes (
-			id, name, node_type, management_ip, mac_address, vendor, model, status, tags_json, metadata_json, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			id, version, name, node_type, management_ip, mac_address, vendor, model, status, tags_json, metadata_json, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		node.ID, node.Name, node.NodeType, node.ManagementIP, node.MACAddress, node.Vendor, node.Model, node.Status, tagsJSON, metadataJSON, node.CreatedAt, node.UpdatedAt,
+		node.ID, node.Version, node.Name, node.NodeType, node.ManagementIP, node.MACAddress, node.Vendor, node.Model, node.Status, tagsJSON, metadataJSON, node.CreatedAt, node.UpdatedAt,
 	)
 	if err != nil {
 		return NetworkNode{}, err
@@ -353,7 +402,7 @@ func (s *Store) AddNetworkNode(ctx context.Context, node NetworkNode) (NetworkNo
 
 func (s *Store) GetNetworkNode(ctx context.Context, id string) (NetworkNode, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, node_type, management_ip, mac_address, vendor, model, status, tags_json, metadata_json, created_at, updated_at
+		SELECT id, version, name, node_type, management_ip, mac_address, vendor, model, status, tags_json, metadata_json, created_at, updated_at
 		FROM network_nodes
 		WHERE id = ?
 	`, id)
@@ -367,13 +416,22 @@ func (s *Store) GetNetworkNode(ctx context.Context, id string) (NetworkNode, err
 }
 
 func (s *Store) UpdateNetworkNode(ctx context.Context, node NetworkNode) (NetworkNode, error) {
+	var err error
+	node, err = canonicalizeExistingNetworkNode(node)
+	if err != nil {
+		return NetworkNode{}, err
+	}
 	current, err := s.GetNetworkNode(ctx, node.ID)
 	if err != nil {
 		return NetworkNode{}, err
 	}
+	if node.Version != current.Version {
+		return NetworkNode{}, ErrConflict
+	}
 
 	node.CreatedAt = current.CreatedAt
 	node.UpdatedAt = time.Now().UTC()
+	node.Version = current.Version + 1
 
 	tagsJSON, metadataJSON, err := marshalJSONFields(node.Tags, node.Metadata)
 	if err != nil {
@@ -382,27 +440,34 @@ func (s *Store) UpdateNetworkNode(ctx context.Context, node NetworkNode) (Networ
 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE network_nodes
-		SET name = ?, node_type = ?, management_ip = ?, mac_address = ?, vendor = ?, model = ?, status = ?, tags_json = ?, metadata_json = ?, updated_at = ?
-		WHERE id = ?
-	`, node.Name, node.NodeType, node.ManagementIP, node.MACAddress, node.Vendor, node.Model, node.Status, tagsJSON, metadataJSON, node.UpdatedAt, node.ID)
+		SET version = ?, name = ?, node_type = ?, management_ip = ?, mac_address = ?, vendor = ?, model = ?, status = ?, tags_json = ?, metadata_json = ?, updated_at = ?
+		WHERE id = ? AND version = ?
+	`, node.Version, node.Name, node.NodeType, node.ManagementIP, node.MACAddress, node.Vendor, node.Model, node.Status, tagsJSON, metadataJSON, node.UpdatedAt, node.ID, current.Version)
 	if err != nil {
 		return NetworkNode{}, err
 	}
 
-	if rows, err := result.RowsAffected(); err == nil && rows == 0 {
-		return NetworkNode{}, ErrNotFound
+	if rows, err := result.RowsAffected(); err != nil {
+		return NetworkNode{}, err
+	} else if rows == 0 {
+		return NetworkNode{}, ErrConflict
 	}
 
 	return node, nil
 }
 
 func (s *Store) DeleteNetworkNode(ctx context.Context, id string) error {
-	return s.deleteEntity(ctx, "networkNode", id)
+	return s.deleteEntity(ctx, "networkNode", id, nil)
+}
+
+// DeleteNetworkNodeVersioned deletes a node only when version matches the stored row.
+func (s *Store) DeleteNetworkNodeVersioned(ctx context.Context, id string, version int64) error {
+	return s.deleteEntity(ctx, "networkNode", id, &version)
 }
 
 func (s *Store) ListNetworkSegments(ctx context.Context) ([]NetworkSegment, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, segment_type, cidr, vlan_id, gateway_ip, dns_domain, metadata_json, created_at, updated_at
+		SELECT id, version, name, segment_type, cidr, vlan_id, gateway_ip, dns_domain, metadata_json, created_at, updated_at
 		FROM network_segments
 		ORDER BY name
 	`)
@@ -432,6 +497,12 @@ func (s *Store) AddNetworkSegment(ctx context.Context, segment NetworkSegment) (
 	if strings.TrimSpace(segment.ID) == "" {
 		segment.ID = "segment-" + uuid.NewString()
 	}
+	var err error
+	segment, err = canonicalizeNetworkSegment(segment)
+	if err != nil {
+		return NetworkSegment{}, err
+	}
+	segment.Version = 1
 	segment.CreatedAt = now
 	segment.UpdatedAt = now
 
@@ -442,10 +513,10 @@ func (s *Store) AddNetworkSegment(ctx context.Context, segment NetworkSegment) (
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO network_segments (
-			id, name, segment_type, cidr, vlan_id, gateway_ip, dns_domain, metadata_json, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			id, version, name, segment_type, cidr, vlan_id, gateway_ip, dns_domain, metadata_json, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		segment.ID, segment.Name, segment.SegmentType, segment.CIDR, segment.VLANID, segment.GatewayIP, segment.DNSDomain, metadataJSON, segment.CreatedAt, segment.UpdatedAt,
+		segment.ID, segment.Version, segment.Name, segment.SegmentType, segment.CIDR, segment.VLANID, segment.GatewayIP, segment.DNSDomain, metadataJSON, segment.CreatedAt, segment.UpdatedAt,
 	)
 	if err != nil {
 		return NetworkSegment{}, err
@@ -456,7 +527,7 @@ func (s *Store) AddNetworkSegment(ctx context.Context, segment NetworkSegment) (
 
 func (s *Store) GetNetworkSegment(ctx context.Context, id string) (NetworkSegment, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, segment_type, cidr, vlan_id, gateway_ip, dns_domain, metadata_json, created_at, updated_at
+		SELECT id, version, name, segment_type, cidr, vlan_id, gateway_ip, dns_domain, metadata_json, created_at, updated_at
 		FROM network_segments
 		WHERE id = ?
 	`, id)
@@ -470,13 +541,22 @@ func (s *Store) GetNetworkSegment(ctx context.Context, id string) (NetworkSegmen
 }
 
 func (s *Store) UpdateNetworkSegment(ctx context.Context, segment NetworkSegment) (NetworkSegment, error) {
+	var err error
+	segment, err = canonicalizeExistingNetworkSegment(segment)
+	if err != nil {
+		return NetworkSegment{}, err
+	}
 	current, err := s.GetNetworkSegment(ctx, segment.ID)
 	if err != nil {
 		return NetworkSegment{}, err
 	}
+	if segment.Version != current.Version {
+		return NetworkSegment{}, ErrConflict
+	}
 
 	segment.CreatedAt = current.CreatedAt
 	segment.UpdatedAt = time.Now().UTC()
+	segment.Version = current.Version + 1
 
 	_, metadataJSON, err := marshalJSONFields([]string{}, segment.Metadata)
 	if err != nil {
@@ -485,27 +565,34 @@ func (s *Store) UpdateNetworkSegment(ctx context.Context, segment NetworkSegment
 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE network_segments
-		SET name = ?, segment_type = ?, cidr = ?, vlan_id = ?, gateway_ip = ?, dns_domain = ?, metadata_json = ?, updated_at = ?
-		WHERE id = ?
-	`, segment.Name, segment.SegmentType, segment.CIDR, segment.VLANID, segment.GatewayIP, segment.DNSDomain, metadataJSON, segment.UpdatedAt, segment.ID)
+		SET version = ?, name = ?, segment_type = ?, cidr = ?, vlan_id = ?, gateway_ip = ?, dns_domain = ?, metadata_json = ?, updated_at = ?
+		WHERE id = ? AND version = ?
+	`, segment.Version, segment.Name, segment.SegmentType, segment.CIDR, segment.VLANID, segment.GatewayIP, segment.DNSDomain, metadataJSON, segment.UpdatedAt, segment.ID, current.Version)
 	if err != nil {
 		return NetworkSegment{}, err
 	}
 
-	if rows, err := result.RowsAffected(); err == nil && rows == 0 {
-		return NetworkSegment{}, ErrNotFound
+	if rows, err := result.RowsAffected(); err != nil {
+		return NetworkSegment{}, err
+	} else if rows == 0 {
+		return NetworkSegment{}, ErrConflict
 	}
 
 	return segment, nil
 }
 
 func (s *Store) DeleteNetworkSegment(ctx context.Context, id string) error {
-	return s.deleteEntity(ctx, "networkSegment", id)
+	return s.deleteEntity(ctx, "networkSegment", id, nil)
+}
+
+// DeleteNetworkSegmentVersioned deletes a segment only when version matches the stored row.
+func (s *Store) DeleteNetworkSegmentVersioned(ctx context.Context, id string, version int64) error {
+	return s.deleteEntity(ctx, "networkSegment", id, &version)
 }
 
 func (s *Store) ListRelations(ctx context.Context) ([]Relation, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, source_kind, source_id, target_kind, target_id, relation_type, confidence, metadata_json, observed_at
+		SELECT id, version, source_kind, source_id, target_kind, target_id, relation_type, confidence, metadata_json, observed_at
 		FROM relations
 		ORDER BY observed_at DESC, id
 	`)
@@ -527,6 +614,15 @@ func (s *Store) ListRelations(ctx context.Context) ([]Relation, error) {
 }
 
 func (s *Store) AddRelation(ctx context.Context, relation Relation) (Relation, error) {
+	if strings.TrimSpace(relation.ID) == "" {
+		relation.ID = "rel-" + uuid.NewString()
+	}
+	var err error
+	relation, err = canonicalizeRelation(relation)
+	if err != nil {
+		return Relation{}, err
+	}
+	relation.Version = 1
 	relation.ObservedAt = time.Now().UTC()
 	_, metadataJSON, err := marshalJSONFields([]string{}, relation.Metadata)
 	if err != nil {
@@ -544,10 +640,10 @@ func (s *Store) AddRelation(ctx context.Context, relation Relation) (Relation, e
 	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO relations (
-			id, source_kind, source_id, target_kind, target_id, relation_type, confidence, metadata_json, observed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			id, version, source_kind, source_id, target_kind, target_id, relation_type, confidence, metadata_json, observed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		relation.ID, relation.SourceKind, relation.SourceID, relation.TargetKind, relation.TargetID, relation.RelationType, relation.Confidence, metadataJSON, relation.ObservedAt,
+		relation.ID, relation.Version, relation.SourceKind, relation.SourceID, relation.TargetKind, relation.TargetID, relation.RelationType, relation.Confidence, metadataJSON, relation.ObservedAt,
 	)
 	if err != nil {
 		return Relation{}, err
@@ -561,7 +657,7 @@ func (s *Store) AddRelation(ctx context.Context, relation Relation) (Relation, e
 
 func (s *Store) GetRelation(ctx context.Context, id string) (Relation, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, source_kind, source_id, target_kind, target_id, relation_type, confidence, metadata_json, observed_at
+		SELECT id, version, source_kind, source_id, target_kind, target_id, relation_type, confidence, metadata_json, observed_at
 		FROM relations
 		WHERE id = ?
 	`, id)
@@ -575,6 +671,11 @@ func (s *Store) GetRelation(ctx context.Context, id string) (Relation, error) {
 }
 
 func (s *Store) UpdateRelation(ctx context.Context, relation Relation) (Relation, error) {
+	var err error
+	relation, err = canonicalizeExistingRelation(relation)
+	if err != nil {
+		return Relation{}, err
+	}
 	_, metadataJSON, err := marshalJSONFields([]string{}, relation.Metadata)
 	if err != nil {
 		return Relation{}, err
@@ -586,26 +687,33 @@ func (s *Store) UpdateRelation(ctx context.Context, relation Relation) (Relation
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := tx.QueryRowContext(ctx, `SELECT observed_at FROM relations WHERE id = ?`, relation.ID).Scan(&relation.ObservedAt); errors.Is(err, sql.ErrNoRows) {
+	var currentVersion int64
+	if err := tx.QueryRowContext(ctx, `SELECT version, observed_at FROM relations WHERE id = ?`, relation.ID).Scan(&currentVersion, &relation.ObservedAt); errors.Is(err, sql.ErrNoRows) {
 		return Relation{}, ErrNotFound
 	} else if err != nil {
 		return Relation{}, err
 	}
+	if relation.Version != currentVersion {
+		return Relation{}, ErrConflict
+	}
 	if err := validateRelationEndpoints(ctx, tx, relation); err != nil {
 		return Relation{}, err
 	}
+	relation.Version = currentVersion + 1
 
 	result, err := tx.ExecContext(ctx, `
 		UPDATE relations
-		SET source_kind = ?, source_id = ?, target_kind = ?, target_id = ?, relation_type = ?, confidence = ?, metadata_json = ?
-		WHERE id = ?
-	`, relation.SourceKind, relation.SourceID, relation.TargetKind, relation.TargetID, relation.RelationType, relation.Confidence, metadataJSON, relation.ID)
+		SET version = ?, source_kind = ?, source_id = ?, target_kind = ?, target_id = ?, relation_type = ?, confidence = ?, metadata_json = ?
+		WHERE id = ? AND version = ?
+	`, relation.Version, relation.SourceKind, relation.SourceID, relation.TargetKind, relation.TargetID, relation.RelationType, relation.Confidence, metadataJSON, relation.ID, currentVersion)
 	if err != nil {
 		return Relation{}, err
 	}
 
-	if rows, err := result.RowsAffected(); err == nil && rows == 0 {
-		return Relation{}, ErrNotFound
+	if rows, err := result.RowsAffected(); err != nil {
+		return Relation{}, err
+	} else if rows == 0 {
+		return Relation{}, ErrConflict
 	}
 	if err := tx.Commit(); err != nil {
 		return Relation{}, err
@@ -615,11 +723,46 @@ func (s *Store) UpdateRelation(ctx context.Context, relation Relation) (Relation
 }
 
 func (s *Store) DeleteRelation(ctx context.Context, id string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM relations WHERE id = ?`, id)
+	return s.deleteRelation(ctx, id, nil)
+}
+
+// DeleteRelationVersioned deletes a relation only when version matches the stored row.
+func (s *Store) DeleteRelationVersioned(ctx context.Context, id string, version int64) error {
+	return s.deleteRelation(ctx, id, &version)
+}
+
+func (s *Store) deleteRelation(ctx context.Context, id string, expectedVersion *int64) error {
+	if expectedVersion != nil && *expectedVersion < 1 {
+		return validationError("relation version must be positive")
+	}
+	statement := `DELETE FROM relations WHERE id = ?`
+	arguments := []any{id}
+	if expectedVersion != nil {
+		statement += ` AND version = ?`
+		arguments = append(arguments, *expectedVersion)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	return requireDeletedRow(result)
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, statement, arguments...)
+	if err != nil {
+		return err
+	}
+	if err := requireDeletedRow(result); err == nil {
+		return tx.Commit()
+	} else if expectedVersion == nil {
+		return err
+	}
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM relations WHERE id = ?)`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		return ErrConflict
+	}
+	return ErrNotFound
 }
 
 func (s *Store) ListActions(ctx context.Context) ([]Action, error) {
@@ -660,6 +803,23 @@ func (s *Store) ListActionsPage(ctx context.Context, limit int, offset int) ([]A
 }
 
 func (s *Store) AddAction(ctx context.Context, action Action) (Action, error) {
+	if action.StartedAt.IsZero() {
+		action.StartedAt = time.Now().UTC()
+	}
+	var err error
+	action, err = canonicalizeAction(action)
+	if err != nil {
+		return Action{}, err
+	}
+	if action.Status == "running" && !action.FinishedAt.IsZero() {
+		return Action{}, validationError("running actions must not have a finish time")
+	}
+	if action.Status != "running" && action.FinishedAt.IsZero() {
+		return Action{}, validationError("completed and failed actions require a finish time")
+	}
+	if !action.FinishedAt.IsZero() && action.FinishedAt.Before(action.StartedAt) {
+		return Action{}, validationError("action finish time must not precede its start time")
+	}
 	_, metadataJSON, err := marshalJSONFields(nil, action.Metadata)
 	if err != nil {
 		return Action{}, err
@@ -705,6 +865,27 @@ func pruneActions(ctx context.Context, tx *sql.Tx, retain int) error {
 }
 
 func (s *Store) UpdateAction(ctx context.Context, action Action) (Action, error) {
+	var err error
+	action, err = canonicalizeExistingAction(action)
+	if err != nil {
+		return Action{}, err
+	}
+	current, err := s.getAction(ctx, action.ID)
+	if err != nil {
+		return Action{}, err
+	}
+	if action.DeviceID != current.DeviceID || action.ActionType != current.ActionType || !action.StartedAt.Equal(current.StartedAt) {
+		return Action{}, validationError("action device, type, and start time are immutable")
+	}
+	if current.Status != "running" || (action.Status != "completed" && action.Status != "failed") {
+		return Action{}, ErrConflict
+	}
+	if action.FinishedAt.IsZero() {
+		return Action{}, validationError("completed and failed actions require a finish time")
+	}
+	if action.FinishedAt.Before(action.StartedAt) {
+		return Action{}, validationError("action finish time must not precede its start time")
+	}
 	_, metadataJSON, err := marshalJSONFields(nil, action.Metadata)
 	if err != nil {
 		return Action{}, err
@@ -714,7 +895,7 @@ func (s *Store) UpdateAction(ctx context.Context, action Action) (Action, error)
 		UPDATE actions
 		SET device_id = ?, action_type = ?, status = ?, result_summary = ?,
 			metadata_json = ?, started_at = ?, finished_at = ?
-		WHERE id = ?
+		WHERE id = ? AND status = 'running'
 	`, action.DeviceID, action.ActionType, action.Status, action.ResultSummary,
 		metadataJSON, action.StartedAt, action.FinishedAt, action.ID)
 	if err != nil {
@@ -723,9 +904,22 @@ func (s *Store) UpdateAction(ctx context.Context, action Action) (Action, error)
 	if rows, err := result.RowsAffected(); err != nil {
 		return Action{}, err
 	} else if rows == 0 {
-		return Action{}, ErrNotFound
+		return Action{}, ErrConflict
 	}
 	return action, nil
+}
+
+func (s *Store) getAction(ctx context.Context, id string) (Action, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, device_id, action_type, status, result_summary, metadata_json, started_at, finished_at
+		FROM actions
+		WHERE id = ?
+	`, id)
+	action, err := scanAction(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Action{}, ErrNotFound
+	}
+	return action, err
 }
 
 func (s *Store) ClearActions(ctx context.Context) error {
@@ -788,6 +982,11 @@ func (s *Store) UpsertSSHCredential(ctx context.Context, credential SSHCredentia
 }
 
 func (s *Store) UpsertSSHCredentialAndPort(ctx context.Context, credential SSHCredential, sshPort string) (SSHCredential, error) {
+	var err error
+	credential, err = canonicalizeSSHCredential(credential)
+	if err != nil {
+		return SSHCredential{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return SSHCredential{}, err
@@ -795,7 +994,8 @@ func (s *Store) UpsertSSHCredentialAndPort(ctx context.Context, credential SSHCr
 	defer func() { _ = tx.Rollback() }()
 
 	var metadataJSON string
-	if err := tx.QueryRowContext(ctx, `SELECT metadata_json FROM devices WHERE id = ?`, credential.DeviceID).Scan(&metadataJSON); errors.Is(err, sql.ErrNoRows) {
+	var deviceVersion int64
+	if err := tx.QueryRowContext(ctx, `SELECT metadata_json, version FROM devices WHERE id = ?`, credential.DeviceID).Scan(&metadataJSON, &deviceVersion); errors.Is(err, sql.ErrNoRows) {
 		return SSHCredential{}, ErrNotFound
 	} else if err != nil {
 		return SSHCredential{}, err
@@ -808,7 +1008,15 @@ func (s *Store) UpsertSSHCredentialAndPort(ctx context.Context, credential SSHCr
 	if port := strings.TrimSpace(sshPort); port == "" {
 		delete(metadata, "sshPort")
 	} else {
+		port, err = canonicalPort(port)
+		if err != nil {
+			return SSHCredential{}, err
+		}
 		metadata["sshPort"] = port
+	}
+	metadata, err = canonicalMetadata(metadata)
+	if err != nil {
+		return SSHCredential{}, err
 	}
 	_, metadataJSON, err = marshalJSONFields(nil, metadata)
 	if err != nil {
@@ -819,8 +1027,18 @@ func (s *Store) UpsertSSHCredentialAndPort(ctx context.Context, credential SSHCr
 	if err != nil {
 		return SSHCredential{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE devices SET metadata_json = ?, updated_at = ? WHERE id = ?`, metadataJSON, credential.UpdatedAt, credential.DeviceID); err != nil {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE devices
+		SET metadata_json = ?, updated_at = ?, version = version + 1
+		WHERE id = ? AND version = ?
+	`, metadataJSON, credential.UpdatedAt, credential.DeviceID, deviceVersion)
+	if err != nil {
 		return SSHCredential{}, err
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return SSHCredential{}, err
+	} else if rows == 0 {
+		return SSHCredential{}, ErrConflict
 	}
 	if err := tx.Commit(); err != nil {
 		return SSHCredential{}, err
@@ -829,6 +1047,18 @@ func (s *Store) UpsertSSHCredentialAndPort(ctx context.Context, credential SSHCr
 }
 
 func upsertSSHCredential(ctx context.Context, tx *sql.Tx, credential SSHCredential) (SSHCredential, error) {
+	var err error
+	credential, err = canonicalizeSSHCredential(credential)
+	if err != nil {
+		return SSHCredential{}, err
+	}
+	var deviceExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`, credential.DeviceID).Scan(&deviceExists); err != nil {
+		return SSHCredential{}, err
+	}
+	if !deviceExists {
+		return SSHCredential{}, ErrNotFound
+	}
 	now := time.Now().UTC()
 	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM ssh_credentials WHERE device_id = ?`, credential.DeviceID).Scan(&credential.CreatedAt); errors.Is(err, sql.ErrNoRows) {
 		credential.CreatedAt = now
@@ -836,12 +1066,8 @@ func upsertSSHCredential(ctx context.Context, tx *sql.Tx, credential SSHCredenti
 		return SSHCredential{}, err
 	}
 	credential.UpdatedAt = now
-	credential.HasPassword = credential.PasswordCiphertext != ""
-	if credential.KeyVersion == 0 {
-		credential.KeyVersion = 1
-	}
 
-	_, err := tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO ssh_credentials (
 			device_id, username, password_ciphertext, password_nonce, key_version, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -918,6 +1144,7 @@ func scanDevice(scanner interface {
 
 	err := scanner.Scan(
 		&device.ID,
+		&device.Version,
 		&device.Name,
 		&device.Hostname,
 		&device.Role,
@@ -954,6 +1181,7 @@ func scanNetworkNode(scanner interface {
 
 	err := scanner.Scan(
 		&node.ID,
+		&node.Version,
 		&node.Name,
 		&node.NodeType,
 		&node.ManagementIP,
@@ -988,6 +1216,7 @@ func scanNetworkSegment(scanner interface {
 
 	err := scanner.Scan(
 		&segment.ID,
+		&segment.Version,
 		&segment.Name,
 		&segment.SegmentType,
 		&segment.CIDR,
@@ -1017,6 +1246,7 @@ func scanRelation(scanner interface {
 
 	err := scanner.Scan(
 		&relation.ID,
+		&relation.Version,
 		&relation.SourceKind,
 		&relation.SourceID,
 		&relation.TargetKind,
@@ -1144,15 +1374,36 @@ func validateRelationEndpoints(ctx context.Context, tx *sql.Tx, relation Relatio
 	return nil
 }
 
-func (s *Store) deleteEntity(ctx context.Context, kind string, id string) error {
+func validateDeviceNetworkSegment(ctx context.Context, tx *sql.Tx, segmentID string) error {
+	if segmentID == "" {
+		return nil
+	}
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM network_segments WHERE id = ?)`, segmentID).Scan(&exists); err != nil {
+		return fmt.Errorf("validate device network segment: %w", err)
+	}
+	if !exists {
+		return validationError("network segment %q does not exist", segmentID)
+	}
+	return nil
+}
+
+func (s *Store) deleteEntity(ctx context.Context, kind string, id string, expectedVersion *int64) error {
+	if expectedVersion != nil && *expectedVersion < 1 {
+		return validationError("entity version must be positive")
+	}
 	var deleteStatement string
+	var existsStatement string
 	switch kind {
 	case "device":
 		deleteStatement = `DELETE FROM devices WHERE id = ?`
+		existsStatement = `SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`
 	case "networkNode":
 		deleteStatement = `DELETE FROM network_nodes WHERE id = ?`
+		existsStatement = `SELECT EXISTS(SELECT 1 FROM network_nodes WHERE id = ?)`
 	case "networkSegment":
 		deleteStatement = `DELETE FROM network_segments WHERE id = ?`
+		existsStatement = `SELECT EXISTS(SELECT 1 FROM network_segments WHERE id = ?)`
 	default:
 		return fmt.Errorf("unsupported entity kind %q", kind)
 	}
@@ -1163,12 +1414,36 @@ func (s *Store) deleteEntity(ctx context.Context, kind string, id string) error 
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(ctx, deleteStatement, id)
+	arguments := []any{id}
+	if expectedVersion != nil {
+		deleteStatement += ` AND version = ?`
+		arguments = append(arguments, *expectedVersion)
+	}
+	result, err := tx.ExecContext(ctx, deleteStatement, arguments...)
 	if err != nil {
 		return err
 	}
 	if err := requireDeletedRow(result); err != nil {
-		return err
+		if expectedVersion == nil {
+			return err
+		}
+		var exists bool
+		if queryErr := tx.QueryRowContext(ctx, existsStatement, id).Scan(&exists); queryErr != nil {
+			return queryErr
+		}
+		if exists {
+			return ErrConflict
+		}
+		return ErrNotFound
+	}
+	if kind == "networkSegment" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE devices
+			SET network_segment = '', version = version + 1, updated_at = ?
+			WHERE network_segment = ?
+		`, time.Now().UTC(), id); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM relations

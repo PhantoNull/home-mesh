@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const latestSchemaVersion = 3
+const latestSchemaVersion = 4
 
 type migration struct {
 	version    int
@@ -164,6 +164,16 @@ var schemaMigrations = []migration{
 				END
 			WHERE action_type = 'ssh_command';
 		`},
+	},
+	{
+		version: 4,
+		name:    "add optimistic concurrency versions",
+		statements: []string{
+			`ALTER TABLE devices ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1)`,
+			`ALTER TABLE network_nodes ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1)`,
+			`ALTER TABLE network_segments ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1)`,
+			`ALTER TABLE relations ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1)`,
+		},
 	},
 }
 
