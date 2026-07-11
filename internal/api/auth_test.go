@@ -246,6 +246,75 @@ func TestHandleLoginSetsSecureCookieForTrustedHTTPSProxy(t *testing.T) {
 	}
 }
 
+func TestLogoutRevokesIssuedSession(t *testing.T) {
+	t.Parallel()
+
+	auth := newTestAuthManager(t)
+	loginRecorder := httptest.NewRecorder()
+	auth.handleLogin(loginRecorder, newLoginRequest(t, "admin", "s3cret-pass"))
+	if loginRecorder.Code != http.StatusOK {
+		t.Fatalf("login status = %d", loginRecorder.Code)
+	}
+	cookies := loginRecorder.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login cookies = %v", cookies)
+	}
+
+	authenticatedRequest := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+	authenticatedRequest.AddCookie(cookies[0])
+	if _, ok := auth.authenticatedUsername(authenticatedRequest); !ok {
+		t.Fatal("issued session was not accepted")
+	}
+
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
+	logoutRequest.AddCookie(cookies[0])
+	auth.handleLogout(httptest.NewRecorder(), logoutRequest)
+	if _, ok := auth.authenticatedUsername(authenticatedRequest); ok {
+		t.Fatal("revoked session remained valid")
+	}
+}
+
+func TestHandleLoginBoundsConcurrentPasswordChecks(t *testing.T) {
+	t.Parallel()
+
+	auth := newTestAuthManager(t)
+	for range maxConcurrentPasswordChecks {
+		auth.passwordSlots <- struct{}{}
+	}
+	defer func() {
+		for range maxConcurrentPasswordChecks {
+			<-auth.passwordSlots
+		}
+	}()
+
+	recorder := httptest.NewRecorder()
+	auth.handleLogin(recorder, newLoginRequest(t, "admin", "s3cret-pass"))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if recorder.Header().Get("Retry-After") != "1" {
+		t.Fatalf("Retry-After = %q", recorder.Header().Get("Retry-After"))
+	}
+}
+
+func TestSessionRegistryIsBoundedAndExpiresEntries(t *testing.T) {
+	t.Parallel()
+
+	registry := newSessionRegistry()
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	registry.now = func() time.Time { return now }
+	registry.register("expired", now.Add(-time.Second))
+	for index := 0; index <= maxActiveSessions; index++ {
+		registry.register(strconv.Itoa(index), now.Add(time.Duration(index+1)*time.Second))
+	}
+	if len(registry.sessions) != maxActiveSessions {
+		t.Fatalf("session count = %d, want %d", len(registry.sessions), maxActiveSessions)
+	}
+	if registry.valid("expired", now.Add(-time.Second)) {
+		t.Fatal("expired session remained valid")
+	}
+}
+
 func newTestAuthManager(t *testing.T) *authManager {
 	t.Helper()
 
@@ -255,11 +324,14 @@ func newTestAuthManager(t *testing.T) *authManager {
 	}
 
 	return &authManager{
-		enabled:       true,
-		account:       store.AdminAccount{Username: "admin", PasswordHash: hash},
-		sessionSecret: []byte("0123456789abcdef0123456789abcdef"),
-		loginLimiter:  newLoginRateLimiter(),
-		requests:      newTestRequestMetadata(t),
+		enabled:         true,
+		account:         store.AdminAccount{Username: "admin", PasswordHash: hash},
+		sessionSecret:   []byte("0123456789abcdef0123456789abcdef"),
+		sessionDuration: time.Hour,
+		sessions:        newSessionRegistry(),
+		passwordSlots:   make(chan struct{}, maxConcurrentPasswordChecks),
+		loginLimiter:    newLoginRateLimiter(),
+		requests:        newTestRequestMetadata(t),
 	}
 }
 

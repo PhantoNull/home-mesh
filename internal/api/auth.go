@@ -31,18 +31,82 @@ const (
 )
 
 type authManager struct {
-	enabled       bool
-	account       store.AdminAccount
-	sessionSecret []byte
-	loginLimiter  *loginRateLimiter
-	requests      *requestMetadata
+	enabled         bool
+	account         store.AdminAccount
+	sessionSecret   []byte
+	sessionDuration time.Duration
+	sessions        *sessionRegistry
+	passwordSlots   chan struct{}
+	loginLimiter    *loginRateLimiter
+	requests        *requestMetadata
 }
 
 const (
-	loginMaxAttempts  = 5
-	loginWindowPeriod = 15 * time.Minute
-	maxLoginTrackIPs  = 1024
+	loginMaxAttempts            = 5
+	loginWindowPeriod           = 15 * time.Minute
+	maxLoginTrackIPs            = 1024
+	maxActiveSessions           = 1024
+	maxConcurrentPasswordChecks = 2
+	maxLoginUsernameBytes       = 128
+	maxLoginPasswordBytes       = 1024
 )
+
+type sessionRegistry struct {
+	mu       sync.Mutex
+	sessions map[string]time.Time
+	now      func() time.Time
+}
+
+func newSessionRegistry() *sessionRegistry {
+	return &sessionRegistry{sessions: make(map[string]time.Time), now: time.Now}
+}
+
+func (r *sessionRegistry) register(nonce string, expiresAt time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneLocked()
+	if len(r.sessions) >= maxActiveSessions {
+		var earliestNonce string
+		var earliestExpiry time.Time
+		for candidate, expiry := range r.sessions {
+			if earliestNonce == "" || expiry.Before(earliestExpiry) {
+				earliestNonce = candidate
+				earliestExpiry = expiry
+			}
+		}
+		delete(r.sessions, earliestNonce)
+	}
+	r.sessions[nonce] = expiresAt
+}
+
+func (r *sessionRegistry) valid(nonce string, expiresAt time.Time) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneLocked()
+	registeredExpiry, ok := r.sessions[nonce]
+	return ok && registeredExpiry.Unix() == expiresAt.Unix()
+}
+
+func (r *sessionRegistry) revoke(nonce string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.sessions, nonce)
+}
+
+func (r *sessionRegistry) pruneLocked() {
+	now := r.now()
+	for nonce, expiresAt := range r.sessions {
+		if !now.Before(expiresAt) {
+			delete(r.sessions, nonce)
+		}
+	}
+}
 
 type loginAttemptRecord struct {
 	failures  int
@@ -204,13 +268,23 @@ func newAuthManager(cfg config.Config, inventory *store.Store, requests *request
 	default:
 		return nil, err
 	}
+	sessionDuration := cfg.SessionDuration
+	if sessionDuration == 0 {
+		sessionDuration = time.Hour
+	}
+	if sessionDuration < 5*time.Minute || sessionDuration > 24*time.Hour {
+		return nil, errors.New("session duration must be between 5m and 24h")
+	}
 
 	return &authManager{
-		enabled:       true,
-		account:       account,
-		sessionSecret: []byte(sessionSecret),
-		loginLimiter:  newLoginRateLimiter(),
-		requests:      requests,
+		enabled:         true,
+		account:         account,
+		sessionSecret:   []byte(sessionSecret),
+		sessionDuration: sessionDuration,
+		sessions:        newSessionRegistry(),
+		passwordSlots:   make(chan struct{}, maxConcurrentPasswordChecks),
+		loginLimiter:    newLoginRateLimiter(),
+		requests:        requests,
 	}, nil
 }
 
@@ -265,9 +339,20 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid login payload"})
 		return
 	}
+	if len(payload.Username) > maxLoginUsernameBytes || len(payload.Password) > maxLoginPasswordBytes {
+		a.loginLimiter.recordFailure(clientIP)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+		return
+	}
 
-	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(payload.Username)), []byte(a.account.Username)) != 1 ||
-		!verifyPassword(payload.Password, a.account.PasswordHash) {
+	passwordValid, available := a.verifyPasswordBounded(payload.Password)
+	if !available {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication capacity is busy; retry shortly"})
+		return
+	}
+	usernameValid := subtle.ConstantTimeCompare([]byte(strings.TrimSpace(payload.Username)), []byte(a.account.Username)) == 1
+	if !usernameValid || !passwordValid {
 		a.loginLimiter.recordFailure(clientIP)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 		return
@@ -305,6 +390,7 @@ func (a *authManager) handleLogout(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
+	a.revokeRequestSession(r)
 
 	// #nosec G124 -- Secure is derived from direct TLS or a configured trusted proxy.
 	http.SetCookie(w, &http.Cookie{
@@ -367,7 +453,8 @@ func (a *authManager) authenticatedUsername(r *http.Request) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	if time.Now().UTC().Unix() > expiresAt {
+	expiresAtTime := time.Unix(expiresAt, 0).UTC()
+	if !time.Now().UTC().Before(expiresAtTime) {
 		return "", false
 	}
 
@@ -380,6 +467,9 @@ func (a *authManager) authenticatedUsername(r *http.Request) (string, bool) {
 	if subtle.ConstantTimeCompare([]byte(username), []byte(a.account.Username)) != 1 {
 		return "", false
 	}
+	if !a.sessions.valid(parts[1], expiresAtTime) {
+		return "", false
+	}
 
 	return username, true
 }
@@ -390,13 +480,48 @@ func (a *authManager) newSessionValue(username string) (string, time.Time, error
 		return "", time.Time{}, err
 	}
 
-	expiresAt := time.Now().UTC().Add(time.Hour)
+	duration := a.sessionDuration
+	if duration == 0 {
+		duration = time.Hour
+	}
+	expiresAt := time.Now().UTC().Add(duration)
 	userPart := base64.RawURLEncoding.EncodeToString([]byte(username))
 	noncePart := base64.RawURLEncoding.EncodeToString(nonce)
 	expiresPart := strconv.FormatInt(expiresAt.Unix(), 10)
 	signature := a.signSession(userPart, noncePart, expiresPart, nonce)
+	if a.sessions == nil {
+		a.sessions = newSessionRegistry()
+	}
+	a.sessions.register(noncePart, expiresAt)
 
 	return strings.Join([]string{userPart, noncePart, expiresPart, signature}, "."), expiresAt, nil
+}
+
+func (a *authManager) verifyPasswordBounded(password string) (valid bool, available bool) {
+	if a.passwordSlots == nil {
+		return verifyPassword(password, a.account.PasswordHash), true
+	}
+	select {
+	case a.passwordSlots <- struct{}{}:
+		defer func() { <-a.passwordSlots }()
+		return verifyPassword(password, a.account.PasswordHash), true
+	default:
+		return false, false
+	}
+}
+
+func (a *authManager) revokeRequestSession(r *http.Request) {
+	if a.sessions == nil {
+		return
+	}
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return
+	}
+	parts := strings.Split(cookie.Value, ".")
+	if len(parts) == 4 {
+		a.sessions.revoke(parts[1])
+	}
 }
 
 func (a *authManager) signSession(userPart string, noncePart string, expiresPart string, nonce []byte) string {

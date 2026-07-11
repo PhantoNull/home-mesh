@@ -107,6 +107,7 @@ Required values:
 - `HOME_MESH_SESSION_SECRET` with at least 32 bytes
 - `HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD` with at least 12 bytes on first start
 - optionally `HOME_MESH_SCAN_INTERVAL`
+- optionally `HOME_MESH_SESSION_DURATION` between 5 minutes and 24 hours
 - optionally `HOME_MESH_SSH_HOST_KEY_MODE`
 - optionally `HOME_MESH_TRUSTED_PROXY_CIDRS` when running behind an explicit reverse proxy
 - optionally `HOME_MESH_NMAP_PATH`
@@ -123,6 +124,7 @@ HOME_MESH_MASTER_KEY_VERSION=2
 HOME_MESH_PREVIOUS_MASTER_KEYS=
 HOME_MESH_SEED_DEMO_DATA=false
 HOME_MESH_SESSION_SECRET=replace-with-a-long-random-session-secret
+HOME_MESH_SESSION_DURATION=1h
 HOME_MESH_AUTH_DISABLED=false
 HOME_MESH_TRUSTED_PROXY_CIDRS=172.16.0.0/12
 HOME_MESH_BOOTSTRAP_ADMIN_USERNAME=root
@@ -266,8 +268,10 @@ Behavior:
 - unauthenticated requests to protected API routes return `401`
 - the frontend shows a login form before loading the dashboard
 - successful login creates an `HttpOnly` session cookie
-- session lifetime is 1 hour
+- session lifetime defaults to 1 hour and is bounded by `HOME_MESH_SESSION_DURATION`
+- logout revokes the current session server-side; process restarts revoke all sessions
 - failed login attempts are rate-limited per client IP
+- concurrent Argon2 password checks are bounded to cap authentication memory use
 
 This protection applies server-side, so direct requests to the backend API are also blocked without a valid session.
 

@@ -75,6 +75,12 @@ func TestLoadRejectsInvalidOperationalValues(t *testing.T) {
 	if _, err := Load(); err == nil {
 		t.Fatal("expected invalid trusted proxy CIDR to be rejected")
 	}
+
+	t.Setenv("HOME_MESH_TRUSTED_PROXY_CIDRS", "")
+	t.Setenv("HOME_MESH_SESSION_DURATION", "25h")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected excessive session duration to be rejected")
+	}
 }
 
 func TestLoadParsesMasterKeyVersions(t *testing.T) {

@@ -24,6 +24,7 @@ type Config struct {
 	SSHHostKeyMode         string
 	KnownHostsPath         string
 	SessionSecret          string
+	SessionDuration        time.Duration
 	AuthDisabled           bool
 	TrustedProxyCIDRs      []string
 	BootstrapAdminUsername string
@@ -47,6 +48,10 @@ func Load() (Config, error) {
 	scanInterval, err := parseDuration(getEnv("HOME_MESH_SCAN_INTERVAL", "30s"))
 	if err != nil {
 		return Config{}, fmt.Errorf("HOME_MESH_SCAN_INTERVAL: %w", err)
+	}
+	sessionDuration, err := parseDurationWithin(getEnv("HOME_MESH_SESSION_DURATION", "1h"), 5*time.Minute, 24*time.Hour)
+	if err != nil {
+		return Config{}, fmt.Errorf("HOME_MESH_SESSION_DURATION: %w", err)
 	}
 	trustedProxyCIDRs := commaSeparatedValues(os.Getenv("HOME_MESH_TRUSTED_PROXY_CIDRS"))
 	for _, value := range trustedProxyCIDRs {
@@ -81,6 +86,7 @@ func Load() (Config, error) {
 		SSHHostKeyMode:         getEnv("HOME_MESH_SSH_HOST_KEY_MODE", defaultSSHHostKeyMode()),
 		KnownHostsPath:         getEnv("HOME_MESH_SSH_KNOWN_HOSTS_PATH", defaultKnownHostsPath()),
 		SessionSecret:          getEnv("HOME_MESH_SESSION_SECRET", ""),
+		SessionDuration:        sessionDuration,
 		AuthDisabled:           authDisabled,
 		TrustedProxyCIDRs:      trustedProxyCIDRs,
 		BootstrapAdminUsername: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_USERNAME", "root"),
@@ -151,6 +157,17 @@ func parseDuration(s string) (time.Duration, error) {
 		return 0, errors.New("must be at least 5s")
 	}
 	return d, nil
+}
+
+func parseDurationWithin(s string, minimum time.Duration, maximum time.Duration) (time.Duration, error) {
+	duration, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	if duration < minimum || duration > maximum {
+		return 0, fmt.Errorf("must be between %s and %s", minimum, maximum)
+	}
+	return duration, nil
 }
 
 func parsePositiveInt(key string, fallback int) (int, error) {
