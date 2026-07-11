@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os/exec"
 	"runtime"
@@ -15,6 +16,8 @@ import (
 )
 
 var ErrNmapUnavailable = errors.New("nmap is not available")
+
+const discoveryBatchSize = 32
 
 type Service struct {
 	nmapPath string
@@ -70,6 +73,14 @@ func (s *Service) Capabilities() Capabilities {
 }
 
 func (s *Service) ScanCIDR(ctx context.Context, cidr string) (ScanResult, error) {
+	return s.scanCIDR(ctx, cidr, nil)
+}
+
+func (s *Service) ScanCIDRStream(ctx context.Context, cidr string, onHost func(HostMatch) error) (ScanResult, error) {
+	return s.scanCIDR(ctx, cidr, onHost)
+}
+
+func (s *Service) scanCIDR(ctx context.Context, cidr string, onHost func(HostMatch) error) (ScanResult, error) {
 	if !s.hasNmap() {
 		return ScanResult{}, ErrNmapUnavailable
 	}
@@ -97,28 +108,8 @@ func (s *Service) ScanCIDR(ctx context.Context, cidr string) (ScanResult, error)
 
 	hostsByIP := make(map[string]HostMatch)
 	for _, targetCIDR := range targetCIDRs {
-		cmd := exec.CommandContext(
-			ctx,
-			s.nmapPath,
-			"-sn",
-			"-n",
-			"--disable-arp-ping",
-			"-PE",
-			"-PS22,80,443",
-			"-PA22,80,443",
-			"-PU53",
-			targetCIDR,
-		)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return ScanResult{}, fmt.Errorf("nmap scan failed for %s: %w", targetCIDR, err)
-		}
-
-		for _, host := range parseNmapPingScan(output) {
-			if strings.TrimSpace(host.IPAddress) == "" {
-				continue
-			}
-			hostsByIP[host.IPAddress] = host
+		if err := s.scanTargetCIDR(ctx, targetCIDR, hostsByIP, onHost); err != nil {
+			return ScanResult{}, err
 		}
 	}
 
@@ -141,6 +132,92 @@ func (s *Service) ScanCIDR(ctx context.Context, cidr string) (ScanResult, error)
 		ScannedCIDRs: targetCIDRs,
 		Hosts:        hosts,
 	}, nil
+}
+
+func (s *Service) scanTargetCIDR(ctx context.Context, targetCIDR string, hostsByIP map[string]HostMatch, onHost func(HostMatch) error) error {
+	targets, err := expandIPv4Targets(targetCIDR)
+	if err != nil {
+		return fmt.Errorf("expand targets for %s: %w", targetCIDR, err)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	for _, batch := range chunkStrings(targets, discoveryBatchSize) {
+		if err := s.scanTargets(ctx, batch, targetCIDR, hostsByIP, onHost); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *Service) scanTargets(ctx context.Context, targets []string, targetLabel string, hostsByIP map[string]HostMatch, onHost func(HostMatch) error) error {
+	if len(targets) == 0 {
+		return nil
+	}
+
+	cmd := exec.CommandContext(
+		ctx,
+		s.nmapPath,
+		"-sn",
+		"-n",
+		"--disable-arp-ping",
+		"-PE",
+		"-PS22,80,443",
+		"-PA22,80,443",
+		"-PU53",
+	)
+	cmd.Args = append(cmd.Args, targets...)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("nmap stdout pipe failed for %s: %w", targetLabel, err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("nmap stderr pipe failed for %s: %w", targetLabel, err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("nmap start failed for %s: %w", targetLabel, err)
+	}
+
+	var stderrBuffer bytes.Buffer
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		_, _ = io.Copy(&stderrBuffer, stderr)
+	}()
+
+	emittedHosts := 0
+	emit := func(host HostMatch) error {
+		if strings.TrimSpace(host.IPAddress) == "" {
+			return nil
+		}
+		hostsByIP[host.IPAddress] = host
+		emittedHosts++
+		if onHost != nil {
+			return onHost(host)
+		}
+		return nil
+	}
+
+	if err := scanNmapPingStream(stdout, emit); err != nil {
+		_ = cmd.Process.Kill()
+		<-stderrDone
+		_ = cmd.Wait()
+		return err
+	}
+	<-stderrDone
+	if err := cmd.Wait(); err != nil {
+		if isIgnorableNmapExit(err, stderrBuffer.String(), emittedHosts) {
+			return nil
+		}
+		return fmt.Errorf("nmap scan failed for %s: %w", targetLabel, err)
+	}
+
+	return nil
 }
 
 func (s *Service) hasNmap() bool {
@@ -253,18 +330,29 @@ func compareIPStrings(left string, right string) int {
 }
 
 func parseNmapPingScan(output []byte) []HostMatch {
-	scanner := bufio.NewScanner(bytes.NewReader(output))
 	hosts := make([]HostMatch, 0)
+	_ = scanNmapPingStream(bytes.NewReader(output), func(host HostMatch) error {
+		hosts = append(hosts, host)
+		return nil
+	})
+	return hosts
+}
+
+func scanNmapPingStream(reader io.Reader, emit func(HostMatch) error) error {
+	scanner := bufio.NewScanner(reader)
 	var current *HostMatch
 	currentUp := false
 
-	flush := func() {
+	flush := func() error {
 		if current == nil || !currentUp || strings.TrimSpace(current.IPAddress) == "" {
-			return
+			current = nil
+			currentUp = false
+			return nil
 		}
-		hosts = append(hosts, *current)
+		host := *current
 		current = nil
 		currentUp = false
+		return emit(host)
 	}
 
 	for scanner.Scan() {
@@ -273,10 +361,11 @@ func parseNmapPingScan(output []byte) []HostMatch {
 			continue
 		}
 		if strings.HasPrefix(line, "Nmap scan report for ") {
-			flush()
+			if err := flush(); err != nil {
+				return err
+			}
 			target := strings.TrimPrefix(line, "Nmap scan report for ")
 			current = &HostMatch{}
-			currentUp = false
 			if open := strings.LastIndex(target, "("); open != -1 && strings.HasSuffix(target, ")") {
 				current.Hostname = strings.TrimSpace(target[:open])
 				current.IPAddress = strings.TrimSuffix(strings.TrimPrefix(target[open:], "("), ")")
@@ -301,9 +390,10 @@ func parseNmapPingScan(output []byte) []HostMatch {
 			}
 		}
 	}
-
-	flush()
-	return hosts
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return flush()
 }
 
 func DefaultNmapPath() string {
@@ -311,4 +401,99 @@ func DefaultNmapPath() string {
 		return "nmap.exe"
 	}
 	return "nmap"
+}
+
+func expandIPv4Targets(cidr string) ([]string, error) {
+	ip, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil {
+		return nil, err
+	}
+
+	start := ip.To4()
+	if start == nil {
+		return nil, errors.New("only IPv4 CIDRs are supported")
+	}
+
+	ones, bits := network.Mask.Size()
+	if bits != 32 {
+		return nil, errors.New("only IPv4 CIDRs are supported")
+	}
+	if ones < 16 {
+		return nil, errors.New("CIDR is too large; use /16 or smaller")
+	}
+
+	networkIP := network.IP.Mask(network.Mask).To4()
+	if networkIP == nil {
+		return nil, errors.New("invalid IPv4 network")
+	}
+
+	broadcast := make(net.IP, len(networkIP))
+	copy(broadcast, networkIP)
+	for i := range broadcast {
+		broadcast[i] |= ^network.Mask[i]
+	}
+
+	targets := make([]string, 0)
+	for current := append(net.IP(nil), networkIP...); compareIPStrings(current.String(), broadcast.String()) <= 0; incrementIPv4(current) {
+		target := current.String()
+		if target == networkIP.String() || target == broadcast.String() {
+			continue
+		}
+		targets = append(targets, target)
+	}
+
+	if len(targets) == 0 {
+		targets = append(targets, networkIP.String())
+	}
+
+	return targets, nil
+}
+
+func incrementIPv4(ip net.IP) {
+	for i := len(ip) - 1; i >= 0; i-- {
+		ip[i]++
+		if ip[i] != 0 {
+			return
+		}
+	}
+}
+
+func chunkStrings(values []string, size int) [][]string {
+	if size <= 0 || len(values) == 0 {
+		return nil
+	}
+
+	chunks := make([][]string, 0, (len(values)+size-1)/size)
+	for start := 0; start < len(values); start += size {
+		end := start + size
+		if end > len(values) {
+			end = len(values)
+		}
+		chunks = append(chunks, values[start:end])
+	}
+	return chunks
+}
+
+func isIgnorableNmapExit(err error, stderr string, emittedHosts int) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	if exitErr.ExitCode() != 1 {
+		return false
+	}
+
+	trimmedStderr := strings.TrimSpace(stderr)
+	if trimmedStderr != "" {
+		return false
+	}
+
+	return true
 }

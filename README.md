@@ -121,7 +121,7 @@ HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password-for-first-star
 HOME_MESH_SSH_HOST_KEY_MODE=insecure
 HOME_MESH_NMAP_PATH=nmap
 HOME_MESH_SCAN_INTERVAL=30s
-HOME_MESH_API_PORT=8080
+HOME_MESH_HTTP_ADDR=:8080
 HOME_MESH_WEB_PORT=3000
 ```
 
@@ -192,6 +192,7 @@ Current Docker layout:
 - `web`
   - frontend served by Nginx
   - proxies `/api` to the backend via `host.docker.internal:8080`
+  - maps `host.docker.internal` through Docker's `host-gateway` on Linux
   - forwards websocket and forwarded-host headers required by the SSH terminal and stricter origin checks
 
 Start the stack:
@@ -204,6 +205,11 @@ Open:
 
 - frontend: `http://localhost:3000`
 - backend API: `http://localhost:8080`
+
+Current Compose note:
+
+- `HOME_MESH_WEB_PORT` controls the published frontend port.
+- The backend listener is configured with `HOME_MESH_HTTP_ADDR` and should remain `:8080` unless the Nginx proxy target is changed as well.
 
 Stop the stack:
 

@@ -31,7 +31,7 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 		id, events := bus.Subscribe()
 		defer bus.Unsubscribe(id)
 
-		fmt.Fprintf(w, ": connected\n\n")
+		writeSSEComment(w, "connected")
 		flusher.Flush()
 
 		heartbeat := time.NewTicker(sseHeartbeatInterval)
@@ -50,7 +50,7 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 				flusher.Flush()
 
 			case <-heartbeat.C:
-				fmt.Fprintf(w, ": heartbeat\n\n")
+				writeSSEComment(w, "heartbeat")
 				flusher.Flush()
 			}
 		}
@@ -58,9 +58,17 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 }
 
 func writeSSEEvent(w http.ResponseWriter, event monitor.ScanEvent) {
-	data, err := json.Marshal(event)
+	writeSSEJSONEvent(w, "scan", event)
+}
+
+func writeSSEJSONEvent(w http.ResponseWriter, eventName string, payload any) {
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(w, "event: scan\ndata: %s\n\n", data)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, data)
+}
+
+func writeSSEComment(w http.ResponseWriter, comment string) {
+	fmt.Fprintf(w, ": %s\n\n", comment)
 }

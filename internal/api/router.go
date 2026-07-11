@@ -72,6 +72,10 @@ type discoveryScanResponse struct {
 	SegmentCandidates []discoverySegmentCandidate `json:"segmentCandidates,omitempty"`
 }
 
+type discoveryStreamError struct {
+	Error string `json:"error"`
+}
+
 type discoverySegmentCandidate struct {
 	CIDR string `json:"cidr"`
 	Name string `json:"name"`
@@ -153,6 +157,61 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		}
 
 		writeJSON(w, http.StatusOK, discoveryService.Capabilities())
+	})
+
+	mux.HandleFunc("/api/discovery/scan/stream", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming not supported"})
+			return
+		}
+
+		filterState, err := loadDiscoveryFilterState(r.Context(), inventory)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load discovery filter state"})
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		writeSSEComment(w, "connected")
+		flusher.Flush()
+
+		result, err := discoveryService.ScanCIDRStream(r.Context(), strings.TrimSpace(r.URL.Query().Get("cidr")), func(host discovery.HostMatch) error {
+			if !filterState.shouldIncludeHost(host) {
+				return nil
+			}
+			writeSSEJSONEvent(w, "discovery-host", host)
+			flusher.Flush()
+			return nil
+		})
+		if errors.Is(err, discovery.ErrNmapUnavailable) {
+			writeSSEJSONEvent(w, "discovery-error", discoveryStreamError{Error: "nmap is not available in the current runtime"})
+			flusher.Flush()
+			return
+		}
+		if err != nil {
+			writeSSEJSONEvent(w, "discovery-error", discoveryStreamError{Error: err.Error()})
+			flusher.Flush()
+			return
+		}
+
+		filteredHosts, segmentCandidates := filterState.finalize(result)
+		writeSSEJSONEvent(w, "discovery-complete", discoveryScanResponse{
+			Provider:          result.Provider,
+			CIDR:              result.CIDR,
+			ScannedCIDRs:      result.ScannedCIDRs,
+			Hosts:             filteredHosts,
+			SegmentCandidates: segmentCandidates,
+		})
+		flusher.Flush()
 	})
 
 	mux.HandleFunc("/api/discovery/scan", func(w http.ResponseWriter, r *http.Request) {
@@ -1142,17 +1201,37 @@ func joinMethods(methods []string) string {
 }
 
 func filterDiscoveryResults(ctx context.Context, inventory *store.Store, result discovery.ScanResult) ([]discovery.HostMatch, []discoverySegmentCandidate, error) {
-	devices, err := inventory.ListDevices(ctx)
+	filterState, err := loadDiscoveryFilterState(ctx, inventory)
 	if err != nil {
 		return nil, nil, err
+	}
+	for _, host := range result.Hosts {
+		filterState.shouldIncludeHost(host)
+	}
+	filteredHosts, segmentCandidates := filterState.finalize(result)
+	return filteredHosts, segmentCandidates, nil
+}
+
+type discoveryFilterState struct {
+	knownIPs        map[string]bool
+	knownMACs       map[string]bool
+	knownCIDRs      map[string]bool
+	filteredHosts   map[string]discovery.HostMatch
+	filteredHostIPs []string
+}
+
+func loadDiscoveryFilterState(ctx context.Context, inventory *store.Store) (*discoveryFilterState, error) {
+	devices, err := inventory.ListDevices(ctx)
+	if err != nil {
+		return nil, err
 	}
 	nodes, err := inventory.ListNetworkNodes(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	segments, err := inventory.ListNetworkSegments(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	knownIPs := map[string]bool{}
@@ -1166,28 +1245,52 @@ func filterDiscoveryResults(ctx context.Context, inventory *store.Store, result 
 		knownMACs[strings.ToUpper(strings.TrimSpace(node.MACAddress))] = true
 	}
 
-	filteredHosts := make([]discovery.HostMatch, 0, len(result.Hosts))
-	for _, host := range result.Hosts {
-		ip := strings.TrimSpace(host.IPAddress)
-		mac := strings.ToUpper(strings.TrimSpace(host.MACAddress))
-		if knownIPs[ip] {
-			continue
-		}
-		if mac != "" && knownMACs[mac] {
-			continue
-		}
-		filteredHosts = append(filteredHosts, host)
-	}
-
 	knownCIDRs := map[string]bool{}
 	for _, segment := range segments {
 		knownCIDRs[strings.TrimSpace(segment.CIDR)] = true
 	}
 
+	return &discoveryFilterState{
+		knownIPs:      knownIPs,
+		knownMACs:     knownMACs,
+		knownCIDRs:    knownCIDRs,
+		filteredHosts: map[string]discovery.HostMatch{},
+	}, nil
+}
+
+func (f *discoveryFilterState) shouldIncludeHost(host discovery.HostMatch) bool {
+	ip := strings.TrimSpace(host.IPAddress)
+	mac := strings.ToUpper(strings.TrimSpace(host.MACAddress))
+	if ip == "" {
+		return false
+	}
+	if f.knownIPs[ip] {
+		return false
+	}
+	if mac != "" && f.knownMACs[mac] {
+		return false
+	}
+	if _, exists := f.filteredHosts[ip]; !exists {
+		f.filteredHostIPs = append(f.filteredHostIPs, ip)
+	}
+	f.filteredHosts[ip] = host
+	return true
+}
+
+func (f *discoveryFilterState) finalize(result discovery.ScanResult) ([]discovery.HostMatch, []discoverySegmentCandidate) {
+	filteredHosts := make([]discovery.HostMatch, 0, len(f.filteredHostIPs))
+	for _, ip := range f.filteredHostIPs {
+		host, ok := f.filteredHosts[ip]
+		if !ok {
+			continue
+		}
+		filteredHosts = append(filteredHosts, host)
+	}
+
 	segmentCandidates := make([]discoverySegmentCandidate, 0, len(result.ScannedCIDRs))
 	for _, cidr := range result.ScannedCIDRs {
 		trimmed := strings.TrimSpace(cidr)
-		if trimmed == "" || knownCIDRs[trimmed] {
+		if trimmed == "" || f.knownCIDRs[trimmed] {
 			continue
 		}
 		segmentCandidates = append(segmentCandidates, discoverySegmentCandidate{
@@ -1196,5 +1299,5 @@ func filterDiscoveryResults(ctx context.Context, inventory *store.Store, result 
 		})
 	}
 
-	return filteredHosts, segmentCandidates, nil
+	return filteredHosts, segmentCandidates
 }

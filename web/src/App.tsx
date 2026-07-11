@@ -1371,70 +1371,103 @@ function ActionList({ actions }: { actions: Action[] }) {
 
 function DiscoveryResults({
   result,
+  isLoading,
   onCreateDevice,
   onCreateNode,
   onCreateSegment,
 }: {
   result: DiscoveryScanResult
+  isLoading: boolean
   onCreateDevice: (host: DiscoveryHostMatch) => void
   onCreateNode: (host: DiscoveryHostMatch) => void
   onCreateSegment: (candidate: { cidr: string; name: string }) => void
 }) {
+  const scannedCidrs = result.scannedCidrs ?? []
+  const segmentCandidates = result.segmentCandidates ?? []
+  const hosts = result.hosts ?? []
+
   return (
     <div className="discovery-results">
       <div className="form-note">
-        Scanned networks: {result.scannedCidrs.length > 0 ? result.scannedCidrs.join(', ') : result.cidr}
+        Scanned networks: {scannedCidrs.length > 0 ? scannedCidrs.join(', ') : result.cidr}
       </div>
-      {result.segmentCandidates.map((candidate) => (
-        <article key={candidate.cidr} className="inventory-row">
-          <div className="inventory-row__body">
-            <div className="inventory-row__header">
-              <strong>{candidate.name}</strong>
-            </div>
-            <p className="inventory-row__meta">
-              <span className="inventory-row__meta-label">CIDR</span>
-              <span className="inventory-row__meta-value">{candidate.cidr}</span>
-            </p>
+      {isLoading ? (
+        <div className="discovery-streaming-note" role="status" aria-live="polite">
+          <span className="refresh-spinner" aria-hidden="true" />
+          <span>Scanning network... Found {hosts.length} host{hosts.length === 1 ? '' : 's'} so far.</span>
+        </div>
+      ) : null}
+      {hosts.length === 0 && segmentCandidates.length === 0 ? <div className="empty-state">Empty</div> : null}
+      {segmentCandidates.length > 0 ? (
+        <div className="discovery-results__section">
+          <div className="discovery-results__heading">
+            <span className="section-label">Segments</span>
+            <span className="status-pill status-pill--mapped">{segmentCandidates.length} candidate{segmentCandidates.length === 1 ? '' : 's'}</span>
           </div>
-          <div className="inventory-row__actions inventory-row__actions--device">
-            <button type="button" className="action-button" onClick={() => onCreateSegment(candidate)}>
-              Create segment
-            </button>
+          <div className="inventory-list discovery-results__grid">
+            {segmentCandidates.map((candidate) => (
+              <article key={candidate.cidr} className="inventory-row discovery-card discovery-card--segment">
+                <div className="inventory-row__body">
+                  <div className="inventory-row__header">
+                    <strong>{candidate.name}</strong>
+                    <span className="status-pill status-pill--mapped">Segment</span>
+                  </div>
+                  <p className="inventory-row__meta">
+                    <span className="inventory-row__meta-label">CIDR</span>
+                    <span className="inventory-row__meta-value">{candidate.cidr}</span>
+                  </p>
+                </div>
+                <div className="inventory-row__actions inventory-row__actions--device">
+                  <button type="button" className="action-button" onClick={() => onCreateSegment(candidate)}>
+                    Create segment
+                  </button>
+                </div>
+              </article>
+            ))}
           </div>
-        </article>
-      ))}
+        </div>
+      ) : null}
 
-      {result.hosts.length === 0 && result.segmentCandidates.length === 0 ? <div className="empty-state">Empty</div> : null}
-
-      {result.hosts.map((host) => (
-        <article key={`${host.ipAddress}-${host.macAddress ?? ''}`} className="inventory-row">
-          <div className="inventory-row__body">
-            <div className="inventory-row__header">
-              <strong>{host.hostname || host.ipAddress}</strong>
-            </div>
-            <p className="inventory-row__meta">
-              <span className="inventory-row__meta-label">IP</span>
-              <span className="inventory-row__meta-value">{host.ipAddress}</span>
-            </p>
-            <p className="inventory-row__meta">
-              <span className="inventory-row__meta-label">MAC</span>
-              <span className="inventory-row__meta-value">{host.macAddress || 'Not resolved'}</span>
-            </p>
-            <p className="inventory-row__meta">
-              <span className="inventory-row__meta-label">VENDOR</span>
-              <span className="inventory-row__meta-value">{host.vendor || 'Unknown vendor'}</span>
-            </p>
+      {hosts.length > 0 ? (
+        <div className="discovery-results__section">
+          <div className="discovery-results__heading">
+            <span className="section-label">Hosts</span>
+            <span className="status-pill status-pill--online">{hosts.length} found</span>
           </div>
-          <div className="inventory-row__actions inventory-row__actions--device">
-            <button type="button" className="action-button" onClick={() => onCreateDevice(host)}>
-              Create device
-            </button>
-            <button type="button" className="action-button" onClick={() => onCreateNode(host)}>
-              Create node
-            </button>
+          <div className="inventory-list discovery-results__grid">
+            {hosts.map((host) => (
+              <article key={`${host.ipAddress}-${host.macAddress ?? ''}`} className="inventory-row discovery-card">
+                <div className="inventory-row__body">
+                  <div className="inventory-row__header">
+                    <strong>{host.hostname || host.ipAddress}</strong>
+                    <span className="status-pill status-pill--online">Discovered</span>
+                  </div>
+                  <p className="inventory-row__meta">
+                    <span className="inventory-row__meta-label">IP</span>
+                    <span className="inventory-row__meta-value">{host.ipAddress}</span>
+                  </p>
+                  <p className="inventory-row__meta">
+                    <span className="inventory-row__meta-label">MAC</span>
+                    <span className="inventory-row__meta-value">{host.macAddress || 'Not resolved'}</span>
+                  </p>
+                  <p className="inventory-row__meta">
+                    <span className="inventory-row__meta-label">VENDOR</span>
+                    <span className="inventory-row__meta-value">{host.vendor || 'Unknown vendor'}</span>
+                  </p>
+                </div>
+                <div className="inventory-row__actions inventory-row__actions--device">
+                  <button type="button" className="action-button" onClick={() => onCreateDevice(host)}>
+                    Create device
+                  </button>
+                  <button type="button" className="action-button" onClick={() => onCreateNode(host)}>
+                    Create node
+                  </button>
+                </div>
+              </article>
+            ))}
           </div>
-        </article>
-      ))}
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -1485,6 +1518,7 @@ export default function App() {
   const [discoveryState, setDiscoveryState] = useState<'idle' | 'loading'>('idle')
   const [discoveryError, setDiscoveryError] = useState<string | null>(null)
   const [discoveryResult, setDiscoveryResult] = useState<DiscoveryScanResult | null>(null)
+  const discoveryStreamRef = useRef<EventSource | null>(null)
 
   useEffect(() => {
     stateRef.current = state
@@ -1508,6 +1542,18 @@ export default function App() {
     const timeout = window.setTimeout(() => setToast(null), 5000)
     return () => window.clearTimeout(timeout)
   }, [toast])
+
+  useEffect(() => {
+    return () => discoveryStreamRef.current?.close()
+  }, [])
+
+  useEffect(() => {
+    if (isDiscoveryOpen) {
+      return
+    }
+    discoveryStreamRef.current?.close()
+    discoveryStreamRef.current = null
+  }, [isDiscoveryOpen])
 
   useEffect(() => {
     if (authState !== 'authenticated') {
@@ -1597,6 +1643,8 @@ export default function App() {
   }
 
   async function openDiscoveryModal() {
+    discoveryStreamRef.current?.close()
+    discoveryStreamRef.current = null
     setIsDiscoveryOpen(true)
     setDiscoveryError(null)
     setDiscoveryResult(null)
@@ -1622,25 +1670,75 @@ export default function App() {
       return
     }
 
+    discoveryStreamRef.current?.close()
+    discoveryStreamRef.current = null
+
+    const targetCIDR = discoveryCIDR.trim()
     setDiscoveryState('loading')
     setDiscoveryError(null)
-    setDiscoveryResult(null)
-    try {
-      const response = await authFetch('/api/discovery/scan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cidr: discoveryCIDR.trim() }),
+    setDiscoveryResult({
+      provider: 'nmap',
+      cidr: targetCIDR || 'auto',
+      scannedCidrs: [],
+      hosts: [],
+      segmentCandidates: [],
+    })
+
+    const query = targetCIDR ? `?cidr=${encodeURIComponent(targetCIDR)}` : ''
+    const source = new EventSource(`/api/discovery/scan/stream${query}`)
+    discoveryStreamRef.current = source
+
+    let finished = false
+
+    source.addEventListener('discovery-host', (event: MessageEvent<string>) => {
+      const host = JSON.parse(event.data) as DiscoveryHostMatch
+      setDiscoveryResult((current) => {
+        if (!current) {
+          return current
+        }
+        const hosts = [...current.hosts]
+        const index = hosts.findIndex((item) => item.ipAddress === host.ipAddress)
+        if (index === -1) {
+          hosts.push(host)
+        } else {
+          hosts[index] = host
+        }
+        return { ...current, hosts }
       })
-      if (!response.ok) {
-        const payload = (await response.json()) as { error?: string }
-        throw new Error(payload.error ?? `Discovery scan failed with status ${response.status}`)
-      }
-      const result = (await response.json()) as DiscoveryScanResult
+    })
+
+    source.addEventListener('discovery-complete', (event: MessageEvent<string>) => {
+      finished = true
+      const result = JSON.parse(event.data) as DiscoveryScanResult
       setDiscoveryResult(result)
-    } catch (error) {
-      setDiscoveryError(error instanceof Error ? error.message : 'Discovery scan failed')
-    } finally {
       setDiscoveryState('idle')
+      source.close()
+      if (discoveryStreamRef.current === source) {
+        discoveryStreamRef.current = null
+      }
+    })
+
+    source.addEventListener('discovery-error', (event: MessageEvent<string>) => {
+      finished = true
+      const payload = JSON.parse(event.data) as { error?: string }
+      setDiscoveryError(payload.error ?? 'Discovery scan failed')
+      setDiscoveryState('idle')
+      source.close()
+      if (discoveryStreamRef.current === source) {
+        discoveryStreamRef.current = null
+      }
+    })
+
+    source.onerror = () => {
+      if (finished) {
+        return
+      }
+      setDiscoveryError('Discovery scan failed')
+      setDiscoveryState('idle')
+      source.close()
+      if (discoveryStreamRef.current === source) {
+        discoveryStreamRef.current = null
+      }
     }
   }
 
@@ -2884,13 +2982,19 @@ export default function App() {
               </div>
             </div>
             <div className="discovery-modal__results">
-              {discoveryResult ? (
+              {discoveryResult && (discoveryState !== 'loading' || discoveryResult.hosts.length > 0 || discoveryResult.segmentCandidates.length > 0) ? (
                 <DiscoveryResults
                   result={discoveryResult}
+                  isLoading={discoveryState === 'loading'}
                   onCreateDevice={openCreateDeviceFromDiscovery}
                   onCreateNode={openCreateNodeFromDiscovery}
                   onCreateSegment={openCreateSegmentFromDiscovery}
                 />
+              ) : discoveryState === 'loading' ? (
+                <div className="discovery-loading-state" role="status" aria-live="polite">
+                  <span className="refresh-spinner" aria-hidden="true" />
+                  <span>Scanning network...</span>
+                </div>
               ) : (
                 <div className="empty-state">Empty</div>
               )}
