@@ -1,5 +1,10 @@
 import { type ReactNode, useEffect, useRef, useState } from 'react'
 import {
+  parseDiscoveryCompleteEvent,
+  parseDiscoveryErrorEvent,
+  parseDiscoveryHostEvent,
+} from './discovery-events'
+import {
   type Action,
   type DiscoveryCapabilities,
   type DiscoveryHostMatch,
@@ -1519,6 +1524,8 @@ export default function App() {
   const [discoveryError, setDiscoveryError] = useState<string | null>(null)
   const [discoveryResult, setDiscoveryResult] = useState<DiscoveryScanResult | null>(null)
   const discoveryStreamRef = useRef<EventSource | null>(null)
+  const discoveryRequestRef = useRef<AbortController | null>(null)
+  const discoveryGenerationRef = useRef(0)
 
   useEffect(() => {
     stateRef.current = state
@@ -1534,6 +1541,52 @@ export default function App() {
     return response
   }
 
+  function invalidateDiscoveryStream(): number {
+    discoveryGenerationRef.current += 1
+    discoveryRequestRef.current?.abort()
+    discoveryRequestRef.current = null
+    const source = discoveryStreamRef.current
+    discoveryStreamRef.current = null
+    source?.close()
+    return discoveryGenerationRef.current
+  }
+
+  function closeDiscoveryModal() {
+    invalidateDiscoveryStream()
+    setDiscoveryState('idle')
+    setIsDiscoveryOpen(false)
+  }
+
+  function expireDiscoverySession(generation: number) {
+    if (discoveryGenerationRef.current !== generation) {
+      return
+    }
+
+    invalidateDiscoveryStream()
+    setAuthState('unauthenticated')
+    setAuthUsername('')
+    setDiscoveryState('idle')
+    setDiscoveryError(null)
+    setIsDiscoveryOpen(false)
+    setToast({ kind: 'error', message: 'Session expired. Please sign in again.' })
+  }
+
+  async function hasValidDiscoverySession(signal: AbortSignal): Promise<boolean> {
+    const response = await fetch('/api/auth/session', { cache: 'no-store', signal })
+    if (response.status === 401) {
+      return false
+    }
+    if (!response.ok) {
+      throw new Error(`Session check failed with status ${response.status}`)
+    }
+
+    const payload = (await response.json()) as { enabled?: unknown; authenticated?: unknown }
+    if (typeof payload.enabled !== 'boolean' || typeof payload.authenticated !== 'boolean') {
+      throw new Error('Session check returned an invalid response')
+    }
+    return !payload.enabled || payload.authenticated
+  }
+
   useEffect(() => {
     if (!toast) {
       return
@@ -1544,16 +1597,27 @@ export default function App() {
   }, [toast])
 
   useEffect(() => {
-    return () => discoveryStreamRef.current?.close()
+    return () => {
+      discoveryGenerationRef.current += 1
+      discoveryRequestRef.current?.abort()
+      discoveryRequestRef.current = null
+      discoveryStreamRef.current?.close()
+      discoveryStreamRef.current = null
+    }
   }, [])
 
   useEffect(() => {
-    if (isDiscoveryOpen) {
+    if (authState !== 'unauthenticated') {
       return
     }
+    discoveryGenerationRef.current += 1
+    discoveryRequestRef.current?.abort()
+    discoveryRequestRef.current = null
     discoveryStreamRef.current?.close()
     discoveryStreamRef.current = null
-  }, [isDiscoveryOpen])
+    setDiscoveryState('idle')
+    setIsDiscoveryOpen(false)
+  }, [authState])
 
   useEffect(() => {
     if (authState !== 'authenticated') {
@@ -1643,24 +1707,40 @@ export default function App() {
   }
 
   async function openDiscoveryModal() {
-    discoveryStreamRef.current?.close()
-    discoveryStreamRef.current = null
+    const generation = invalidateDiscoveryStream()
+    const request = new AbortController()
+    discoveryRequestRef.current = request
     setIsDiscoveryOpen(true)
+    setDiscoveryCapabilities(null)
+    setDiscoveryCIDR('')
     setDiscoveryError(null)
     setDiscoveryResult(null)
     setDiscoveryState('loading')
     try {
-      const response = await authFetch('/api/discovery/capabilities')
+      const response = await authFetch('/api/discovery/capabilities', { signal: request.signal })
+      if (discoveryGenerationRef.current !== generation) {
+        return
+      }
       if (!response.ok) {
         throw new Error(`Discovery capabilities request failed with status ${response.status}`)
       }
       const capabilities = (await response.json()) as DiscoveryCapabilities
+      if (discoveryGenerationRef.current !== generation) {
+        return
+      }
       setDiscoveryCapabilities(capabilities)
-      setDiscoveryCIDR('')
     } catch (error) {
+      if (discoveryGenerationRef.current !== generation) {
+        return
+      }
       setDiscoveryError(error instanceof Error ? error.message : 'Failed to load discovery capabilities')
     } finally {
-      setDiscoveryState('idle')
+      if (discoveryRequestRef.current === request) {
+        discoveryRequestRef.current = null
+      }
+      if (discoveryGenerationRef.current === generation) {
+        setDiscoveryState('idle')
+      }
     }
   }
 
@@ -1670,8 +1750,9 @@ export default function App() {
       return
     }
 
-    discoveryStreamRef.current?.close()
-    discoveryStreamRef.current = null
+    const generation = invalidateDiscoveryStream()
+    const preflightRequest = new AbortController()
+    discoveryRequestRef.current = preflightRequest
 
     const targetCIDR = discoveryCIDR.trim()
     setDiscoveryState('loading')
@@ -1684,16 +1765,72 @@ export default function App() {
       segmentCandidates: [],
     })
 
+    try {
+      const sessionValid = await hasValidDiscoverySession(preflightRequest.signal)
+      if (discoveryGenerationRef.current !== generation) {
+        return
+      }
+      if (!sessionValid) {
+        expireDiscoverySession(generation)
+        return
+      }
+      if (discoveryRequestRef.current === preflightRequest) {
+        discoveryRequestRef.current = null
+      }
+    } catch (error) {
+      if (discoveryGenerationRef.current !== generation) {
+        return
+      }
+      setDiscoveryError(error instanceof Error ? error.message : 'Failed to verify the current session')
+      setDiscoveryState('idle')
+      return
+    } finally {
+      if (discoveryRequestRef.current === preflightRequest) {
+        discoveryRequestRef.current = null
+      }
+    }
+
     const query = targetCIDR ? `?cidr=${encodeURIComponent(targetCIDR)}` : ''
     const source = new EventSource(`/api/discovery/scan/stream${query}`)
     discoveryStreamRef.current = source
 
     let finished = false
 
+    const isCurrent = () =>
+      discoveryGenerationRef.current === generation && discoveryStreamRef.current === source
+
+    const detach = () => {
+      source.close()
+      if (discoveryStreamRef.current === source) {
+        discoveryStreamRef.current = null
+      }
+    }
+
+    const fail = (message: string) => {
+      if (!isCurrent()) {
+        return
+      }
+      finished = true
+      detach()
+      setDiscoveryError(message)
+      setDiscoveryState('idle')
+    }
+
     source.addEventListener('discovery-host', (event: MessageEvent<string>) => {
-      const host = JSON.parse(event.data) as DiscoveryHostMatch
+      if (!isCurrent()) {
+        return
+      }
+
+      let host: DiscoveryHostMatch
+      try {
+        host = parseDiscoveryHostEvent(event.data)
+      } catch (error) {
+        fail(error instanceof Error ? error.message : 'Discovery stream sent an invalid host update.')
+        return
+      }
+
       setDiscoveryResult((current) => {
-        if (!current) {
+        if (discoveryGenerationRef.current !== generation || !current) {
           return current
         }
         const hosts = [...current.hosts]
@@ -1708,37 +1845,77 @@ export default function App() {
     })
 
     source.addEventListener('discovery-complete', (event: MessageEvent<string>) => {
+      if (!isCurrent()) {
+        return
+      }
+
+      let result: DiscoveryScanResult
+      try {
+        result = parseDiscoveryCompleteEvent(event.data)
+      } catch (error) {
+        fail(error instanceof Error ? error.message : 'Discovery stream sent an invalid completion response.')
+        return
+      }
+
       finished = true
-      const result = JSON.parse(event.data) as DiscoveryScanResult
+      detach()
       setDiscoveryResult(result)
       setDiscoveryState('idle')
-      source.close()
-      if (discoveryStreamRef.current === source) {
-        discoveryStreamRef.current = null
-      }
     })
 
     source.addEventListener('discovery-error', (event: MessageEvent<string>) => {
-      finished = true
-      const payload = JSON.parse(event.data) as { error?: string }
-      setDiscoveryError(payload.error ?? 'Discovery scan failed')
-      setDiscoveryState('idle')
-      source.close()
-      if (discoveryStreamRef.current === source) {
-        discoveryStreamRef.current = null
+      if (!isCurrent()) {
+        return
       }
+
+      let message: string
+      try {
+        message = parseDiscoveryErrorEvent(event.data)
+      } catch (error) {
+        fail(error instanceof Error ? error.message : 'Discovery stream sent an invalid error response.')
+        return
+      }
+
+      finished = true
+      detach()
+      setDiscoveryError(message)
+      setDiscoveryState('idle')
     })
 
     source.onerror = () => {
-      if (finished) {
+      if (finished || !isCurrent()) {
         return
       }
-      setDiscoveryError('Discovery scan failed')
-      setDiscoveryState('idle')
-      source.close()
-      if (discoveryStreamRef.current === source) {
-        discoveryStreamRef.current = null
-      }
+      finished = true
+      detach()
+
+      void (async () => {
+        const sessionRequest = new AbortController()
+        discoveryRequestRef.current = sessionRequest
+        try {
+          const sessionValid = await hasValidDiscoverySession(sessionRequest.signal)
+          if (discoveryGenerationRef.current !== generation) {
+            return
+          }
+          if (!sessionValid) {
+            expireDiscoverySession(generation)
+            return
+          }
+        } catch {
+          if (discoveryGenerationRef.current !== generation) {
+            return
+          }
+        } finally {
+          if (discoveryRequestRef.current === sessionRequest) {
+            discoveryRequestRef.current = null
+          }
+        }
+
+        if (discoveryGenerationRef.current === generation) {
+          setDiscoveryError('Discovery scan failed')
+          setDiscoveryState('idle')
+        }
+      })()
     }
   }
 
@@ -2123,7 +2300,7 @@ export default function App() {
       ipAddress: host.ipAddress,
       macAddress: host.macAddress || '',
     })
-    setIsDiscoveryOpen(false)
+    closeDiscoveryModal()
     setIsCreateDeviceOpen(true)
   }
 
@@ -2217,7 +2394,7 @@ export default function App() {
       managementIp: host.ipAddress,
       vendor: host.vendor || '',
     })
-    setIsDiscoveryOpen(false)
+    closeDiscoveryModal()
     setIsNodeModalOpen(true)
   }
 
@@ -2326,7 +2503,7 @@ export default function App() {
       segmentType: 'lan',
       cidr: candidate.cidr,
     })
-    setIsDiscoveryOpen(false)
+    closeDiscoveryModal()
     setIsSegmentModalOpen(true)
   }
 
@@ -2507,6 +2684,11 @@ export default function App() {
       setActionsState('idle')
     }
   }
+
+  const discoveryCIDROptions =
+    (discoveryCapabilities?.suggestedCidrs.length ?? 0) > 0
+      ? discoveryCapabilities?.suggestedCidrs ?? []
+      : discoveryCapabilities?.localCidrs ?? []
 
   const content =
     authState === 'checking' ? (
@@ -2941,7 +3123,7 @@ export default function App() {
       ) : null}
 
       {isDiscoveryOpen ? (
-        <DraggableModal label="Discovery" title="Scan network" widthClassName="modal-panel--wide modal-panel--discovery" onClose={() => setIsDiscoveryOpen(false)}>
+        <DraggableModal label="Discovery" title="Scan network" widthClassName="modal-panel--wide modal-panel--discovery" onClose={closeDiscoveryModal}>
           <div className="discovery-modal">
             <div className="discovery-modal__controls">
               <div className="device-form">
@@ -2949,7 +3131,16 @@ export default function App() {
                 <div className="form-grid">
                   <label className="form-field">
                     <span>Provider</span>
-                    <input value={discoveryCapabilities?.nmapAvailable ? 'nmap' : 'Unavailable'} readOnly />
+                    <input
+                      value={
+                        !discoveryCapabilities && discoveryState === 'loading'
+                          ? 'Loading...'
+                          : discoveryCapabilities?.nmapAvailable
+                            ? 'nmap'
+                            : 'Unavailable'
+                      }
+                      readOnly
+                    />
                   </label>
                   <label className="form-field">
                     <span>Custom CIDR override</span>
@@ -2960,7 +3151,7 @@ export default function App() {
                       placeholder="Leave empty to scan local networks automatically"
                     />
                     <datalist id="discovery-cidrs">
-                      {(discoveryCapabilities?.suggestedCidrs ?? discoveryCapabilities?.localCidrs ?? []).map((cidr) => (
+                      {discoveryCIDROptions.map((cidr) => (
                         <option key={cidr} value={cidr} />
                       ))}
                     </datalist>
@@ -2976,7 +3167,11 @@ export default function App() {
                     onClick={() => void scanNetwork()}
                     disabled={discoveryState === 'loading' || !discoveryCapabilities?.nmapAvailable}
                   >
-                    {discoveryState === 'loading' ? 'Scanning...' : 'Run scan'}
+                    {discoveryState === 'loading'
+                      ? discoveryCapabilities
+                        ? 'Scanning...'
+                        : 'Loading...'
+                      : 'Run scan'}
                   </button>
                 </div>
               </div>
