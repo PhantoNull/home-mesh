@@ -58,7 +58,7 @@ func TestVerifyPasswordRejectsUntrustedArgon2Parameters(t *testing.T) {
 func TestNewAuthManagerFailsClosedWithoutSessionSecret(t *testing.T) {
 	t.Parallel()
 
-	if _, err := newAuthManager(config.Config{}, nil); err == nil {
+	if _, err := newAuthManager(config.Config{}, nil, newTestRequestMetadata(t)); err == nil {
 		t.Fatal("expected missing session secret to fail closed")
 	}
 }
@@ -66,7 +66,7 @@ func TestNewAuthManagerFailsClosedWithoutSessionSecret(t *testing.T) {
 func TestNewAuthManagerAllowsExplicitDisabledMode(t *testing.T) {
 	t.Parallel()
 
-	auth, err := newAuthManager(config.Config{AuthDisabled: true}, nil)
+	auth, err := newAuthManager(config.Config{AuthDisabled: true}, nil, newTestRequestMetadata(t))
 	if err != nil {
 		t.Fatalf("newAuthManager returned error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestNewAuthManagerAllowsExplicitDisabledMode(t *testing.T) {
 func TestNewAuthManagerRejectsShortSessionSecret(t *testing.T) {
 	t.Parallel()
 
-	_, err := newAuthManager(config.Config{SessionSecret: "too-short"}, nil)
+	_, err := newAuthManager(config.Config{SessionSecret: "too-short"}, nil, newTestRequestMetadata(t))
 	if err == nil {
 		t.Fatal("expected short session secret to be rejected")
 	}
@@ -197,27 +197,52 @@ func TestHandleLoginRateLimitRetryAfterTracksRemainingWindow(t *testing.T) {
 	}
 }
 
-func TestExtractClientIPUsesForwardedHeadersFromTrustedProxy(t *testing.T) {
+func TestClientIPResolvesForwardedChainFromRightToLeft(t *testing.T) {
 	t.Parallel()
 
+	requests := newTestRequestMetadata(t, "172.16.0.0/12")
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
-	req.RemoteAddr = "127.0.0.1:1234"
-	req.Header.Set("X-Forwarded-For", "203.0.113.10, 127.0.0.1")
+	req.RemoteAddr = "172.20.0.2:1234"
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, 172.18.0.8")
 
-	if got := extractClientIP(req); got != "203.0.113.10" {
+	if got := requests.clientIP(req); got != "203.0.113.10" {
 		t.Fatalf("got %q want %q", got, "203.0.113.10")
 	}
 }
 
-func TestExtractClientIPIgnoresForwardedHeadersFromUntrustedPeer(t *testing.T) {
+func TestClientIPIgnoresPrivatePeerOutsideTrustedCIDRs(t *testing.T) {
 	t.Parallel()
 
+	requests := newTestRequestMetadata(t, "172.16.0.0/12")
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
-	req.RemoteAddr = "198.51.100.7:1234"
+	req.RemoteAddr = "192.168.1.42:1234"
 	req.Header.Set("X-Forwarded-For", "203.0.113.10")
 
-	if got := extractClientIP(req); got != "198.51.100.7" {
-		t.Fatalf("got %q want %q", got, "198.51.100.7")
+	if got := requests.clientIP(req); got != "192.168.1.42" {
+		t.Fatalf("got %q want %q", got, "192.168.1.42")
+	}
+}
+
+func TestHandleLoginSetsSecureCookieForTrustedHTTPSProxy(t *testing.T) {
+	t.Parallel()
+
+	auth := newTestAuthManager(t)
+	req := newLoginRequest(t, "admin", "s3cret-pass")
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	recorder := httptest.NewRecorder()
+
+	auth.handleLogin(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("got %d want %d", recorder.Code, http.StatusOK)
+	}
+	cookies := recorder.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != sessionCookieName {
+		t.Fatalf("unexpected response cookies: %v", cookies)
+	}
+	if !cookies[0].Secure {
+		t.Fatal("expected session cookie to be Secure behind trusted HTTPS proxy")
 	}
 }
 
@@ -234,7 +259,18 @@ func newTestAuthManager(t *testing.T) *authManager {
 		account:       store.AdminAccount{Username: "admin", PasswordHash: hash},
 		sessionSecret: []byte("0123456789abcdef0123456789abcdef"),
 		loginLimiter:  newLoginRateLimiter(),
+		requests:      newTestRequestMetadata(t),
 	}
+}
+
+func newTestRequestMetadata(t *testing.T, cidrs ...string) *requestMetadata {
+	t.Helper()
+
+	requests, err := newRequestMetadata(cidrs)
+	if err != nil {
+		t.Fatalf("newRequestMetadata returned error: %v", err)
+	}
+	return requests
 }
 
 func newLoginRequest(t *testing.T, username string, password string) *http.Request {

@@ -35,6 +35,7 @@ type authManager struct {
 	account       store.AdminAccount
 	sessionSecret []byte
 	loginLimiter  *loginRateLimiter
+	requests      *requestMetadata
 }
 
 const (
@@ -161,9 +162,12 @@ const (
 	argon2KeyLen  = 32
 )
 
-func newAuthManager(cfg config.Config, inventory *store.Store) (*authManager, error) {
+func newAuthManager(cfg config.Config, inventory *store.Store, requests *requestMetadata) (*authManager, error) {
+	if requests == nil {
+		return nil, errors.New("request metadata policy is required")
+	}
 	if cfg.AuthDisabled {
-		return &authManager{enabled: false}, nil
+		return &authManager{enabled: false, requests: requests}, nil
 	}
 
 	sessionSecret := strings.TrimSpace(cfg.SessionSecret)
@@ -206,6 +210,7 @@ func newAuthManager(cfg config.Config, inventory *store.Store) (*authManager, er
 		account:       account,
 		sessionSecret: []byte(sessionSecret),
 		loginLimiter:  newLoginRateLimiter(),
+		requests:      requests,
 	}, nil
 }
 
@@ -244,7 +249,7 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientIP := extractClientIP(r)
+	clientIP := a.requests.clientIP(r)
 	if allowed, retryAfter := a.loginLimiter.allow(clientIP); !allowed {
 		retryAfterSeconds := int(retryAfter.Round(time.Second) / time.Second)
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
@@ -276,13 +281,14 @@ func (a *authManager) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #nosec G124 -- Secure is derived from direct TLS or a configured trusted proxy.
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    cookieValue,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
+		Secure:   a.requests.isSecureRequest(r),
 		Expires:  expiresAt,
 		MaxAge:   int(time.Until(expiresAt).Seconds()),
 	})
@@ -300,13 +306,14 @@ func (a *authManager) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #nosec G124 -- Secure is derived from direct TLS or a configured trusted proxy.
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
+		Secure:   a.requests.isSecureRequest(r),
 		Expires:  time.Unix(0, 0),
 		MaxAge:   -1,
 	})

@@ -108,7 +108,10 @@ Required values:
 - `HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD` with at least 12 bytes on first start
 - optionally `HOME_MESH_SCAN_INTERVAL`
 - optionally `HOME_MESH_SSH_HOST_KEY_MODE`
+- optionally `HOME_MESH_TRUSTED_PROXY_CIDRS` when running behind an explicit reverse proxy
 - optionally `HOME_MESH_NMAP_PATH`
+- optionally `HOME_MESH_DISCOVERY_ALLOW_PUBLIC` for an explicit, high-risk
+  public-range scan opt-in
 - optionally `HOME_MESH_WEB_PORT`
 
 Example:
@@ -117,10 +120,12 @@ Example:
 HOME_MESH_MASTER_KEY=replace-with-a-base64-encoded-32-byte-key
 HOME_MESH_SESSION_SECRET=replace-with-a-long-random-session-secret
 HOME_MESH_AUTH_DISABLED=false
+HOME_MESH_TRUSTED_PROXY_CIDRS=172.16.0.0/12
 HOME_MESH_BOOTSTRAP_ADMIN_USERNAME=root
 HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password-for-first-start-only
 HOME_MESH_SSH_HOST_KEY_MODE=known_hosts
 HOME_MESH_NMAP_PATH=nmap
+HOME_MESH_DISCOVERY_ALLOW_PUBLIC=false
 HOME_MESH_SCAN_INTERVAL=30s
 HOME_MESH_HTTP_ADDR=:8080
 HOME_MESH_WEB_PORT=3000
@@ -194,7 +199,8 @@ Current Docker layout:
   - frontend served by Nginx
   - proxies `/api` to the backend via `host.docker.internal:8080`
   - maps `host.docker.internal` through Docker's `host-gateway` on Linux
-  - forwards websocket and forwarded-host headers required by the SSH terminal and stricter origin checks
+  - preserves the canonical Host header and forwards controlled client/protocol
+    metadata required by SSH WebSockets, rate limiting, and origin checks
 
 Start the stack:
 
@@ -250,6 +256,12 @@ Behavior:
 - failed login attempts are rate-limited per client IP
 
 This protection applies server-side, so direct requests to the backend API are also blocked without a valid session.
+
+`HOME_MESH_TRUSTED_PROXY_CIDRS` is a comma-separated allowlist of reverse-proxy
+networks whose `X-Forwarded-For` and `X-Forwarded-Proto` headers may be trusted.
+Loopback is always trusted. Compose defaults this value to the Docker bridge range
+`172.16.0.0/12`; native deployments should leave it empty unless a known proxy is
+in front of the API, and should use the narrowest CIDRs practical.
 
 ### SSH Host Key Mode
 

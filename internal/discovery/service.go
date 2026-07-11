@@ -1,9 +1,9 @@
 package discovery
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -12,15 +12,26 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-var ErrNmapUnavailable = errors.New("nmap is not available")
+var (
+	ErrNmapUnavailable   = errors.New("nmap is not available")
+	ErrScanInProgress    = errors.New("discovery scan already in progress")
+	ErrNetworkNotAllowed = errors.New("discovery network is not private or link-local")
+)
 
-const discoveryBatchSize = 32
+type Options struct {
+	NmapPath            string
+	AllowPublicNetworks bool
+}
 
 type Service struct {
-	nmapPath string
+	nmapPath            string
+	allowPublicNetworks bool
+	scanning            atomic.Bool
+	commandContext      func(context.Context, string, ...string) *exec.Cmd
 }
 
 type Capabilities struct {
@@ -46,13 +57,46 @@ type HostMatch struct {
 	Tags       []string `json:"tags,omitempty"`
 }
 
+type nmapXMLHost struct {
+	Status    nmapXMLStatus    `xml:"status"`
+	Addresses []nmapXMLAddress `xml:"address"`
+	Hostnames nmapXMLHostnames `xml:"hostnames"`
+}
+
+type nmapXMLStatus struct {
+	State string `xml:"state,attr"`
+}
+
+type nmapXMLAddress struct {
+	Address string `xml:"addr,attr"`
+	Type    string `xml:"addrtype,attr"`
+	Vendor  string `xml:"vendor,attr"`
+}
+
+type nmapXMLHostnames struct {
+	Names []nmapXMLHostname `xml:"hostname"`
+}
+
+type nmapXMLHostname struct {
+	Name string `xml:"name,attr"`
+	Type string `xml:"type,attr"`
+}
+
 func NewService(nmapPath string) *Service {
-	path := strings.TrimSpace(nmapPath)
+	return NewServiceWithOptions(Options{NmapPath: nmapPath})
+}
+
+func NewServiceWithOptions(options Options) *Service {
+	path := strings.TrimSpace(options.NmapPath)
 	if path == "" {
 		path = "nmap"
 	}
 
-	return &Service{nmapPath: path}
+	return &Service{
+		nmapPath:            path,
+		allowPublicNetworks: options.AllowPublicNetworks,
+		commandContext:      exec.CommandContext,
+	}
 }
 
 func (s *Service) Capabilities() Capabilities {
@@ -88,10 +132,11 @@ func (s *Service) scanCIDR(ctx context.Context, cidr string, onHost func(HostMat
 	trimmedCIDR := strings.TrimSpace(cidr)
 	targetCIDRs := []string{}
 	if trimmedCIDR != "" {
-		if _, _, err := net.ParseCIDR(trimmedCIDR); err != nil {
+		canonicalCIDR, err := canonicalScanCIDR(trimmedCIDR, s.allowPublicNetworks)
+		if err != nil {
 			return ScanResult{}, fmt.Errorf("invalid CIDR: %w", err)
 		}
-		targetCIDRs = append(targetCIDRs, trimmedCIDR)
+		targetCIDRs = append(targetCIDRs, canonicalCIDR)
 	} else {
 		var err error
 		targetCIDRs, err = suggestedIPv4CIDRs()
@@ -101,7 +146,19 @@ func (s *Service) scanCIDR(ctx context.Context, cidr string, onHost func(HostMat
 		if len(targetCIDRs) == 0 {
 			return ScanResult{}, errors.New("no suitable local IPv4 networks were detected")
 		}
+		for index, targetCIDR := range targetCIDRs {
+			canonicalCIDR, err := canonicalScanCIDR(targetCIDR, s.allowPublicNetworks)
+			if err != nil {
+				return ScanResult{}, fmt.Errorf("unsupported detected network %s: %w", targetCIDR, err)
+			}
+			targetCIDRs[index] = canonicalCIDR
+		}
 	}
+
+	if !s.scanning.CompareAndSwap(false, true) {
+		return ScanResult{}, ErrScanInProgress
+	}
+	defer s.scanning.Store(false)
 
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -124,6 +181,8 @@ func (s *Service) scanCIDR(ctx context.Context, cidr string, onHost func(HostMat
 	displayCIDR := trimmedCIDR
 	if displayCIDR == "" {
 		displayCIDR = "auto"
+	} else {
+		displayCIDR = targetCIDRs[0]
 	}
 
 	return ScanResult{
@@ -134,53 +193,65 @@ func (s *Service) scanCIDR(ctx context.Context, cidr string, onHost func(HostMat
 	}, nil
 }
 
-func (s *Service) scanTargetCIDR(ctx context.Context, targetCIDR string, hostsByIP map[string]HostMatch, onHost func(HostMatch) error) error {
-	targets, err := expandIPv4Targets(targetCIDR)
+func canonicalScanCIDR(cidr string, allowPublicNetworks bool) (string, error) {
+	ip, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
 	if err != nil {
-		return fmt.Errorf("expand targets for %s: %w", targetCIDR, err)
+		return "", err
 	}
-	if len(targets) == 0 {
-		return nil
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return "", errors.New("only IPv4 CIDRs are supported")
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 32 {
+		return "", errors.New("only IPv4 CIDRs are supported")
+	}
+	if ones < 16 {
+		return "", errors.New("CIDR prefix must be /16 or more specific")
 	}
 
-	for _, batch := range chunkStrings(targets, discoveryBatchSize) {
-		if err := s.scanTargets(ctx, batch, targetCIDR, hostsByIP, onHost); err != nil {
-			return err
-		}
+	networkIP := ipv4.Mask(network.Mask)
+	canonicalCIDR := fmt.Sprintf("%s/%d", networkIP.String(), ones)
+	if !allowPublicNetworks && !isPrivateOrLinkLocalIPv4(networkIP) {
+		return "", fmt.Errorf("%w: %s", ErrNetworkNotAllowed, canonicalCIDR)
 	}
-
-	return nil
+	return canonicalCIDR, nil
 }
 
-func (s *Service) scanTargets(ctx context.Context, targets []string, targetLabel string, hostsByIP map[string]HostMatch, onHost func(HostMatch) error) error {
-	if len(targets) == 0 {
-		return nil
-	}
+func isPrivateOrLinkLocalIPv4(ip net.IP) bool {
+	ipv4 := ip.To4()
+	return ipv4 != nil && (ipv4.IsPrivate() || ipv4.IsLinkLocalUnicast())
+}
 
-	cmd := exec.CommandContext(
+func (s *Service) scanTargetCIDR(ctx context.Context, targetCIDR string, hostsByIP map[string]HostMatch, onHost func(HostMatch) error) error {
+	commandContext := s.commandContext
+	if commandContext == nil {
+		commandContext = exec.CommandContext
+	}
+	cmd := commandContext(
 		ctx,
 		s.nmapPath,
 		"-sn",
-		"-n",
-		"--disable-arp-ping",
 		"-PE",
 		"-PS22,80,443",
 		"-PA22,80,443",
 		"-PU53",
+		"-oX",
+		"-",
+		targetCIDR,
 	)
-	cmd.Args = append(cmd.Args, targets...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("nmap stdout pipe failed for %s: %w", targetLabel, err)
+		return fmt.Errorf("nmap stdout pipe failed for %s: %w", targetCIDR, err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("nmap stderr pipe failed for %s: %w", targetLabel, err)
+		return fmt.Errorf("nmap stderr pipe failed for %s: %w", targetCIDR, err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("nmap start failed for %s: %w", targetLabel, err)
+		return fmt.Errorf("nmap start failed for %s: %w", targetCIDR, err)
 	}
 
 	var stderrBuffer bytes.Buffer
@@ -190,20 +261,23 @@ func (s *Service) scanTargets(ctx context.Context, targets []string, targetLabel
 		_, _ = io.Copy(&stderrBuffer, stderr)
 	}()
 
-	emittedHosts := 0
 	emit := func(host HostMatch) error {
-		if strings.TrimSpace(host.IPAddress) == "" {
+		ipAddress := strings.TrimSpace(host.IPAddress)
+		if ipAddress == "" {
 			return nil
 		}
-		hostsByIP[host.IPAddress] = host
-		emittedHosts++
+		if existing, exists := hostsByIP[ipAddress]; exists {
+			hostsByIP[ipAddress] = mergeHostMatch(existing, host)
+			return nil
+		}
+		hostsByIP[ipAddress] = host
 		if onHost != nil {
 			return onHost(host)
 		}
 		return nil
 	}
 
-	if err := scanNmapPingStream(stdout, emit); err != nil {
+	if err := scanNmapXMLStream(stdout, emit); err != nil {
 		_ = cmd.Process.Kill()
 		<-stderrDone
 		_ = cmd.Wait()
@@ -211,13 +285,108 @@ func (s *Service) scanTargets(ctx context.Context, targets []string, targetLabel
 	}
 	<-stderrDone
 	if err := cmd.Wait(); err != nil {
-		if isIgnorableNmapExit(err, stderrBuffer.String(), emittedHosts) {
-			return nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("nmap scan canceled for %s: %w", targetCIDR, ctxErr)
 		}
-		return fmt.Errorf("nmap scan failed for %s: %w", targetLabel, err)
+		stderrText := strings.TrimSpace(stderrBuffer.String())
+		if stderrText != "" {
+			return fmt.Errorf("nmap scan failed for %s: %w: %s", targetCIDR, err, stderrText)
+		}
+		return fmt.Errorf("nmap scan failed for %s: %w", targetCIDR, err)
 	}
 
 	return nil
+}
+
+func scanNmapXMLStream(reader io.Reader, emit func(HostMatch) error) error {
+	decoder := xml.NewDecoder(reader)
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("parse nmap XML: %w", err)
+		}
+
+		start, ok := token.(xml.StartElement)
+		if !ok || start.Name.Local != "host" {
+			continue
+		}
+
+		var xmlHost nmapXMLHost
+		if err := decoder.DecodeElement(&xmlHost, &start); err != nil {
+			return fmt.Errorf("parse nmap XML host: %w", err)
+		}
+		host, ok := hostMatchFromXML(xmlHost)
+		if !ok {
+			continue
+		}
+		if err := emit(host); err != nil {
+			return err
+		}
+	}
+}
+
+func hostMatchFromXML(xmlHost nmapXMLHost) (HostMatch, bool) {
+	if !strings.EqualFold(strings.TrimSpace(xmlHost.Status.State), "up") {
+		return HostMatch{}, false
+	}
+
+	host := HostMatch{}
+	for _, address := range xmlHost.Addresses {
+		switch strings.ToLower(strings.TrimSpace(address.Type)) {
+		case "ipv4":
+			ipAddress := net.ParseIP(strings.TrimSpace(address.Address)).To4()
+			if ipAddress != nil {
+				host.IPAddress = ipAddress.String()
+			}
+		case "mac":
+			macAddress, err := net.ParseMAC(strings.TrimSpace(address.Address))
+			if err == nil && len(macAddress) == 6 {
+				host.MACAddress = strings.ToUpper(macAddress.String())
+				host.Vendor = strings.TrimSpace(address.Vendor)
+			}
+		}
+	}
+	if host.IPAddress == "" {
+		return HostMatch{}, false
+	}
+
+	for _, hostname := range xmlHost.Hostnames.Names {
+		name := strings.TrimSuffix(strings.TrimSpace(hostname.Name), ".")
+		if name == "" {
+			continue
+		}
+		if host.Hostname == "" {
+			host.Hostname = name
+		}
+		if strings.EqualFold(strings.TrimSpace(hostname.Type), "PTR") {
+			host.Hostname = name
+			break
+		}
+	}
+
+	return host, true
+}
+
+func mergeHostMatch(existing HostMatch, current HostMatch) HostMatch {
+	if current.Hostname == "" {
+		current.Hostname = existing.Hostname
+	}
+	if current.MACAddress == "" {
+		current.MACAddress = existing.MACAddress
+	}
+	if current.Vendor == "" {
+		current.Vendor = existing.Vendor
+	}
+	if len(current.OpenPorts) == 0 {
+		current.OpenPorts = existing.OpenPorts
+	}
+	if len(current.Tags) == 0 {
+		current.Tags = existing.Tags
+	}
+	return current
 }
 
 func (s *Service) hasNmap() bool {
@@ -261,15 +430,20 @@ func collectIPv4CIDRs(suggestedOnly bool) ([]string, error) {
 			if ipv4 == nil {
 				continue
 			}
-			if suggestedOnly && !ipv4.IsPrivate() {
-				continue
+			var cidr string
+			if suggestedOnly {
+				var valid bool
+				cidr, valid = suggestedIPv4CIDR(ipv4, ipNet.Mask)
+				if !valid {
+					continue
+				}
+			} else {
+				ones, bits := ipNet.Mask.Size()
+				if bits != 32 || ones <= 0 || ones > 30 {
+					continue
+				}
+				cidr = fmt.Sprintf("%s/%d", ipv4.Mask(ipNet.Mask).String(), ones)
 			}
-			networkIP := ipv4.Mask(ipNet.Mask)
-			ones, bits := ipNet.Mask.Size()
-			if bits != 32 || ones <= 0 || ones > 30 {
-				continue
-			}
-			cidr := fmt.Sprintf("%s/%d", networkIP.String(), ones)
 			if !seen[cidr] {
 				seen[cidr] = true
 				cidrs = append(cidrs, cidr)
@@ -279,6 +453,20 @@ func collectIPv4CIDRs(suggestedOnly bool) ([]string, error) {
 
 	sort.Strings(cidrs)
 	return cidrs, nil
+}
+
+func suggestedIPv4CIDR(ip net.IP, mask net.IPMask) (string, bool) {
+	ipv4 := ip.To4()
+	ones, bits := mask.Size()
+	if ipv4 == nil || bits != 32 || ones <= 0 || ones > 30 || !isPrivateOrLinkLocalIPv4(ipv4) {
+		return "", false
+	}
+
+	if ones < 24 {
+		ones = 24
+		mask = net.CIDRMask(ones, bits)
+	}
+	return fmt.Sprintf("%s/%d", ipv4.Mask(mask).String(), ones), true
 }
 
 func isSuggestedInterface(name string) bool {
@@ -329,171 +517,9 @@ func compareIPStrings(left string, right string) int {
 	return 0
 }
 
-func parseNmapPingScan(output []byte) []HostMatch {
-	hosts := make([]HostMatch, 0)
-	_ = scanNmapPingStream(bytes.NewReader(output), func(host HostMatch) error {
-		hosts = append(hosts, host)
-		return nil
-	})
-	return hosts
-}
-
-func scanNmapPingStream(reader io.Reader, emit func(HostMatch) error) error {
-	scanner := bufio.NewScanner(reader)
-	var current *HostMatch
-	currentUp := false
-
-	flush := func() error {
-		if current == nil || !currentUp || strings.TrimSpace(current.IPAddress) == "" {
-			current = nil
-			currentUp = false
-			return nil
-		}
-		host := *current
-		current = nil
-		currentUp = false
-		return emit(host)
-	}
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "Nmap scan report for ") {
-			if err := flush(); err != nil {
-				return err
-			}
-			target := strings.TrimPrefix(line, "Nmap scan report for ")
-			current = &HostMatch{}
-			if open := strings.LastIndex(target, "("); open != -1 && strings.HasSuffix(target, ")") {
-				current.Hostname = strings.TrimSpace(target[:open])
-				current.IPAddress = strings.TrimSuffix(strings.TrimPrefix(target[open:], "("), ")")
-			} else {
-				current.IPAddress = strings.TrimSpace(target)
-			}
-			continue
-		}
-		if current == nil {
-			continue
-		}
-		if strings.HasPrefix(line, "Host is up") {
-			currentUp = true
-			continue
-		}
-		if strings.HasPrefix(line, "MAC Address: ") {
-			macDetails := strings.TrimPrefix(line, "MAC Address: ")
-			parts := strings.SplitN(macDetails, " ", 2)
-			current.MACAddress = strings.TrimSpace(parts[0])
-			if len(parts) > 1 {
-				current.Vendor = strings.Trim(strings.TrimSpace(parts[1]), "()")
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return flush()
-}
-
 func DefaultNmapPath() string {
 	if runtime.GOOS == "windows" {
 		return "nmap.exe"
 	}
 	return "nmap"
-}
-
-func expandIPv4Targets(cidr string) ([]string, error) {
-	ip, network, err := net.ParseCIDR(strings.TrimSpace(cidr))
-	if err != nil {
-		return nil, err
-	}
-
-	start := ip.To4()
-	if start == nil {
-		return nil, errors.New("only IPv4 CIDRs are supported")
-	}
-
-	ones, bits := network.Mask.Size()
-	if bits != 32 {
-		return nil, errors.New("only IPv4 CIDRs are supported")
-	}
-	if ones < 16 {
-		return nil, errors.New("CIDR is too large; use /16 or smaller")
-	}
-
-	networkIP := network.IP.Mask(network.Mask).To4()
-	if networkIP == nil {
-		return nil, errors.New("invalid IPv4 network")
-	}
-
-	broadcast := make(net.IP, len(networkIP))
-	copy(broadcast, networkIP)
-	for i := range broadcast {
-		broadcast[i] |= ^network.Mask[i]
-	}
-
-	targets := make([]string, 0)
-	for current := append(net.IP(nil), networkIP...); compareIPStrings(current.String(), broadcast.String()) <= 0; incrementIPv4(current) {
-		target := current.String()
-		if target == networkIP.String() || target == broadcast.String() {
-			continue
-		}
-		targets = append(targets, target)
-	}
-
-	if len(targets) == 0 {
-		targets = append(targets, networkIP.String())
-	}
-
-	return targets, nil
-}
-
-func incrementIPv4(ip net.IP) {
-	for i := len(ip) - 1; i >= 0; i-- {
-		ip[i]++
-		if ip[i] != 0 {
-			return
-		}
-	}
-}
-
-func chunkStrings(values []string, size int) [][]string {
-	if size <= 0 || len(values) == 0 {
-		return nil
-	}
-
-	chunks := make([][]string, 0, (len(values)+size-1)/size)
-	for start := 0; start < len(values); start += size {
-		end := start + size
-		if end > len(values) {
-			end = len(values)
-		}
-		chunks = append(chunks, values[start:end])
-	}
-	return chunks
-}
-
-func isIgnorableNmapExit(err error, stderr string, emittedHosts int) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		return false
-	}
-	if exitErr.ExitCode() != 1 {
-		return false
-	}
-
-	trimmedStderr := strings.TrimSpace(stderr)
-	if trimmedStderr != "" {
-		return false
-	}
-
-	return true
 }

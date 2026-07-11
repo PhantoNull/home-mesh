@@ -18,7 +18,7 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 			return
 		}
 
-		flusher, ok := w.(http.Flusher)
+		_, ok := w.(http.Flusher)
 		if !ok {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming not supported"})
 			return
@@ -31,8 +31,12 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 		id, events := bus.Subscribe()
 		defer bus.Unsubscribe(id)
 
-		writeSSEComment(w, "connected")
-		flusher.Flush()
+		if err := writeSSEComment(w, "connected"); err != nil {
+			return
+		}
+		if err := flushSSE(w); err != nil {
+			return
+		}
 
 		heartbeat := time.NewTicker(sseHeartbeatInterval)
 		defer heartbeat.Stop()
@@ -46,29 +50,43 @@ func handleSSE(bus *monitor.EventBus) http.HandlerFunc {
 				if !ok {
 					return
 				}
-				writeSSEEvent(w, event)
-				flusher.Flush()
+				if err := writeSSEEvent(w, event); err != nil {
+					return
+				}
+				if err := flushSSE(w); err != nil {
+					return
+				}
 
 			case <-heartbeat.C:
-				writeSSEComment(w, "heartbeat")
-				flusher.Flush()
+				if err := writeSSEComment(w, "heartbeat"); err != nil {
+					return
+				}
+				if err := flushSSE(w); err != nil {
+					return
+				}
 			}
 		}
 	}
 }
 
-func writeSSEEvent(w http.ResponseWriter, event monitor.ScanEvent) {
-	writeSSEJSONEvent(w, "scan", event)
+func writeSSEEvent(w http.ResponseWriter, event monitor.ScanEvent) error {
+	return writeSSEJSONEvent(w, "scan", event)
 }
 
-func writeSSEJSONEvent(w http.ResponseWriter, eventName string, payload any) {
+func writeSSEJSONEvent(w http.ResponseWriter, eventName string, payload any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return err
 	}
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, data)
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventName, data)
+	return err
 }
 
-func writeSSEComment(w http.ResponseWriter, comment string) {
-	fmt.Fprintf(w, ": %s\n\n", comment)
+func writeSSEComment(w http.ResponseWriter, comment string) error {
+	_, err := fmt.Fprintf(w, ": %s\n\n", comment)
+	return err
+}
+
+func flushSSE(w http.ResponseWriter) error {
+	return http.NewResponseController(w).Flush()
 }

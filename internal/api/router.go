@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -81,12 +82,25 @@ type discoverySegmentCandidate struct {
 	Name string `json:"name"`
 }
 
-func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService *discovery.Service, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
+type discoveryScanner interface {
+	Capabilities() discovery.Capabilities
+	ScanCIDR(context.Context, string) (discovery.ScanResult, error)
+	ScanCIDRStream(context.Context, string, func(discovery.HostMatch) error) (discovery.ScanResult, error)
+}
+
+var errSSETransport = errors.New("sse transport failure")
+
+func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
+	requests, err := newRequestMetadata(cfg.TrustedProxyCIDRs)
+	if err != nil {
+		return nil, err
+	}
+
 	mux := http.NewServeMux()
 	upgrader := websocket.Upgrader{
-		CheckOrigin: checkWebSocketOrigin,
+		CheckOrigin: requests.checkWebSocketOrigin,
 	}
-	auth, err := newAuthManager(cfg, inventory)
+	auth, err := newAuthManager(cfg, inventory, requests)
 	if err != nil {
 		return nil, err
 	}
@@ -159,96 +173,8 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		writeJSON(w, http.StatusOK, discoveryService.Capabilities())
 	})
 
-	mux.HandleFunc("/api/discovery/scan/stream", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			methodNotAllowed(w, http.MethodGet)
-			return
-		}
-
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming not supported"})
-			return
-		}
-
-		filterState, err := loadDiscoveryFilterState(r.Context(), inventory)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load discovery filter state"})
-			return
-		}
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Accel-Buffering", "no")
-
-		writeSSEComment(w, "connected")
-		flusher.Flush()
-
-		result, err := discoveryService.ScanCIDRStream(r.Context(), strings.TrimSpace(r.URL.Query().Get("cidr")), func(host discovery.HostMatch) error {
-			if !filterState.shouldIncludeHost(host) {
-				return nil
-			}
-			writeSSEJSONEvent(w, "discovery-host", host)
-			flusher.Flush()
-			return nil
-		})
-		if errors.Is(err, discovery.ErrNmapUnavailable) {
-			writeSSEJSONEvent(w, "discovery-error", discoveryStreamError{Error: "nmap is not available in the current runtime"})
-			flusher.Flush()
-			return
-		}
-		if err != nil {
-			writeSSEJSONEvent(w, "discovery-error", discoveryStreamError{Error: err.Error()})
-			flusher.Flush()
-			return
-		}
-
-		filteredHosts, segmentCandidates := filterState.finalize(result)
-		writeSSEJSONEvent(w, "discovery-complete", discoveryScanResponse{
-			Provider:          result.Provider,
-			CIDR:              result.CIDR,
-			ScannedCIDRs:      result.ScannedCIDRs,
-			Hosts:             filteredHosts,
-			SegmentCandidates: segmentCandidates,
-		})
-		flusher.Flush()
-	})
-
-	mux.HandleFunc("/api/discovery/scan", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			methodNotAllowed(w, http.MethodPost)
-			return
-		}
-
-		var payload discoveryScanPayload
-		if err := decodeJSON(r, &payload); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid discovery payload"})
-			return
-		}
-		result, err := discoveryService.ScanCIDR(r.Context(), payload.CIDR)
-		if errors.Is(err, discovery.ErrNmapUnavailable) {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "nmap is not available in the current runtime"})
-			return
-		}
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-			return
-		}
-
-		filteredHosts, segmentCandidates, err := filterDiscoveryResults(r.Context(), inventory, result)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to compare discovery results with inventory"})
-			return
-		}
-
-		writeJSON(w, http.StatusOK, discoveryScanResponse{
-			Provider:          result.Provider,
-			CIDR:              result.CIDR,
-			ScannedCIDRs:      result.ScannedCIDRs,
-			Hosts:             filteredHosts,
-			SegmentCandidates: segmentCandidates,
-		})
-	})
+	mux.HandleFunc("/api/discovery/scan/stream", handleDiscoveryScanStream(inventory, discoveryService))
+	mux.HandleFunc("/api/discovery/scan", handleDiscoveryScan(inventory, discoveryService))
 
 	mux.HandleFunc("/api/devices/refresh", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -990,17 +916,144 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		})
 	})
 
-	return withCORS(auth.middleware(mux)), nil
+	return withOriginPolicy(requests, auth.middleware(mux)), nil
 }
 
-func withCORS(next http.Handler) http.Handler {
+func handleDiscoveryScanStream(inventory *store.Store, discoveryService discoveryScanner) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+
+		if _, ok := w.(http.Flusher); !ok {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming not supported"})
+			return
+		}
+
+		filterState, err := loadDiscoveryFilterState(r.Context(), inventory)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load discovery filter state"})
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		if err := writeSSEComment(w, "connected"); err != nil {
+			return
+		}
+		if err := flushSSE(w); err != nil {
+			return
+		}
+
+		result, err := discoveryService.ScanCIDRStream(r.Context(), strings.TrimSpace(r.URL.Query().Get("cidr")), func(host discovery.HostMatch) error {
+			if ctxErr := r.Context().Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if !filterState.shouldIncludeHost(host) {
+				return nil
+			}
+			return writeAndFlushSSEJSON(w, "discovery-host", host)
+		})
+		if err != nil {
+			if r.Context().Err() != nil || errors.Is(err, errSSETransport) {
+				return
+			}
+
+			message := err.Error()
+			switch {
+			case errors.Is(err, discovery.ErrScanInProgress):
+				message = "a discovery scan is already in progress"
+			case errors.Is(err, discovery.ErrNmapUnavailable):
+				message = "nmap is not available in the current runtime"
+			case errors.Is(err, context.DeadlineExceeded):
+				message = "discovery scan timed out"
+			}
+			_ = writeAndFlushSSEJSON(w, "discovery-error", discoveryStreamError{Error: message})
+			return
+		}
+
+		filteredHosts, segmentCandidates := filterState.finalize(result)
+		_ = writeAndFlushSSEJSON(w, "discovery-complete", discoveryScanResponse{
+			Provider:          result.Provider,
+			CIDR:              result.CIDR,
+			ScannedCIDRs:      result.ScannedCIDRs,
+			Hosts:             filteredHosts,
+			SegmentCandidates: segmentCandidates,
+		})
+	}
+}
+
+func handleDiscoveryScan(inventory *store.Store, discoveryService discoveryScanner) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+
+		var payload discoveryScanPayload
+		if err := decodeJSON(r, &payload); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid discovery payload"})
+			return
+		}
+		result, err := discoveryService.ScanCIDR(r.Context(), payload.CIDR)
+		if errors.Is(err, discovery.ErrScanInProgress) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "a discovery scan is already in progress"})
+			return
+		}
+		if errors.Is(err, discovery.ErrNmapUnavailable) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "nmap is not available in the current runtime"})
+			return
+		}
+		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+
+		filteredHosts, segmentCandidates, err := filterDiscoveryResults(r.Context(), inventory, result)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to compare discovery results with inventory"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, discoveryScanResponse{
+			Provider:          result.Provider,
+			CIDR:              result.CIDR,
+			ScannedCIDRs:      result.ScannedCIDRs,
+			Hosts:             filteredHosts,
+			SegmentCandidates: segmentCandidates,
+		})
+	}
+}
+
+func writeAndFlushSSEJSON(w http.ResponseWriter, eventName string, payload any) error {
+	if err := writeSSEJSONEvent(w, eventName, payload); err != nil {
+		return fmt.Errorf("%w: write event: %v", errSSETransport, err)
+	}
+	if err := flushSSE(w); err != nil {
+		return fmt.Errorf("%w: flush event: %v", errSSETransport, err)
+	}
+	return nil
+}
+
+func withOriginPolicy(requests *requestMetadata, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" && isSameOrigin(effectiveRequestHost(r), origin) {
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" {
+			w.Header().Add("Vary", "Origin")
+			if !requests.isSameOrigin(r, origin) {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin request forbidden"})
+				return
+			}
+
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-			w.Header().Add("Vary", "Origin")
 		}
 
 		if r.Method == http.MethodOptions {
@@ -1012,17 +1065,26 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
-func isSameOrigin(host string, origin string) bool {
-	if host == "" || origin == "" {
+func (m *requestMetadata) isSameOrigin(r *http.Request, origin string) bool {
+	return isSameOrigin(m.effectiveScheme(r), r.Host, origin)
+}
+
+func isSameOrigin(requestScheme string, requestHost string, origin string) bool {
+	requestScheme = strings.ToLower(strings.TrimSpace(requestScheme))
+	if defaultOriginPort(requestScheme) == "" || requestHost == "" || origin == "" {
 		return false
 	}
 
 	parsedOrigin, err := url.Parse(origin)
-	if err != nil || parsedOrigin.Host == "" {
+	if err != nil || parsedOrigin.Host == "" || parsedOrigin.User != nil || parsedOrigin.RawQuery != "" || parsedOrigin.Fragment != "" || (parsedOrigin.Path != "" && parsedOrigin.Path != "/") {
+		return false
+	}
+	originScheme := strings.ToLower(parsedOrigin.Scheme)
+	if defaultOriginPort(originScheme) == "" || originScheme != requestScheme {
 		return false
 	}
 
-	requestHost, requestPort, ok := splitHostPort(host)
+	requestHostname, requestPort, ok := splitHostPort(requestHost)
 	if !ok {
 		return false
 	}
@@ -1033,21 +1095,21 @@ func isSameOrigin(host string, origin string) bool {
 	}
 
 	if requestPort == "" {
-		requestPort = defaultOriginPort(parsedOrigin.Scheme)
+		requestPort = defaultOriginPort(requestScheme)
 	}
 	if originPort == "" {
-		originPort = defaultOriginPort(parsedOrigin.Scheme)
+		originPort = defaultOriginPort(originScheme)
 	}
 
-	return strings.EqualFold(requestHost, originHost) && requestPort == originPort
+	return strings.EqualFold(requestHostname, originHost) && requestPort == originPort
 }
 
-func checkWebSocketOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
+func (m *requestMetadata) checkWebSocketOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
 		return true
 	}
-	return isSameOrigin(effectiveRequestHost(r), origin)
+	return m.isSameOrigin(r, origin)
 }
 
 func splitHostPort(hostport string) (string, string, bool) {

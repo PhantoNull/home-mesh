@@ -27,3 +27,27 @@ func TestLoadUsesStrictSSHHostKeyVerificationByDefault(t *testing.T) {
 		t.Fatalf("SSH host key mode %q want known_hosts", cfg.SSHHostKeyMode)
 	}
 }
+
+func TestLoadTrustedProxyCIDRs(t *testing.T) {
+	t.Setenv("HOME_MESH_TRUSTED_PROXY_CIDRS", " 172.16.0.0/12, 2001:db8::/32 ,, ")
+
+	cfg := Load()
+	if len(cfg.TrustedProxyCIDRs) != 2 {
+		t.Fatalf("got %v want two trusted proxy CIDRs", cfg.TrustedProxyCIDRs)
+	}
+	if cfg.TrustedProxyCIDRs[0] != "172.16.0.0/12" || cfg.TrustedProxyCIDRs[1] != "2001:db8::/32" {
+		t.Fatalf("unexpected trusted proxy CIDRs: %v", cfg.TrustedProxyCIDRs)
+	}
+}
+
+func TestLoadDiscoveryPublicNetworksRequireExplicitOptIn(t *testing.T) {
+	t.Setenv("HOME_MESH_DISCOVERY_ALLOW_PUBLIC", "true")
+	if cfg := Load(); !cfg.DiscoveryAllowPublic {
+		t.Fatal("expected explicit public discovery opt-in")
+	}
+
+	t.Setenv("HOME_MESH_DISCOVERY_ALLOW_PUBLIC", "invalid")
+	if cfg := Load(); cfg.DiscoveryAllowPublic {
+		t.Fatal("invalid public discovery value must fail closed")
+	}
+}

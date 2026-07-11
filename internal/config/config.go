@@ -12,11 +12,13 @@ type Config struct {
 	Env                    string
 	DBPath                 string
 	NmapPath               string
+	DiscoveryAllowPublic   bool
 	MasterKeyBase          string
 	SSHHostKeyMode         string
 	KnownHostsPath         string
 	SessionSecret          string
 	AuthDisabled           bool
+	TrustedProxyCIDRs      []string
 	BootstrapAdminUsername string
 	BootstrapAdminPassword string
 	ScanInterval           time.Duration
@@ -29,15 +31,27 @@ func Load() Config {
 		Env:                    getEnv("HOME_MESH_ENV", "development"),
 		DBPath:                 getEnv("HOME_MESH_DB_PATH", "data/home-mesh.db"),
 		NmapPath:               getEnv("HOME_MESH_NMAP_PATH", defaultNmapPath()),
+		DiscoveryAllowPublic:   explicitTrue("HOME_MESH_DISCOVERY_ALLOW_PUBLIC"),
 		MasterKeyBase:          getEnv("HOME_MESH_MASTER_KEY", ""),
 		SSHHostKeyMode:         getEnv("HOME_MESH_SSH_HOST_KEY_MODE", defaultSSHHostKeyMode()),
 		KnownHostsPath:         getEnv("HOME_MESH_SSH_KNOWN_HOSTS_PATH", defaultKnownHostsPath()),
 		SessionSecret:          getEnv("HOME_MESH_SESSION_SECRET", ""),
 		AuthDisabled:           explicitTrue("HOME_MESH_AUTH_DISABLED"),
+		TrustedProxyCIDRs:      commaSeparatedValues(os.Getenv("HOME_MESH_TRUSTED_PROXY_CIDRS")),
 		BootstrapAdminUsername: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_USERNAME", "root"),
 		BootstrapAdminPassword: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD", ""),
 		ScanInterval:           parseDuration(getEnv("HOME_MESH_SCAN_INTERVAL", "30s")),
 	}
+}
+
+func commaSeparatedValues(value string) []string {
+	var values []string
+	for _, part := range strings.Split(value, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			values = append(values, trimmed)
+		}
+	}
+	return values
 }
 
 func explicitTrue(key string) bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os/signal"
 	"syscall"
@@ -32,7 +33,10 @@ func main() {
 
 	bus := monitor.NewEventBus()
 	refresher := monitor.NewRefresher(inventory, bus)
-	discoveryService := discovery.NewService(cfg.NmapPath)
+	discoveryService := discovery.NewServiceWithOptions(discovery.Options{
+		NmapPath:            cfg.NmapPath,
+		AllowPublicNetworks: cfg.DiscoveryAllowPublic,
+	})
 	secretService, err := secrets.New(cfg.MasterKeyBase)
 	if err != nil && err != secrets.ErrUnavailable {
 		log.Fatal(err)
@@ -47,17 +51,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	server := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           router,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	server := newHTTPServer(cfg.HTTPAddr, router, ctx)
 
 	log.Printf("background refresh configured: interval=%s nmap_enabled=%t", cfg.ScanInterval, refresher.UsingNmap())
 	go refresher.RunBackground(ctx, cfg.ScanInterval)
@@ -80,4 +76,19 @@ func main() {
 	}
 
 	log.Println("server stopped")
+}
+
+func newHTTPServer(address string, handler http.Handler, baseContext context.Context) *http.Server {
+	return &http.Server{
+		Addr:    address,
+		Handler: handler,
+		BaseContext: func(net.Listener) context.Context {
+			return baseContext
+		},
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		// Streaming handlers own their write lifecycle and detect failed flushes.
+		WriteTimeout: 0,
+		IdleTimeout:  120 * time.Second,
+	}
 }
