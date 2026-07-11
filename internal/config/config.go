@@ -27,6 +27,7 @@ type Config struct {
 	SessionDuration        time.Duration
 	AuthDisabled           bool
 	TrustedProxyCIDRs      []string
+	AllowedHosts           []string
 	BootstrapAdminUsername string
 	BootstrapAdminPassword string
 	ScanInterval           time.Duration
@@ -89,6 +90,7 @@ func Load() (Config, error) {
 		SessionDuration:        sessionDuration,
 		AuthDisabled:           authDisabled,
 		TrustedProxyCIDRs:      trustedProxyCIDRs,
+		AllowedHosts:           commaSeparatedValues(os.Getenv("HOME_MESH_ALLOWED_HOSTS")),
 		BootstrapAdminUsername: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_USERNAME", "root"),
 		BootstrapAdminPassword: getEnv("HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD", ""),
 		ScanInterval:           scanInterval,

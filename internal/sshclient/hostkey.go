@@ -1,6 +1,7 @@
 package sshclient
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -9,18 +10,30 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
+var ErrHostKeyTrustUnavailable = errors.New("SSH host-key trust unavailable")
+
 func HostKeyCallback(mode string, knownHostsPath string) (ssh.HostKeyCallback, error) {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "", "known_hosts":
 		if strings.TrimSpace(knownHostsPath) == "" {
-			return nil, fmt.Errorf("known_hosts path is required when ssh host key mode is known_hosts")
+			return nil, fmt.Errorf("%w: known_hosts path is required", ErrHostKeyTrustUnavailable)
 		}
-		if _, err := os.Stat(knownHostsPath); err != nil {
-			return nil, fmt.Errorf("open known_hosts file: %w", err)
+		info, err := os.Lstat(knownHostsPath)
+		if err != nil {
+			return nil, fmt.Errorf("%w: open known_hosts file: %v", ErrHostKeyTrustUnavailable, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("%w: known_hosts file must not be a symbolic link", ErrHostKeyTrustUnavailable)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("%w: known_hosts path must be a regular file", ErrHostKeyTrustUnavailable)
+		}
+		if err := validateKnownHostsPermissions(info); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrHostKeyTrustUnavailable, err)
 		}
 		callback, err := knownhosts.New(knownHostsPath)
 		if err != nil {
-			return nil, fmt.Errorf("load known_hosts: %w", err)
+			return nil, fmt.Errorf("%w: load known_hosts: %v", ErrHostKeyTrustUnavailable, err)
 		}
 		return callback, nil
 	default:

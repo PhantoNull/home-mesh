@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PhantoNull/home-mesh/internal/networkscan"
 	"github.com/PhantoNull/home-mesh/internal/store"
 )
 
@@ -53,7 +54,8 @@ type RefreshResult struct {
 }
 
 type RefresherOptions struct {
-	NmapPath string
+	NmapPath    string
+	Coordinator *networkscan.Coordinator
 }
 
 type nmapScanFunc func(context.Context, string, []string, []int) (map[string]nmapScanResult, error)
@@ -67,12 +69,12 @@ type probeSet struct {
 }
 
 type Refresher struct {
-	store    *store.Store
-	bus      *EventBus
-	nmapPath string
-	scanGate chan struct{}
-	nmapScan nmapScanFunc
-	probes   probeSet
+	store       *store.Store
+	bus         *EventBus
+	nmapPath    string
+	coordinator *networkscan.Coordinator
+	nmapScan    nmapScanFunc
+	probes      probeSet
 }
 
 type nmapExecutionError struct {
@@ -96,13 +98,17 @@ func NewRefresherWithOptions(inventory *store.Store, bus *EventBus, options Refr
 	if bus == nil {
 		bus = NewEventBus()
 	}
+	coordinator := options.Coordinator
+	if coordinator == nil {
+		coordinator = networkscan.NewCoordinator()
+	}
 
 	return &Refresher{
-		store:    inventory,
-		bus:      bus,
-		nmapPath: path,
-		scanGate: make(chan struct{}, 1),
-		nmapScan: nmapScan,
+		store:       inventory,
+		bus:         bus,
+		nmapPath:    path,
+		coordinator: coordinator,
+		nmapScan:    nmapScan,
 		probes: probeSet{
 			resolveIPv4:   resolveIPv4,
 			reverseLookup: reverseLookup,
@@ -165,11 +171,23 @@ func (r *Refresher) scanAndPublish(ctx context.Context) {
 		return
 	}
 
+	deviceVersions := make(map[string]int64, len(devices))
+	for _, device := range devices {
+		deviceVersions[device.ID] = device.Version
+	}
 	for _, device := range result.Devices {
-		r.bus.publishJSON(EventDeviceUpdate, device)
+		if device.Version != deviceVersions[device.ID] {
+			r.bus.publishJSON(EventDeviceUpdate, device)
+		}
+	}
+	nodeVersions := make(map[string]int64, len(nodes))
+	for _, node := range nodes {
+		nodeVersions[node.ID] = node.Version
 	}
 	for _, node := range result.NetworkNodes {
-		r.bus.publishJSON(EventNodeUpdate, node)
+		if node.Version != nodeVersions[node.ID] {
+			r.bus.publishJSON(EventNodeUpdate, node)
+		}
 	}
 	r.bus.publishJSON(EventScanComplete, map[string]any{
 		"checked": result.Summary.Checked, "updated": result.Summary.Updated,
@@ -186,12 +204,7 @@ func (r *Refresher) scanAndPublish(ctx context.Context) {
 }
 
 func (r *Refresher) acquireScan(ctx context.Context) (func(), error) {
-	select {
-	case r.scanGate <- struct{}{}:
-		return func() { <-r.scanGate }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return r.coordinator.Acquire(ctx)
 }
 
 func (r *Refresher) loadInventory(ctx context.Context) ([]store.Device, []store.NetworkNode, error) {
@@ -610,11 +623,13 @@ func (r *Refresher) RefreshDeviceSnapshotByID(ctx context.Context, id string) (s
 	if err != nil {
 		return store.Device{}, err
 	}
-	refreshed, _, _, _, err := r.refreshDevice(ctx, device)
+	refreshed, updated, _, _, err := r.refreshDevice(ctx, device)
 	if err != nil {
 		return store.Device{}, err
 	}
-	r.bus.publishJSON(EventDeviceUpdate, refreshed)
+	if updated {
+		r.bus.publishJSON(EventDeviceUpdate, refreshed)
+	}
 	return refreshed, nil
 }
 
@@ -629,11 +644,13 @@ func (r *Refresher) RefreshNetworkNodeSnapshotByID(ctx context.Context, id strin
 	if err != nil {
 		return store.NetworkNode{}, err
 	}
-	refreshed, _, _, _, err := r.refreshNetworkNode(ctx, node)
+	refreshed, updated, _, _, err := r.refreshNetworkNode(ctx, node)
 	if err != nil {
 		return store.NetworkNode{}, err
 	}
-	r.bus.publishJSON(EventNodeUpdate, refreshed)
+	if updated {
+		r.bus.publishJSON(EventNodeUpdate, refreshed)
+	}
 	return refreshed, nil
 }
 

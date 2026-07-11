@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PhantoNull/home-mesh/internal/networkscan"
 	"github.com/PhantoNull/home-mesh/internal/store"
 )
 
@@ -566,17 +567,21 @@ func TestRefreshAllTreatsMissingSuccessfulNmapResultAsOffline(t *testing.T) {
 	}
 }
 
-func TestRefreshAllWaitsForScanGateWithCallerContext(t *testing.T) {
+func TestRefreshAllWaitsForCoordinatorWithCallerContext(t *testing.T) {
 	t.Parallel()
 
 	inventory := newMonitorStore(t)
-	refresher := NewRefresherWithOptions(inventory, NewEventBus(), RefresherOptions{})
-	refresher.scanGate <- struct{}{}
-	defer func() { <-refresher.scanGate }()
+	coordinator := networkscan.NewCoordinator()
+	refresher := NewRefresherWithOptions(inventory, NewEventBus(), RefresherOptions{Coordinator: coordinator})
+	release, err := coordinator.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
-	_, err := refresher.RefreshAll(ctx)
+	_, err = refresher.RefreshAll(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v", err)
 	}
@@ -623,6 +628,38 @@ func TestUnavailableConfiguredNmapPathDisablesNmap(t *testing.T) {
 	})
 	if refresher.UsingNmap() {
 		t.Fatal("missing configured nmap path was reported as available")
+	}
+}
+
+func TestBackgroundRefreshDoesNotPublishUnchangedEntityEvents(t *testing.T) {
+	inventory := newMonitorStore(t)
+	ctx := context.Background()
+	for index := 0; index < 200; index++ {
+		if _, err := inventory.AddDevice(ctx, store.Device{Name: fmt.Sprintf("device-%03d", index)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bus := NewEventBusWithOptions(EventBusOptions{SubscriberBuffer: 4, Generation: "unchanged-test"})
+	subscriberID, events := bus.Subscribe()
+	defer bus.Unsubscribe(subscriberID)
+	refresher := NewRefresherWithOptions(inventory, bus, RefresherOptions{})
+	refresher.probes = deterministicProbes()
+
+	refresher.scanAndPublish(ctx)
+	var received []ScanEvent
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				t.Fatal("unchanged refresh overflowed and disconnected the subscriber")
+			}
+			received = append(received, event)
+		default:
+			if len(received) != 2 || received[0].Kind != EventScanStarted || received[1].Kind != EventScanComplete {
+				t.Fatalf("events = %+v", received)
+			}
+			return
+		}
 	}
 }
 

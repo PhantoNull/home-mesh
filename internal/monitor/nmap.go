@@ -1,7 +1,6 @@
 package monitor
 
 import (
-	"bytes"
 	"context"
 	"encoding/xml"
 	"fmt"
@@ -10,6 +9,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/PhantoNull/home-mesh/internal/networkscan"
+)
+
+const (
+	nmapStdoutLimit = 8 * 1024 * 1024
+	nmapStderrLimit = 64 * 1024
 )
 
 type nmapScanResult struct {
@@ -19,6 +25,11 @@ type nmapScanResult struct {
 	Vendor    string
 	Hostname  string
 	OpenPorts []int
+}
+
+type nmapCommandOutput struct {
+	stdout *networkscan.BoundedBuffer
+	stderr *networkscan.BoundedBuffer
 }
 
 type nmapXMLRun struct {
@@ -100,21 +111,31 @@ func nmapScan(ctx context.Context, nmapPath string, ips []string, ports []int) (
 		return nil, fmt.Errorf("nmap path is empty")
 	}
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
 	// #nosec G204 -- the executable is resolved from administrator configuration;
 	// every dynamic target is a parsed IPv4 literal and ports are numeric.
 	cmd := exec.CommandContext(ctx, nmapPath, nmapArguments(canonicalIPs, ports)...)
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	output, err := runNmapCommand(cmd)
+	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("nmap failed: %w: %s", err, boundedMessage(stderr.String(), 512))
+		return nil, fmt.Errorf("nmap failed: %w: %s", err, boundedMessage(output.stderr.String(), 512))
+	}
+	if output.stdout.Truncated() {
+		return nil, fmt.Errorf("nmap XML output exceeded %d bytes", nmapStdoutLimit)
 	}
 
-	return parseNmapXML(stdout.Bytes())
+	return parseNmapXML(output.stdout.Bytes())
+}
+
+func runNmapCommand(cmd *exec.Cmd) (nmapCommandOutput, error) {
+	output := nmapCommandOutput{
+		stdout: networkscan.NewBoundedBuffer(nmapStdoutLimit),
+		stderr: networkscan.NewBoundedBuffer(nmapStderrLimit),
+	}
+	cmd.Stdout = output.stdout
+	cmd.Stderr = output.stderr
+	return output, cmd.Run()
 }
 
 func nmapArguments(ips []string, ports []int) []string {

@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestNewHTTPServerAllowsLongLivedStreamingResponses(t *testing.T) {
+func TestNewHTTPServerBoundsOrdinaryResponseWrites(t *testing.T) {
 	t.Parallel()
 
 	handlerCalled := false
@@ -34,8 +34,8 @@ func TestNewHTTPServerAllowsLongLivedStreamingResponses(t *testing.T) {
 	default:
 		t.Fatal("server request base context did not observe cancellation")
 	}
-	if server.WriteTimeout != 0 {
-		t.Fatalf("WriteTimeout = %s, want 0 for streaming handlers", server.WriteTimeout)
+	if server.WriteTimeout != 30*time.Second {
+		t.Fatalf("WriteTimeout = %s, want 30s", server.WriteTimeout)
 	}
 	if server.ReadHeaderTimeout != 10*time.Second {
 		t.Fatalf("ReadHeaderTimeout = %s, want 10s", server.ReadHeaderTimeout)

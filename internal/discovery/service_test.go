@@ -8,10 +8,15 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/PhantoNull/home-mesh/internal/monitor"
+	"github.com/PhantoNull/home-mesh/internal/networkscan"
+	"github.com/PhantoNull/home-mesh/internal/store"
 )
 
 func TestCompareIPStringsSortsNumerically(t *testing.T) {
@@ -180,6 +185,19 @@ func TestSuggestedIPv4CIDRBoundsWideNetworksToContaining24(t *testing.T) {
 	}
 }
 
+func TestSuggestedInterfaceRejectsTunnelAndVirtualAdapters(t *testing.T) {
+	for _, name := range []string{"tun0", "utun4", "tap-home", "wg0", "ppp0", "ipsec0", "tailscale0", "docker0"} {
+		if isSuggestedInterface(name) {
+			t.Fatalf("tunnel or virtual interface %q was suggested", name)
+		}
+	}
+	for _, name := range []string{"eth0", "en0", "wlan0", "Wi-Fi"} {
+		if !isSuggestedInterface(name) {
+			t.Fatalf("physical interface %q was rejected", name)
+		}
+	}
+}
+
 func TestScanCIDRStreamsAndDeduplicatesPointToPointRangeWithOneProcess(t *testing.T) {
 	commandCalls := 0
 	var commandArgs []string
@@ -290,6 +308,69 @@ func TestServiceRejectsConcurrentScanAndReleasesSlotAfterCancellation(t *testing
 	service.commandContext = newNmapHelperService(t, "hosts", nil).commandContext
 	if _, err := service.ScanCIDR(context.Background(), "203.0.113.0/24"); err != nil {
 		t.Fatalf("scan after cancellation returned error: %v", err)
+	}
+}
+
+func TestSharedCoordinatorMakesMonitorWaitForDiscovery(t *testing.T) {
+	coordinator := networkscan.NewCoordinator()
+	commandStarted := make(chan struct{})
+	service := newNmapHelperServiceWithOptions(t, "block", Options{
+		AllowPublicNetworks: true,
+		Coordinator:         coordinator,
+	}, func([]string) {
+		close(commandStarted)
+	})
+	discoveryCtx, cancelDiscovery := context.WithCancel(context.Background())
+	discoveryDone := make(chan error, 1)
+	go func() {
+		_, err := service.ScanCIDR(discoveryCtx, "192.0.2.0/24")
+		discoveryDone <- err
+	}()
+
+	select {
+	case <-commandStarted:
+	case <-time.After(5 * time.Second):
+		cancelDiscovery()
+		t.Fatal("discovery scan did not start")
+	}
+
+	inventory, err := store.New(filepath.Join(t.TempDir(), "cross-consumer.db"))
+	if err != nil {
+		cancelDiscovery()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inventory.Close() })
+	refresher := monitor.NewRefresherWithOptions(inventory, monitor.NewEventBus(), monitor.RefresherOptions{
+		Coordinator: coordinator,
+	})
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelWait()
+	if _, err := refresher.RefreshAll(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		cancelDiscovery()
+		t.Fatalf("monitor wait error = %v", err)
+	}
+
+	cancelDiscovery()
+	select {
+	case err := <-discoveryDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("discovery cancellation error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("discovery did not release the shared coordinator")
+	}
+}
+
+func TestDiscoveryDrainsStderrAfterTheBoundedLimit(t *testing.T) {
+	service := newNmapHelperService(t, "large-stderr", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := service.ScanCIDR(ctx, "192.0.2.0/24")
+	if err != nil {
+		t.Fatalf("ScanCIDR returned error: %v", err)
+	}
+	if len(result.Hosts) != 0 {
+		t.Fatalf("unexpected hosts: %+v", result.Hosts)
 	}
 }
 
@@ -489,6 +570,14 @@ func TestNmapHelperProcess(t *testing.T) {
 `)
 	case "incomplete":
 		fmt.Print(`<nmaprun><host><status state="up"/><address addr="192.0.2.10" addrtype="ipv4"/></host></nmaprun>`)
+	case "large-stderr":
+		chunk := strings.Repeat("x", 32*1024)
+		for written := 0; written <= nmapStderrLimit*2; written += len(chunk) {
+			if _, err := fmt.Fprint(os.Stderr, chunk); err != nil {
+				os.Exit(2)
+			}
+		}
+		fmt.Print(`<nmaprun><runstats><finished exit="success"/></runstats></nmaprun>`)
 	case "block":
 		time.Sleep(time.Minute)
 	case "exit-silent":

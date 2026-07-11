@@ -2,9 +2,13 @@ package monitor
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNmapArgumentsDoNotFilterHostsWithoutOpenPorts(t *testing.T) {
@@ -130,4 +134,40 @@ func TestNmapScanOneDoesNotConvertScannerFailureToOffline(t *testing.T) {
 	if err != wantErr {
 		t.Fatalf("error = %v, want %v", err, wantErr)
 	}
+}
+
+func TestRunNmapCommandBoundsAndDrainsStdoutAndStderr(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestNmapBoundedOutputHelperProcess$")
+	command.Env = append(os.Environ(), "HOME_MESH_NMAP_OUTPUT_HELPER=1")
+
+	output, err := runNmapCommand(command)
+	if err != nil {
+		t.Fatalf("runNmapCommand returned error: %v", err)
+	}
+	if output.stdout.Len() != nmapStdoutLimit || !output.stdout.Truncated() || output.stdout.Total() <= nmapStdoutLimit {
+		t.Fatalf("stdout len=%d total=%d truncated=%t", output.stdout.Len(), output.stdout.Total(), output.stdout.Truncated())
+	}
+	if output.stderr.Len() != nmapStderrLimit || !output.stderr.Truncated() || output.stderr.Total() <= nmapStderrLimit {
+		t.Fatalf("stderr len=%d total=%d truncated=%t", output.stderr.Len(), output.stderr.Total(), output.stderr.Truncated())
+	}
+}
+
+func TestNmapBoundedOutputHelperProcess(t *testing.T) {
+	if os.Getenv("HOME_MESH_NMAP_OUTPUT_HELPER") != "1" {
+		return
+	}
+	chunk := strings.Repeat("x", 32*1024)
+	for written := 0; written <= nmapStdoutLimit; written += len(chunk) {
+		if _, err := fmt.Fprint(os.Stdout, chunk); err != nil {
+			os.Exit(2)
+		}
+	}
+	for written := 0; written <= nmapStderrLimit; written += len(chunk) {
+		if _, err := fmt.Fprint(os.Stderr, chunk); err != nil {
+			os.Exit(2)
+		}
+	}
+	os.Exit(0)
 }

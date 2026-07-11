@@ -1,7 +1,6 @@
 package discovery
 
 import (
-	"bytes"
 	"context"
 	"encoding/xml"
 	"errors"
@@ -13,8 +12,9 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
+
+	"github.com/PhantoNull/home-mesh/internal/networkscan"
 )
 
 var (
@@ -24,15 +24,18 @@ var (
 	errNmapCompletion    = errors.New("nmap XML did not report successful completion")
 )
 
+const nmapStderrLimit = 64 * 1024
+
 type Options struct {
 	NmapPath            string
 	AllowPublicNetworks bool
+	Coordinator         *networkscan.Coordinator
 }
 
 type Service struct {
 	nmapPath            string
 	allowPublicNetworks bool
-	scanning            atomic.Bool
+	coordinator         *networkscan.Coordinator
 	commandContext      func(context.Context, string, ...string) *exec.Cmd
 }
 
@@ -102,10 +105,15 @@ func NewServiceWithOptions(options Options) *Service {
 	if path == "" {
 		path = "nmap"
 	}
+	coordinator := options.Coordinator
+	if coordinator == nil {
+		coordinator = networkscan.NewCoordinator()
+	}
 
 	return &Service{
 		nmapPath:            path,
 		allowPublicNetworks: options.AllowPublicNetworks,
+		coordinator:         coordinator,
 		commandContext:      exec.CommandContext,
 	}
 }
@@ -139,6 +147,14 @@ func (s *Service) scanCIDR(ctx context.Context, cidr string, onHost func(HostMat
 	if !s.hasNmap() {
 		return ScanResult{}, ErrNmapUnavailable
 	}
+	if err := ctx.Err(); err != nil {
+		return ScanResult{}, err
+	}
+	release, acquired := s.coordinator.TryAcquire()
+	if !acquired {
+		return ScanResult{}, ErrScanInProgress
+	}
+	defer release()
 
 	trimmedCIDR := strings.TrimSpace(cidr)
 	targetCIDRs := []string{}
@@ -165,11 +181,6 @@ func (s *Service) scanCIDR(ctx context.Context, cidr string, onHost func(HostMat
 			targetCIDRs[index] = canonicalCIDR
 		}
 	}
-
-	if !s.scanning.CompareAndSwap(false, true) {
-		return ScanResult{}, ErrScanInProgress
-	}
-	defer s.scanning.Store(false)
 
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -265,11 +276,11 @@ func (s *Service) scanTargetCIDR(ctx context.Context, targetCIDR string, hostsBy
 		return fmt.Errorf("nmap start failed for %s: %w", targetCIDR, err)
 	}
 
-	var stderrBuffer bytes.Buffer
+	stderrBuffer := networkscan.NewBoundedBuffer(nmapStderrLimit)
 	stderrDone := make(chan struct{})
 	go func() {
 		defer close(stderrDone)
-		_, _ = io.Copy(&stderrBuffer, stderr)
+		_, _ = io.Copy(stderrBuffer, stderr)
 	}()
 
 	emit := func(host HostMatch) error {
@@ -490,7 +501,7 @@ func collectIPv4CIDRs(suggestedOnly bool) ([]string, error) {
 	seen := map[string]bool{}
 	var cidrs []string
 	for _, iface := range interfaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagPointToPoint != 0 {
 			continue
 		}
 		if suggestedOnly && !isSuggestedInterface(iface.Name) {
@@ -566,9 +577,15 @@ func isSuggestedInterface(name string) bool {
 		"vmware",
 		"virtualbox",
 		"loopback",
+		"ipsec",
 	}
 	for _, token := range excluded {
 		if strings.Contains(lowerName, token) {
+			return false
+		}
+	}
+	for _, prefix := range []string{"tun", "tap", "utun", "wg", "ppp"} {
+		if strings.HasPrefix(lowerName, prefix) {
 			return false
 		}
 	}
