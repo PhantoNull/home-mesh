@@ -395,7 +395,11 @@ func canonicalIP(value string, field string) (string, error) {
 	if err != nil || !address.IsValid() || address.Zone() != "" {
 		return "", validationError("%s is invalid", field)
 	}
-	return address.Unmap().String(), nil
+	address = address.Unmap()
+	if address.IsUnspecified() || address.IsMulticast() || address == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
+		return "", validationError("%s must be a unicast host address", field)
+	}
+	return address.String(), nil
 }
 
 func canonicalMAC(value string, field string) (string, error) {
@@ -407,7 +411,19 @@ func canonicalMAC(value string, field string) (string, error) {
 	if err != nil || len(hardware) != 6 {
 		return "", validationError("%s must be a 48-bit Ethernet address", field)
 	}
+	if hardware[0]&1 != 0 || allZeroBytes(hardware) {
+		return "", validationError("%s must be a non-zero unicast Ethernet address", field)
+	}
 	return strings.ToUpper(hardware.String()), nil
+}
+
+func allZeroBytes(value []byte) bool {
+	for _, current := range value {
+		if current != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func canonicalDNSName(value string, field string) (string, error) {

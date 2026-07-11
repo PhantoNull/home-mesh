@@ -199,6 +199,89 @@ func TestConcurrentUpdatesAllowExactlyOneWinner(t *testing.T) {
 	}
 }
 
+func TestInventoryReorderIsAtomicAndVersioned(t *testing.T) {
+	inventory := openTestStore(t, filepath.Join(t.TempDir(), "inventory-order.db"), Options{})
+	ctx := context.Background()
+	first, err := inventory.AddDevice(ctx, Device{ID: "device-a", Name: "Alpha", Metadata: map[string]string{"owner": "home"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := inventory.AddDevice(ctx, Device{ID: "device-b", Name: "Beta"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := inventory.ReorderInventory(ctx, "device", []InventoryOrderItem{
+		{ID: second.ID, Version: second.Version},
+		{ID: first.ID, Version: first.Version},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ordered, err := inventory.ListDevices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ordered) != 2 || ordered[0].ID != second.ID || ordered[1].ID != first.ID {
+		t.Fatalf("ordered devices = %+v", ordered)
+	}
+	if ordered[0].Version != 2 || ordered[1].Version != 2 || ordered[1].Metadata["owner"] != "home" {
+		t.Fatalf("versioned devices = %+v", ordered)
+	}
+
+	before := ordered
+	err = inventory.ReorderInventory(ctx, "device", []InventoryOrderItem{
+		{ID: first.ID, Version: first.Version},
+		{ID: second.ID, Version: ordered[0].Version},
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale reorder error = %v", err)
+	}
+	after, err := inventory.ListDevices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("failed reorder was not atomic: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestInventoryReorderRequiresCompleteUniqueCollection(t *testing.T) {
+	inventory := openTestStore(t, filepath.Join(t.TempDir(), "inventory-order-validation.db"), Options{})
+	ctx := context.Background()
+	device, err := inventory.AddDevice(ctx, Device{ID: "device-a", Name: "Alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, test := range map[string]struct {
+		kind  string
+		items []InventoryOrderItem
+		want  error
+	}{
+		"unsupported kind": {kind: "relation", want: ErrValidation},
+		"missing item":     {kind: "device", want: ErrConflict},
+		"duplicate item": {
+			kind: "device",
+			items: []InventoryOrderItem{
+				{ID: device.ID, Version: device.Version},
+				{ID: device.ID, Version: device.Version},
+			},
+			want: ErrValidation,
+		},
+		"invalid version": {
+			kind:  "device",
+			items: []InventoryOrderItem{{ID: device.ID, Version: 0}},
+			want:  ErrValidation,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := inventory.ReorderInventory(ctx, test.kind, test.items); !errors.Is(err, test.want) {
+				t.Fatalf("error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
 func TestNodeAndSegmentOptimisticConcurrency(t *testing.T) {
 	inventory := openTestStore(t, filepath.Join(t.TempDir(), "node-segment-conflicts.db"), Options{})
 	ctx := context.Background()
@@ -317,8 +400,24 @@ func TestCanonicalValidationRejectsInvalidInventory(t *testing.T) {
 			_, err := inventory.AddDevice(ctx, Device{Name: "Device", IPAddress: "--script=unsafe"})
 			return err
 		}},
+		{"unspecified IP", func() error {
+			_, err := inventory.AddDevice(ctx, Device{Name: "Device", IPAddress: "0.0.0.0"})
+			return err
+		}},
+		{"multicast IP", func() error {
+			_, err := inventory.AddDevice(ctx, Device{Name: "Device", IPAddress: "224.0.0.1"})
+			return err
+		}},
 		{"non Ethernet MAC", func() error {
 			_, err := inventory.AddDevice(ctx, Device{Name: "Device", MACAddress: "00:11:22:33:44:55:66:77"})
+			return err
+		}},
+		{"multicast MAC", func() error {
+			_, err := inventory.AddDevice(ctx, Device{Name: "Device", MACAddress: "01:00:5E:00:00:01"})
+			return err
+		}},
+		{"zero MAC", func() error {
+			_, err := inventory.AddDevice(ctx, Device{Name: "Device", MACAddress: "00:00:00:00:00:00"})
 			return err
 		}},
 		{"invalid entity status", func() error { _, err := inventory.AddDevice(ctx, Device{Name: "Device", Status: "awake"}); return err }},
@@ -609,8 +708,62 @@ func TestCredentialAndPortCanonicalizationBumpsDeviceVersion(t *testing.T) {
 	if _, err := inventory.UpdateDevice(ctx, device); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale update after credential metadata patch = %v", err)
 	}
+	if err := inventory.DeleteSSHCredentialAndPort(ctx, device.ID, device.Version); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale credential delete error = %v", err)
+	}
+	if _, err := inventory.GetSSHCredential(ctx, device.ID); err != nil {
+		t.Fatalf("stale delete removed credential: %v", err)
+	}
+	if err := inventory.DeleteSSHCredentialAndPort(ctx, device.ID, storedDevice.Version); err != nil {
+		t.Fatalf("delete credential: %v", err)
+	}
+	if _, err := inventory.GetSSHCredential(ctx, device.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted credential error = %v", err)
+	}
+	storedDevice, err = inventory.GetDevice(ctx, device.ID)
+	if err != nil || storedDevice.Version != 3 || storedDevice.Metadata["owner"] != "home" || storedDevice.Metadata["sshPort"] != "" {
+		t.Fatalf("device after credential delete = %+v, %v", storedDevice, err)
+	}
 	if _, err := inventory.UpsertSSHCredential(ctx, SSHCredential{DeviceID: "missing-device", Username: "root", PasswordCiphertext: "cipher", PasswordNonce: "nonce"}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing credential device error = %v", err)
+	}
+}
+
+func TestVersionedCredentialUpdateRejectsStaleDevice(t *testing.T) {
+	inventory := openTestStore(t, filepath.Join(t.TempDir(), "credential-occ.db"), Options{})
+	ctx := context.Background()
+	device, err := inventory.AddDevice(ctx, Device{ID: "device-a", Name: "Device"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := SSHCredential{
+		DeviceID: device.ID, Username: "root", PasswordCiphertext: "cipher-one", PasswordNonce: "nonce-one",
+	}
+	if _, err := inventory.UpsertSSHCredentialAndPortVersioned(ctx, credential, "22", device.Version); err != nil {
+		t.Fatal(err)
+	}
+
+	credential.Username = "admin"
+	credential.PasswordCiphertext = "cipher-two"
+	credential.PasswordNonce = "nonce-two"
+	if _, err := inventory.UpsertSSHCredentialAndPortVersioned(ctx, credential, "2222", device.Version); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale credential update error = %v", err)
+	}
+	stored, err := inventory.GetSSHCredential(ctx, device.ID)
+	if err != nil || stored.Username != "root" || stored.PasswordCiphertext != "cipher-one" {
+		t.Fatalf("credential after stale update = %+v, %v", stored, err)
+	}
+
+	currentDevice, err := inventory.GetDevice(ctx, device.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inventory.UpsertSSHCredentialAndPortVersioned(ctx, credential, "2222", currentDevice.Version); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = inventory.GetSSHCredential(ctx, device.ID)
+	if err != nil || stored.Username != "admin" || stored.PasswordCiphertext != "cipher-two" {
+		t.Fatalf("credential after current update = %+v, %v", stored, err)
 	}
 }
 
@@ -753,6 +906,64 @@ func TestVersionMigrationRollsBackPartialAlterations(t *testing.T) {
 	var schemaVersion int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&schemaVersion); err != nil || schemaVersion != 3 {
 		t.Fatalf("schema version = %d, %v", schemaVersion, err)
+	}
+}
+
+func TestTopologyMigrationQuarantinesLegacyOrphans(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-topology.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, candidate := range schemaMigrations[:4] {
+		if err := applyMigration(ctx, db, candidate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := fixedTestTime()
+	if _, err := db.Exec(`
+		INSERT INTO devices (id, name, network_segment, created_at, updated_at)
+		VALUES ('device-a', 'Device', 'missing-segment', ?, ?)
+	`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO network_nodes (id, name, node_type, created_at, updated_at)
+		VALUES ('node-a', 'Node', 'router', ?, ?)
+	`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`INSERT INTO relations (id, source_kind, source_id, target_kind, target_id, relation_type, observed_at) VALUES ('missing-source', 'device', 'missing-device', 'networkNode', 'node-a', 'connected_to', ?)`,
+		`INSERT INTO relations (id, source_kind, source_id, target_kind, target_id, relation_type, observed_at) VALUES ('bad-kind', 'unknown', 'device-a', 'networkNode', 'node-a', 'connected_to', ?)`,
+	} {
+		if _, err := db.Exec(statement, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	inventory := openTestStore(t, dbPath, Options{})
+	device, err := inventory.GetDevice(ctx, "device-a")
+	if err != nil || device.NetworkSegment != "" || device.Version != 2 {
+		t.Fatalf("migrated device = %+v, %v", device, err)
+	}
+	relations, err := inventory.ListRelations(ctx)
+	if err != nil || len(relations) != 0 {
+		t.Fatalf("active relations = %+v, %v", relations, err)
+	}
+	var relationCount, segmentCount int
+	if err := inventory.db.QueryRow(`SELECT COUNT(*) FROM relations_quarantine`).Scan(&relationCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := inventory.db.QueryRow(`SELECT COUNT(*) FROM device_segment_quarantine`).Scan(&segmentCount); err != nil {
+		t.Fatal(err)
+	}
+	if relationCount != 2 || segmentCount != 1 {
+		t.Fatalf("quarantine counts: relations=%d segments=%d", relationCount, segmentCount)
 	}
 }
 

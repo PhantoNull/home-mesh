@@ -70,6 +70,11 @@ type InventorySnapshot struct {
 	Actions         []Action         `json:"actions"`
 }
 
+type InventoryOrderItem struct {
+	ID      string `json:"id"`
+	Version int64  `json:"version"`
+}
+
 type Action struct {
 	ID            string            `json:"id"`
 	DeviceID      string            `json:"deviceId"`

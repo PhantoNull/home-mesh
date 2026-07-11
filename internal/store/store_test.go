@@ -29,7 +29,7 @@ func TestFreshDatabaseMigratesWithoutDefaultSeed(t *testing.T) {
 		t.Fatalf("got schema version %d want %d", version, latestSchemaVersion)
 	}
 
-	for _, table := range []string{"devices", "network_nodes", "network_segments", "relations", "actions", "ssh_credentials", "ssh_credentials_quarantine", "admin_account"} {
+	for _, table := range []string{"devices", "network_nodes", "network_segments", "relations", "relations_quarantine", "device_segment_quarantine", "actions", "ssh_credentials", "ssh_credentials_quarantine", "admin_account"} {
 		if !tableExists(t, store.db, table) {
 			t.Fatalf("expected migrated table %q", table)
 		}
@@ -41,6 +41,131 @@ func TestFreshDatabaseMigratesWithoutDefaultSeed(t *testing.T) {
 	}
 	if len(snapshot.Devices)+len(snapshot.NetworkNodes)+len(snapshot.NetworkSegments)+len(snapshot.Relations)+len(snapshot.Actions) != 0 {
 		t.Fatalf("New unexpectedly seeded demo data: %+v", snapshot)
+	}
+}
+
+func TestStoreReadinessChecksDatabaseState(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "ready.db"), Options{})
+	if err := store.Ready(context.Background()); err != nil {
+		t.Fatalf("ready store: %v", err)
+	}
+
+	if _, err := store.db.Exec(`PRAGMA user_version = 0`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ready(context.Background()); err == nil || !strings.Contains(err.Error(), "schema version") {
+		t.Fatalf("schema readiness error = %v", err)
+	}
+}
+
+func TestSnapshotCollectionReadsShareOneDatabaseSnapshot(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "snapshot.db")
+	reader := openTestStore(t, dbPath, Options{})
+	writer, err := New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	ctx := context.Background()
+	node, err := writer.AddNetworkNode(ctx, NetworkNode{ID: "node-a", Name: "Router", NodeType: "router"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := reader.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	devices, err := listDevices(ctx, tx)
+	if err != nil || len(devices) != 0 {
+		t.Fatalf("initial transaction devices = %+v, %v", devices, err)
+	}
+	device, err := writer.AddDevice(ctx, Device{ID: "device-a", Name: "Server"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.AddRelation(ctx, Relation{
+		ID: "relation-a", SourceKind: "device", SourceID: device.ID,
+		TargetKind: "networkNode", TargetID: node.ID, RelationType: "connected_to",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	relations, err := listRelations(ctx, tx)
+	if err != nil || len(relations) != 0 {
+		t.Fatalf("transaction observed relation without device snapshot: %+v, %v", relations, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := reader.Snapshot(ctx)
+	if err != nil || len(snapshot.Devices) != 1 || len(snapshot.Relations) != 1 {
+		t.Fatalf("fresh snapshot = %+v, %v", snapshot, err)
+	}
+}
+
+func TestClearActionsPreservesRunningAuditRecords(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "clear-actions.db"), Options{})
+	ctx := context.Background()
+	running, err := store.AddAction(ctx, Action{ID: "running-action", ActionType: "test", Status: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().UTC().Add(-time.Second)
+	if _, err := store.AddAction(ctx, Action{
+		ID: "finished-action", ActionType: "test", Status: "completed",
+		FinishedAt: started.Add(time.Second), StartedAt: started,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ClearActions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	actions, err := store.ListActions(ctx)
+	if err != nil || len(actions) != 1 || actions[0].ID != running.ID {
+		t.Fatalf("actions after clear = %+v, %v", actions, err)
+	}
+
+	running.Status = "completed"
+	running.FinishedAt = running.StartedAt.Add(time.Second)
+	if _, err := store.UpdateAction(ctx, running); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ClearActions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	actions, err = store.ListActions(ctx)
+	if err != nil || len(actions) != 0 {
+		t.Fatalf("terminal actions after second clear = %+v, %v", actions, err)
+	}
+}
+
+func TestReopenRecoversInterruptedActions(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "recover-actions.db")
+	store, err := New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := store.AddAction(context.Background(), Action{
+		ID: "interrupted-action", ActionType: "ssh_terminal", Status: "running",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := openTestStore(t, dbPath, Options{})
+	actions, err := reopened.ListActions(context.Background())
+	if err != nil || len(actions) != 1 {
+		t.Fatalf("recovered actions = %+v, %v", actions, err)
+	}
+	recovered := actions[0]
+	if recovered.ID != running.ID || recovered.Status != "failed" || recovered.FinishedAt.IsZero() ||
+		recovered.ResultSummary != "Interrupted by previous process termination." || recovered.Metadata["terminationReason"] != "process_restart" {
+		t.Fatalf("recovered action = %+v", recovered)
 	}
 }
 

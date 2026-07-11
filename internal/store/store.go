@@ -28,10 +28,15 @@ const (
 	defaultActionPageSize = 200
 	maxActionPageSize     = 500
 	maxRetainedActions    = 5000
+	maxInventoryOrderSize = 10_000
 )
 
 type Store struct {
 	db *sql.DB
+}
+
+type queryContext interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 type Options struct {
@@ -69,6 +74,10 @@ func NewWithOptions(dbPath string, options Options) (*Store, error) {
 		return nil, err
 	}
 	if err := store.migrate(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.recoverInterruptedActions(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -158,29 +167,64 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Ready verifies the lightweight database invariants required to serve API
+// traffic. Full integrity checks remain part of startup, not every probe.
+func (s *Store) Ready(ctx context.Context) error {
+	if err := s.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("database ping: %w", err)
+	}
+
+	var schemaVersion int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&schemaVersion); err != nil {
+		return fmt.Errorf("read database schema version: %w", err)
+	}
+	if schemaVersion != latestSchemaVersion {
+		return fmt.Errorf("database schema version %d does not match required version %d", schemaVersion, latestSchemaVersion)
+	}
+
+	var foreignKeysEnabled int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeysEnabled); err != nil {
+		return fmt.Errorf("read database foreign-key state: %w", err)
+	}
+	if foreignKeysEnabled != 1 {
+		return errors.New("database foreign-key enforcement is disabled")
+	}
+
+	return nil
+}
+
 func (s *Store) Snapshot(ctx context.Context) (InventorySnapshot, error) {
-	devices, err := s.ListDevices(ctx)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return InventorySnapshot{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	devices, err := listDevices(ctx, tx)
 	if err != nil {
 		return InventorySnapshot{}, err
 	}
 
-	networkNodes, err := s.ListNetworkNodes(ctx)
+	networkNodes, err := listNetworkNodes(ctx, tx)
 	if err != nil {
 		return InventorySnapshot{}, err
 	}
 
-	networkSegments, err := s.ListNetworkSegments(ctx)
+	networkSegments, err := listNetworkSegments(ctx, tx)
 	if err != nil {
 		return InventorySnapshot{}, err
 	}
 
-	relations, err := s.ListRelations(ctx)
+	relations, err := listRelations(ctx, tx)
 	if err != nil {
 		return InventorySnapshot{}, err
 	}
 
-	actions, err := s.ListActions(ctx)
+	actions, err := listActionsPage(ctx, tx, defaultActionPageSize, 0)
 	if err != nil {
+		return InventorySnapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return InventorySnapshot{}, err
 	}
 
@@ -193,8 +237,124 @@ func (s *Store) Snapshot(ctx context.Context) (InventorySnapshot, error) {
 	}, nil
 }
 
+// ReorderInventory atomically assigns displayOrder metadata to a complete
+// inventory collection. Every supplied version must still match the database.
+func (s *Store) ReorderInventory(ctx context.Context, kind string, items []InventoryOrderItem) error {
+	if len(items) > maxInventoryOrderSize {
+		return validationError("inventory order exceeds %d items", maxInventoryOrderSize)
+	}
+
+	var selectStatement string
+	var updateStatement string
+	switch kind {
+	case "device":
+		selectStatement = `SELECT id, version, metadata_json FROM devices`
+		updateStatement = `UPDATE devices SET metadata_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?`
+	case "networkNode":
+		selectStatement = `SELECT id, version, metadata_json FROM network_nodes`
+		updateStatement = `UPDATE network_nodes SET metadata_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?`
+	case "networkSegment":
+		selectStatement = `SELECT id, version, metadata_json FROM network_segments`
+		updateStatement = `UPDATE network_segments SET metadata_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ?`
+	default:
+		return validationError("inventory order kind %q is unsupported", kind)
+	}
+
+	requested := make(map[string]InventoryOrderItem, len(items))
+	for _, item := range items {
+		id, err := canonicalReferenceID(item.ID, "inventory order id")
+		if err != nil {
+			return err
+		}
+		if item.Version < 1 {
+			return validationError("inventory order version must be positive")
+		}
+		if _, duplicate := requested[id]; duplicate {
+			return validationError("inventory order id %q is duplicated", id)
+		}
+		item.ID = id
+		requested[id] = item
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	type storedOrderItem struct {
+		version  int64
+		metadata map[string]string
+	}
+	stored := make(map[string]storedOrderItem, len(items))
+	rows, err := tx.QueryContext(ctx, selectStatement)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id string
+		var version int64
+		var metadataJSON string
+		if err := rows.Scan(&id, &version, &metadataJSON); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		metadata := map[string]string{}
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("decode %s metadata for ordering: %w", kind, err)
+		}
+		stored[id] = storedOrderItem{version: version, metadata: metadata}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(stored) != len(items) {
+		return ErrConflict
+	}
+	for id, item := range requested {
+		current, exists := stored[id]
+		if !exists || current.version != item.Version {
+			return ErrConflict
+		}
+	}
+
+	now := time.Now().UTC()
+	for index, item := range items {
+		current := stored[item.ID]
+		current.metadata["displayOrder"] = strconv.Itoa(index)
+		metadata, err := canonicalMetadata(current.metadata)
+		if err != nil {
+			return err
+		}
+		_, metadataJSON, err := marshalJSONFields(nil, metadata)
+		if err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, updateStatement, metadataJSON, now, item.ID, item.Version)
+		if err != nil {
+			return err
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return err
+		} else if affected != 1 {
+			return ErrConflict
+		}
+	}
+
+	return tx.Commit()
+}
+
 func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return listDevices(ctx, s.db)
+}
+
+func listDevices(ctx context.Context, query queryContext) ([]Device, error) {
+	rows, err := query.QueryContext(ctx, `
 		SELECT id, version, name, hostname, role, device_type, ip_address, mac_address, network_segment, status, tags_json, metadata_json, created_at, updated_at
 		FROM devices
 		ORDER BY name
@@ -341,7 +501,11 @@ func (s *Store) DeleteDeviceVersioned(ctx context.Context, id string, version in
 }
 
 func (s *Store) ListNetworkNodes(ctx context.Context) ([]NetworkNode, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return listNetworkNodes(ctx, s.db)
+}
+
+func listNetworkNodes(ctx context.Context, query queryContext) ([]NetworkNode, error) {
+	rows, err := query.QueryContext(ctx, `
 		SELECT id, version, name, node_type, management_ip, mac_address, vendor, model, status, tags_json, metadata_json, created_at, updated_at
 		FROM network_nodes
 		ORDER BY name
@@ -466,7 +630,11 @@ func (s *Store) DeleteNetworkNodeVersioned(ctx context.Context, id string, versi
 }
 
 func (s *Store) ListNetworkSegments(ctx context.Context) ([]NetworkSegment, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return listNetworkSegments(ctx, s.db)
+}
+
+func listNetworkSegments(ctx context.Context, query queryContext) ([]NetworkSegment, error) {
+	rows, err := query.QueryContext(ctx, `
 		SELECT id, version, name, segment_type, cidr, vlan_id, gateway_ip, dns_domain, metadata_json, created_at, updated_at
 		FROM network_segments
 		ORDER BY name
@@ -591,7 +759,11 @@ func (s *Store) DeleteNetworkSegmentVersioned(ctx context.Context, id string, ve
 }
 
 func (s *Store) ListRelations(ctx context.Context) ([]Relation, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return listRelations(ctx, s.db)
+}
+
+func listRelations(ctx context.Context, query queryContext) ([]Relation, error) {
+	rows, err := query.QueryContext(ctx, `
 		SELECT id, version, source_kind, source_id, target_kind, target_id, relation_type, confidence, metadata_json, observed_at
 		FROM relations
 		ORDER BY observed_at DESC, id
@@ -779,7 +951,11 @@ func (s *Store) ListActionsPage(ctx context.Context, limit int, offset int) ([]A
 	if offset < 0 {
 		return nil, errors.New("action offset must not be negative")
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	return listActionsPage(ctx, s.db, limit, offset)
+}
+
+func listActionsPage(ctx context.Context, query queryContext, limit int, offset int) ([]Action, error) {
+	rows, err := query.QueryContext(ctx, `
 		SELECT id, device_id, action_type, status, result_summary, metadata_json, started_at, finished_at
 		FROM actions
 		ORDER BY started_at DESC, id DESC
@@ -857,6 +1033,7 @@ func pruneActions(ctx context.Context, tx *sql.Tx, retain int) error {
 		DELETE FROM actions
 		WHERE id IN (
 			SELECT id FROM actions
+			WHERE status <> 'running'
 			ORDER BY started_at DESC, id DESC
 			LIMIT -1 OFFSET ?
 		)
@@ -923,8 +1100,27 @@ func (s *Store) getAction(ctx context.Context, id string) (Action, error) {
 }
 
 func (s *Store) ClearActions(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM actions`)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM actions WHERE status <> 'running'`)
 	return err
+}
+
+func (s *Store) recoverInterruptedActions(ctx context.Context) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE actions
+		SET status = 'failed',
+			result_summary = 'Interrupted by previous process termination.',
+			metadata_json = json_set(
+				CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,
+				'$.terminationReason', 'process_restart'
+			),
+			finished_at = ?
+		WHERE status = 'running'
+	`, now)
+	if err != nil {
+		return fmt.Errorf("recover interrupted actions: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) GetSSHCredential(ctx context.Context, deviceID string) (SSHCredential, error) {
@@ -964,6 +1160,73 @@ func (s *Store) ListSSHCredentials(ctx context.Context) ([]SSHCredential, error)
 	return credentials, rows.Err()
 }
 
+// DeleteSSHCredentialAndPort removes a stored credential and its device port
+// metadata only when the caller still holds the current device version.
+func (s *Store) DeleteSSHCredentialAndPort(ctx context.Context, deviceID string, expectedDeviceVersion int64) error {
+	deviceID, err := canonicalReferenceID(deviceID, "credential device id")
+	if err != nil {
+		return err
+	}
+	if expectedDeviceVersion < 1 {
+		return validationError("device version must be positive")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var metadataJSON string
+	var currentVersion int64
+	if err := tx.QueryRowContext(ctx, `SELECT metadata_json, version FROM devices WHERE id = ?`, deviceID).Scan(&metadataJSON, &currentVersion); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if currentVersion != expectedDeviceVersion {
+		return ErrConflict
+	}
+
+	result, err := tx.ExecContext(ctx, `DELETE FROM ssh_credentials WHERE device_id = ?`, deviceID)
+	if err != nil {
+		return err
+	}
+	if err := requireDeletedRow(result); err != nil {
+		return err
+	}
+
+	metadata := map[string]string{}
+	if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+		return fmt.Errorf("decode device metadata for SSH credential deletion: %w", err)
+	}
+	delete(metadata, "sshPort")
+	metadata, err = canonicalMetadata(metadata)
+	if err != nil {
+		return err
+	}
+	_, metadataJSON, err = marshalJSONFields(nil, metadata)
+	if err != nil {
+		return err
+	}
+
+	result, err = tx.ExecContext(ctx, `
+		UPDATE devices
+		SET metadata_json = ?, version = version + 1, updated_at = ?
+		WHERE id = ? AND version = ?
+	`, metadataJSON, time.Now().UTC(), deviceID, expectedDeviceVersion)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return ErrConflict
+	}
+
+	return tx.Commit()
+}
+
 func (s *Store) UpsertSSHCredential(ctx context.Context, credential SSHCredential) (SSHCredential, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -982,6 +1245,17 @@ func (s *Store) UpsertSSHCredential(ctx context.Context, credential SSHCredentia
 }
 
 func (s *Store) UpsertSSHCredentialAndPort(ctx context.Context, credential SSHCredential, sshPort string) (SSHCredential, error) {
+	return s.upsertSSHCredentialAndPort(ctx, credential, sshPort, nil)
+}
+
+func (s *Store) UpsertSSHCredentialAndPortVersioned(ctx context.Context, credential SSHCredential, sshPort string, expectedDeviceVersion int64) (SSHCredential, error) {
+	if expectedDeviceVersion < 1 {
+		return SSHCredential{}, validationError("device version must be positive")
+	}
+	return s.upsertSSHCredentialAndPort(ctx, credential, sshPort, &expectedDeviceVersion)
+}
+
+func (s *Store) upsertSSHCredentialAndPort(ctx context.Context, credential SSHCredential, sshPort string, expectedDeviceVersion *int64) (SSHCredential, error) {
 	var err error
 	credential, err = canonicalizeSSHCredential(credential)
 	if err != nil {
@@ -999,6 +1273,9 @@ func (s *Store) UpsertSSHCredentialAndPort(ctx context.Context, credential SSHCr
 		return SSHCredential{}, ErrNotFound
 	} else if err != nil {
 		return SSHCredential{}, err
+	}
+	if expectedDeviceVersion != nil && deviceVersion != *expectedDeviceVersion {
+		return SSHCredential{}, ErrConflict
 	}
 
 	metadata := make(map[string]string)

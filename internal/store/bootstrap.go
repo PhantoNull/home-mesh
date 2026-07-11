@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const latestSchemaVersion = 4
+const latestSchemaVersion = 5
 
 type migration struct {
 	version    int
@@ -174,6 +174,88 @@ var schemaMigrations = []migration{
 			`ALTER TABLE network_segments ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1)`,
 			`ALTER TABLE relations ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1)`,
 		},
+	},
+	{
+		version: 5,
+		name:    "quarantine invalid topology references",
+		statements: []string{`
+			CREATE TABLE IF NOT EXISTS relations_quarantine (
+				id TEXT PRIMARY KEY,
+				version INTEGER NOT NULL,
+				source_kind TEXT NOT NULL,
+				source_id TEXT NOT NULL,
+				target_kind TEXT NOT NULL,
+				target_id TEXT NOT NULL,
+				relation_type TEXT NOT NULL,
+				confidence TEXT NOT NULL,
+				metadata_json TEXT NOT NULL,
+				observed_at TIMESTAMP NOT NULL,
+				quarantined_at TIMESTAMP NOT NULL,
+				quarantine_reason TEXT NOT NULL
+			);
+
+			INSERT INTO relations_quarantine (
+				id, version, source_kind, source_id, target_kind, target_id,
+				relation_type, confidence, metadata_json, observed_at,
+				quarantined_at, quarantine_reason
+			)
+			SELECT id, version, source_kind, source_id, target_kind, target_id,
+				relation_type, confidence, metadata_json, observed_at, CURRENT_TIMESTAMP,
+				CASE
+					WHEN source_kind NOT IN ('device', 'networkNode', 'networkSegment')
+						OR target_kind NOT IN ('device', 'networkNode', 'networkSegment')
+						THEN 'unsupported_kind'
+					WHEN source_kind = target_kind AND source_id = target_id THEN 'self_relation'
+					WHEN (source_kind = 'device' AND NOT EXISTS (SELECT 1 FROM devices WHERE devices.id = relations.source_id))
+						OR (source_kind = 'networkNode' AND NOT EXISTS (SELECT 1 FROM network_nodes WHERE network_nodes.id = relations.source_id))
+						OR (source_kind = 'networkSegment' AND NOT EXISTS (SELECT 1 FROM network_segments WHERE network_segments.id = relations.source_id))
+						THEN 'missing_source'
+					ELSE 'missing_target'
+				END
+			FROM relations
+			WHERE source_kind NOT IN ('device', 'networkNode', 'networkSegment')
+				OR target_kind NOT IN ('device', 'networkNode', 'networkSegment')
+				OR (source_kind = target_kind AND source_id = target_id)
+				OR (source_kind = 'device' AND NOT EXISTS (SELECT 1 FROM devices WHERE devices.id = relations.source_id))
+				OR (source_kind = 'networkNode' AND NOT EXISTS (SELECT 1 FROM network_nodes WHERE network_nodes.id = relations.source_id))
+				OR (source_kind = 'networkSegment' AND NOT EXISTS (SELECT 1 FROM network_segments WHERE network_segments.id = relations.source_id))
+				OR (target_kind = 'device' AND NOT EXISTS (SELECT 1 FROM devices WHERE devices.id = relations.target_id))
+				OR (target_kind = 'networkNode' AND NOT EXISTS (SELECT 1 FROM network_nodes WHERE network_nodes.id = relations.target_id))
+				OR (target_kind = 'networkSegment' AND NOT EXISTS (SELECT 1 FROM network_segments WHERE network_segments.id = relations.target_id))
+			ON CONFLICT(id) DO NOTHING;
+
+			DELETE FROM relations
+			WHERE id IN (SELECT id FROM relations_quarantine);
+
+			CREATE TABLE IF NOT EXISTS device_segment_quarantine (
+				device_id TEXT NOT NULL,
+				network_segment TEXT NOT NULL,
+				device_version INTEGER NOT NULL,
+				quarantined_at TIMESTAMP NOT NULL,
+				quarantine_reason TEXT NOT NULL,
+				PRIMARY KEY (device_id, network_segment)
+			);
+
+			INSERT INTO device_segment_quarantine (
+				device_id, network_segment, device_version, quarantined_at, quarantine_reason
+			)
+			SELECT id, network_segment, version, CURRENT_TIMESTAMP, 'missing_segment'
+			FROM devices
+			WHERE network_segment <> ''
+				AND NOT EXISTS (
+					SELECT 1 FROM network_segments
+					WHERE network_segments.id = devices.network_segment
+				)
+			ON CONFLICT(device_id, network_segment) DO NOTHING;
+
+			UPDATE devices
+			SET network_segment = '', version = version + 1, updated_at = CURRENT_TIMESTAMP
+			WHERE network_segment <> ''
+				AND NOT EXISTS (
+					SELECT 1 FROM network_segments
+					WHERE network_segments.id = devices.network_segment
+				);
+		`},
 	},
 }
 
