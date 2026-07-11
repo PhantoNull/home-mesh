@@ -13,17 +13,30 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
 
-var ErrNotFound = errors.New("not found")
+var (
+	ErrNotFound                = errors.New("not found")
+	ErrInvalidRelationEndpoint = errors.New("invalid relation endpoint")
+)
 
 type Store struct {
 	db *sql.DB
 }
 
+type Options struct {
+	SeedDemo bool
+	seedDemo func(context.Context, *sql.Tx) error
+}
+
 func New(dbPath string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+	return NewWithOptions(dbPath, Options{})
+}
+
+func NewWithOptions(dbPath string, options Options) (*Store, error) {
+	if err := secureDatabaseDirectory(dbPath); err != nil {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
 
@@ -39,7 +52,37 @@ func New(dbPath string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	if err := store.init(context.Background()); err != nil {
+	if err := secureDatabaseFile(dbPath); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.checkIntegrity(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.migrate(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if options.SeedDemo {
+		seed := options.seedDemo
+		if seed == nil {
+			seed = seedDemoData
+		}
+		if err := store.seedDemoIfEmpty(context.Background(), seed); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
+	if err := store.checkIntegrity(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.checkForeignKeys(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := secureDatabaseFile(dbPath); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -60,7 +103,47 @@ func (s *Store) configure(ctx context.Context) error {
 		}
 	}
 
+	var foreignKeysEnabled int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeysEnabled); err != nil {
+		return fmt.Errorf("verify database foreign keys: %w", err)
+	}
+	if foreignKeysEnabled != 1 {
+		return errors.New("SQLite foreign key enforcement is disabled")
+	}
+
 	return nil
+}
+
+func secureDatabaseDirectory(dbPath string) error {
+	if !isFilesystemDatabase(dbPath) {
+		return nil
+	}
+	directory := filepath.Clean(filepath.Dir(dbPath))
+	if directory == "." || directory == string(os.PathSeparator) || directory == filepath.VolumeName(directory)+string(os.PathSeparator) {
+		return nil
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		return fmt.Errorf("secure database directory: %w", err)
+	}
+	return nil
+}
+
+func secureDatabaseFile(dbPath string) error {
+	if !isFilesystemDatabase(dbPath) {
+		return nil
+	}
+	if err := os.Chmod(dbPath, 0o600); err != nil {
+		return fmt.Errorf("secure database file: %w", err)
+	}
+	return nil
+}
+
+func isFilesystemDatabase(dbPath string) bool {
+	trimmed := strings.TrimSpace(dbPath)
+	return trimmed != "" && trimmed != ":memory:" && !strings.HasPrefix(strings.ToLower(trimmed), "file:")
 }
 
 func (s *Store) Close() error {
@@ -132,11 +215,7 @@ func (s *Store) ListDevices(ctx context.Context) ([]Device, error) {
 func (s *Store) AddDevice(ctx context.Context, device Device) (Device, error) {
 	now := time.Now().UTC()
 	if strings.TrimSpace(device.ID) == "" {
-		nextID, err := s.nextDeviceID(ctx)
-		if err != nil {
-			return Device{}, err
-		}
-		device.ID = nextID
+		device.ID = "dev-" + uuid.NewString()
 	}
 	if strings.TrimSpace(device.Status) == "" {
 		device.Status = "unknown"
@@ -161,15 +240,6 @@ func (s *Store) AddDevice(ctx context.Context, device Device) (Device, error) {
 	}
 
 	return device, nil
-}
-
-func (s *Store) nextDeviceID(ctx context.Context) (string, error) {
-	var next int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) + 1 FROM devices`).Scan(&next); err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("dev-%06d", next), nil
 }
 
 func (s *Store) GetDevice(ctx context.Context, id string) (Device, error) {
@@ -218,7 +288,7 @@ func (s *Store) UpdateDevice(ctx context.Context, device Device) (Device, error)
 }
 
 func (s *Store) DeleteDevice(ctx context.Context, id string) error {
-	return deleteByID(ctx, s.db, "devices", id)
+	return s.deleteEntity(ctx, "device", id)
 }
 
 func (s *Store) ListNetworkNodes(ctx context.Context) ([]NetworkNode, error) {
@@ -251,11 +321,7 @@ func (s *Store) ListNetworkNodes(ctx context.Context) ([]NetworkNode, error) {
 func (s *Store) AddNetworkNode(ctx context.Context, node NetworkNode) (NetworkNode, error) {
 	now := time.Now().UTC()
 	if strings.TrimSpace(node.ID) == "" {
-		nextID, err := s.nextNetworkNodeID(ctx)
-		if err != nil {
-			return NetworkNode{}, err
-		}
-		node.ID = nextID
+		node.ID = "node-" + uuid.NewString()
 	}
 	node.CreatedAt = now
 	node.UpdatedAt = now
@@ -277,15 +343,6 @@ func (s *Store) AddNetworkNode(ctx context.Context, node NetworkNode) (NetworkNo
 	}
 
 	return node, nil
-}
-
-func (s *Store) nextNetworkNodeID(ctx context.Context) (string, error) {
-	var next int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) + 1 FROM network_nodes`).Scan(&next); err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("node-%06d", next), nil
 }
 
 func (s *Store) GetNetworkNode(ctx context.Context, id string) (NetworkNode, error) {
@@ -334,7 +391,7 @@ func (s *Store) UpdateNetworkNode(ctx context.Context, node NetworkNode) (Networ
 }
 
 func (s *Store) DeleteNetworkNode(ctx context.Context, id string) error {
-	return deleteByID(ctx, s.db, "network_nodes", id)
+	return s.deleteEntity(ctx, "networkNode", id)
 }
 
 func (s *Store) ListNetworkSegments(ctx context.Context) ([]NetworkSegment, error) {
@@ -367,11 +424,7 @@ func (s *Store) ListNetworkSegments(ctx context.Context) ([]NetworkSegment, erro
 func (s *Store) AddNetworkSegment(ctx context.Context, segment NetworkSegment) (NetworkSegment, error) {
 	now := time.Now().UTC()
 	if strings.TrimSpace(segment.ID) == "" {
-		nextID, err := s.nextNetworkSegmentID(ctx)
-		if err != nil {
-			return NetworkSegment{}, err
-		}
-		segment.ID = nextID
+		segment.ID = "segment-" + uuid.NewString()
 	}
 	segment.CreatedAt = now
 	segment.UpdatedAt = now
@@ -393,15 +446,6 @@ func (s *Store) AddNetworkSegment(ctx context.Context, segment NetworkSegment) (
 	}
 
 	return segment, nil
-}
-
-func (s *Store) nextNetworkSegmentID(ctx context.Context) (string, error) {
-	var next int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) + 1 FROM network_segments`).Scan(&next); err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("segment-%06d", next), nil
 }
 
 func (s *Store) GetNetworkSegment(ctx context.Context, id string) (NetworkSegment, error) {
@@ -450,7 +494,7 @@ func (s *Store) UpdateNetworkSegment(ctx context.Context, segment NetworkSegment
 }
 
 func (s *Store) DeleteNetworkSegment(ctx context.Context, id string) error {
-	return deleteByID(ctx, s.db, "network_segments", id)
+	return s.deleteEntity(ctx, "networkSegment", id)
 }
 
 func (s *Store) ListRelations(ctx context.Context) ([]Relation, error) {
@@ -483,7 +527,16 @@ func (s *Store) AddRelation(ctx context.Context, relation Relation) (Relation, e
 		return Relation{}, err
 	}
 
-	_, err = s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Relation{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := validateRelationEndpoints(ctx, tx, relation); err != nil {
+		return Relation{}, err
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO relations (
 			id, source_kind, source_id, target_kind, target_id, relation_type, confidence, metadata_json, observed_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -491,6 +544,9 @@ func (s *Store) AddRelation(ctx context.Context, relation Relation) (Relation, e
 		relation.ID, relation.SourceKind, relation.SourceID, relation.TargetKind, relation.TargetID, relation.RelationType, relation.Confidence, metadataJSON, relation.ObservedAt,
 	)
 	if err != nil {
+		return Relation{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return Relation{}, err
 	}
 
@@ -513,18 +569,27 @@ func (s *Store) GetRelation(ctx context.Context, id string) (Relation, error) {
 }
 
 func (s *Store) UpdateRelation(ctx context.Context, relation Relation) (Relation, error) {
-	current, err := s.GetRelation(ctx, relation.ID)
-	if err != nil {
-		return Relation{}, err
-	}
-
-	relation.ObservedAt = current.ObservedAt
 	_, metadataJSON, err := marshalJSONFields([]string{}, relation.Metadata)
 	if err != nil {
 		return Relation{}, err
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Relation{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := tx.QueryRowContext(ctx, `SELECT observed_at FROM relations WHERE id = ?`, relation.ID).Scan(&relation.ObservedAt); errors.Is(err, sql.ErrNoRows) {
+		return Relation{}, ErrNotFound
+	} else if err != nil {
+		return Relation{}, err
+	}
+	if err := validateRelationEndpoints(ctx, tx, relation); err != nil {
+		return Relation{}, err
+	}
+
+	result, err := tx.ExecContext(ctx, `
 		UPDATE relations
 		SET source_kind = ?, source_id = ?, target_kind = ?, target_id = ?, relation_type = ?, confidence = ?, metadata_json = ?
 		WHERE id = ?
@@ -536,12 +601,19 @@ func (s *Store) UpdateRelation(ctx context.Context, relation Relation) (Relation
 	if rows, err := result.RowsAffected(); err == nil && rows == 0 {
 		return Relation{}, ErrNotFound
 	}
+	if err := tx.Commit(); err != nil {
+		return Relation{}, err
+	}
 
 	return relation, nil
 }
 
 func (s *Store) DeleteRelation(ctx context.Context, id string) error {
-	return deleteByID(ctx, s.db, "relations", id)
+	result, err := s.db.ExecContext(ctx, `DELETE FROM relations WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	return requireDeletedRow(result)
 }
 
 func (s *Store) ListActions(ctx context.Context) ([]Action, error) {
@@ -606,17 +678,69 @@ func (s *Store) GetSSHCredential(ctx context.Context, deviceID string) (SSHCrede
 }
 
 func (s *Store) UpsertSSHCredential(ctx context.Context, credential SSHCredential) (SSHCredential, error) {
-	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SSHCredential{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
 
-	current, err := s.GetSSHCredential(ctx, credential.DeviceID)
-	if err != nil && !errors.Is(err, ErrNotFound) {
+	credential, err = upsertSSHCredential(ctx, tx, credential)
+	if err != nil {
+		return SSHCredential{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SSHCredential{}, err
+	}
+	return credential, nil
+}
+
+func (s *Store) UpsertSSHCredentialAndPort(ctx context.Context, credential SSHCredential, sshPort string) (SSHCredential, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SSHCredential{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var metadataJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT metadata_json FROM devices WHERE id = ?`, credential.DeviceID).Scan(&metadataJSON); errors.Is(err, sql.ErrNoRows) {
+		return SSHCredential{}, ErrNotFound
+	} else if err != nil {
 		return SSHCredential{}, err
 	}
 
-	if errors.Is(err, ErrNotFound) {
-		credential.CreatedAt = now
+	metadata := make(map[string]string)
+	if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+		return SSHCredential{}, fmt.Errorf("decode device metadata: %w", err)
+	}
+	if port := strings.TrimSpace(sshPort); port == "" {
+		delete(metadata, "sshPort")
 	} else {
-		credential.CreatedAt = current.CreatedAt
+		metadata["sshPort"] = port
+	}
+	_, metadataJSON, err = marshalJSONFields(nil, metadata)
+	if err != nil {
+		return SSHCredential{}, err
+	}
+
+	credential, err = upsertSSHCredential(ctx, tx, credential)
+	if err != nil {
+		return SSHCredential{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE devices SET metadata_json = ?, updated_at = ? WHERE id = ?`, metadataJSON, credential.UpdatedAt, credential.DeviceID); err != nil {
+		return SSHCredential{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SSHCredential{}, err
+	}
+	return credential, nil
+}
+
+func upsertSSHCredential(ctx context.Context, tx *sql.Tx, credential SSHCredential) (SSHCredential, error) {
+	now := time.Now().UTC()
+	if err := tx.QueryRowContext(ctx, `SELECT created_at FROM ssh_credentials WHERE device_id = ?`, credential.DeviceID).Scan(&credential.CreatedAt); errors.Is(err, sql.ErrNoRows) {
+		credential.CreatedAt = now
+	} else if err != nil {
+		return SSHCredential{}, err
 	}
 	credential.UpdatedAt = now
 	credential.HasPassword = credential.PasswordCiphertext != ""
@@ -624,7 +748,7 @@ func (s *Store) UpsertSSHCredential(ctx context.Context, credential SSHCredentia
 		credential.KeyVersion = 1
 	}
 
-	_, err = s.db.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO ssh_credentials (
 			device_id, username, password_ciphertext, password_nonce, key_version, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -638,7 +762,6 @@ func (s *Store) UpsertSSHCredential(ctx context.Context, credential SSHCredentia
 	if err != nil {
 		return SSHCredential{}, err
 	}
-
 	return credential, nil
 }
 
@@ -891,12 +1014,80 @@ func marshalJSONFields(tags []string, metadata map[string]string) (string, strin
 	return string(tagsJSON), string(metadataJSON), nil
 }
 
-func deleteByID(ctx context.Context, db *sql.DB, table string, id string) error {
-	result, err := db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE id = ?", table), id)
+func validateRelationEndpoints(ctx context.Context, tx *sql.Tx, relation Relation) error {
+	endpoints := []struct {
+		label string
+		kind  string
+		id    string
+	}{
+		{label: "source", kind: relation.SourceKind, id: relation.SourceID},
+		{label: "target", kind: relation.TargetKind, id: relation.TargetID},
+	}
+
+	for _, endpoint := range endpoints {
+		if strings.TrimSpace(endpoint.id) == "" {
+			return fmt.Errorf("%w: %s ID is empty", ErrInvalidRelationEndpoint, endpoint.label)
+		}
+		var query string
+		switch endpoint.kind {
+		case "device":
+			query = `SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`
+		case "networkNode":
+			query = `SELECT EXISTS(SELECT 1 FROM network_nodes WHERE id = ?)`
+		case "networkSegment":
+			query = `SELECT EXISTS(SELECT 1 FROM network_segments WHERE id = ?)`
+		default:
+			return fmt.Errorf("%w: unsupported %s kind %q", ErrInvalidRelationEndpoint, endpoint.label, endpoint.kind)
+		}
+
+		var exists bool
+		if err := tx.QueryRowContext(ctx, query, endpoint.id).Scan(&exists); err != nil {
+			return fmt.Errorf("validate %s relation endpoint: %w", endpoint.label, err)
+		}
+		if !exists {
+			return fmt.Errorf("%w: %s %s %q does not exist", ErrInvalidRelationEndpoint, endpoint.label, endpoint.kind, endpoint.id)
+		}
+	}
+	return nil
+}
+
+func (s *Store) deleteEntity(ctx context.Context, kind string, id string) error {
+	var deleteStatement string
+	switch kind {
+	case "device":
+		deleteStatement = `DELETE FROM devices WHERE id = ?`
+	case "networkNode":
+		deleteStatement = `DELETE FROM network_nodes WHERE id = ?`
+	case "networkSegment":
+		deleteStatement = `DELETE FROM network_segments WHERE id = ?`
+	default:
+		return fmt.Errorf("unsupported entity kind %q", kind)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = tx.Rollback() }()
 
+	result, err := tx.ExecContext(ctx, deleteStatement, id)
+	if err != nil {
+		return err
+	}
+	if err := requireDeletedRow(result); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM relations
+		WHERE (source_kind = ? AND source_id = ?)
+		   OR (target_kind = ? AND target_id = ?)
+	`, kind, id, kind, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func requireDeletedRow(result sql.Result) error {
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return err
@@ -904,7 +1095,6 @@ func deleteByID(ctx context.Context, db *sql.DB, table string, id string) error 
 	if rows == 0 {
 		return ErrNotFound
 	}
-
 	return nil
 }
 
