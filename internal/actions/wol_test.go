@@ -28,8 +28,14 @@ func TestMagicPacketLayout(t *testing.T) {
 	}
 }
 
-func TestMagicPacketRejectsNonEthernetAddress(t *testing.T) {
-	for _, address := range []string{"invalid", "01:02:03:04:05:06:07:08"} {
+func TestMagicPacketRejectsUnsafeEthernetAddress(t *testing.T) {
+	for _, address := range []string{
+		"invalid",
+		"01:02:03:04:05:06:07:08",
+		"00:00:00:00:00:00",
+		"FF:FF:FF:FF:FF:FF",
+		"01:00:5E:00:00:01",
+	} {
 		if _, err := magicPacket(address); err == nil {
 			t.Fatalf("expected %q to be rejected", address)
 		}

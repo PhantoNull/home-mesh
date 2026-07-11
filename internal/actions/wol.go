@@ -77,6 +77,13 @@ func magicPacket(macAddress string) ([]byte, error) {
 	if len(hardwareAddr) != 6 {
 		return nil, errors.New("wake-on-lan requires a 6-byte MAC address")
 	}
+	allZero := true
+	for _, value := range hardwareAddr {
+		allZero = allZero && value == 0
+	}
+	if hardwareAddr[0]&1 != 0 || allZero {
+		return nil, errors.New("wake-on-lan requires a non-zero unicast MAC address")
+	}
 
 	payload := make([]byte, 0, 102)
 	payload = append(payload, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}...)
