@@ -261,8 +261,7 @@ Native execution can override the default user known-hosts file with:
 
 - `HOME_MESH_SSH_KNOWN_HOSTS_PATH`
 
-`insecure` mode remains an explicit development-only escape hatch and disables
-server identity verification.
+Unverified SSH host keys are rejected; there is no insecure host-key mode.
 
 ### Database
 

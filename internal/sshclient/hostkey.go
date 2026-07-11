@@ -23,8 +23,6 @@ func HostKeyCallback(mode string, knownHostsPath string) (ssh.HostKeyCallback, e
 			return nil, fmt.Errorf("load known_hosts: %w", err)
 		}
 		return callback, nil
-	case "insecure":
-		return ssh.InsecureIgnoreHostKey(), nil
 	default:
 		return nil, fmt.Errorf("unsupported ssh host key mode %q", mode)
 	}
