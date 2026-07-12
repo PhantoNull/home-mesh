@@ -257,7 +257,6 @@ func (s *Service) scanTargetCIDR(ctx context.Context, targetCIDR string, hostsBy
 		"-PE",
 		"-PS22,80,443",
 		"-PA22,80,443",
-		"-PU53",
 		"-oX",
 		"-",
 		targetCIDR,

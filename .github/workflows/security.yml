@@ -110,16 +110,16 @@ jobs:
             docker run --detach --rm \
               --name home-mesh-${{ matrix.name }}-smoke \
               --read-only \
+              --cap-drop ALL \
               --security-opt no-new-privileges \
               --tmpfs /tmp:uid=10001,gid=10001,mode=0700 \
               --publish 127.0.0.1:${{ matrix.port }}:8080 \
               --env HOME_MESH_AUTH_DISABLED=true \
               --env HOME_MESH_DB_PATH=/tmp/home-mesh.db \
               --env HOME_MESH_SESSION_SECRET=ci-only-session-secret-with-at-least-32-bytes \
-              --env HOME_MESH_SSH_KNOWN_HOSTS_PATH=/tmp/known_hosts \
-              --entrypoint /bin/sh \
-              "${{ matrix.image }}" \
-              -c 'touch /tmp/known_hosts && exec /usr/local/bin/home-mesh-api'
+              --env HOME_MESH_SSH_KNOWN_HOSTS_SOURCE=/etc/home-mesh/known_hosts \
+              --volume "${{ github.workspace }}/config/known_hosts:/etc/home-mesh/known_hosts:ro" \
+              "${{ matrix.image }}"
           else
             docker run --detach --rm \
               --name home-mesh-${{ matrix.name }}-smoke \

@@ -42,6 +42,7 @@ RUN apk upgrade --no-cache \
     && chmod 0700 /data
 
 COPY --from=build --chown=root:root --chmod=0555 /out/home-mesh-api /usr/local/bin/home-mesh-api
+COPY --chown=root:root --chmod=0555 docker-entrypoint-api.sh /usr/local/bin/home-mesh-entrypoint
 
 WORKDIR /app
 ENV HOME=/tmp \
@@ -57,4 +58,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD wget -q -T 3 -O /dev/null http://127.0.0.1:8080/api/ready || exit 1
 
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["/usr/local/bin/home-mesh-api"]
+ENTRYPOINT ["/usr/local/bin/home-mesh-entrypoint"]

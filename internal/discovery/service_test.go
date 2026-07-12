@@ -228,6 +228,9 @@ func TestScanCIDRStreamsAndDeduplicatesPointToPointRangeWithOneProcess(t *testin
 	if strings.Contains(joinedArgs, " --disable-arp-ping ") {
 		t.Fatalf("nmap args %v disable ARP discovery", commandArgs)
 	}
+	if strings.Contains(joinedArgs, " -PU") {
+		t.Fatalf("nmap args %v require privileged UDP raw sockets", commandArgs)
+	}
 	assertIPs(t, streamed, []string{"192.0.2.11", "192.0.2.10"})
 
 	resultIPs := make([]string, len(result.Hosts))

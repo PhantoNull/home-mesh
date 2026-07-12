@@ -320,6 +320,10 @@ the host file selected by `HOME_MESH_SSH_KNOWN_HOSTS_FILE` (default
 channel before opening an SSH session. The file should be readable by the
 container user and must not contain unverified keys.
 
+The API entrypoint copies that read-only mount into its private tmpfs with mode
+`0600` before startup. This preserves permission validation on Linux and avoids
+Docker Desktop's synthetic bind-mount permissions disabling SSH on Windows.
+
 Native execution can override the default user known-hosts file with:
 
 - `HOME_MESH_SSH_KNOWN_HOSTS_PATH`
@@ -382,10 +386,16 @@ Current shape:
 - native non-Docker runs require `nmap` to be installed separately if you want discovery or faster batch scans
 - the backend falls back to legacy probing when `nmap` is unavailable
 - the background scan interval is controlled by `HOME_MESH_SCAN_INTERVAL`
+- discovery uses an unprivileged-compatible host probe profile; it omits raw
+  UDP probes and does not require added container capabilities
 - manual discovery and scheduled refresh share one coordinator, so overlapping
   `nmap` workloads are rejected or deferred rather than competing for the host
 - tunnel, VPN, and point-to-point interfaces are excluded from inferred local
   scan ranges; public-range discovery requires the explicit high-risk opt-in
+
+On Docker Desktop, automatic interface detection can expose only the internal
+Linux VM subnet. Enter the physical LAN explicitly in the discovery dialog (for
+example `192.168.1.0/24`), or deploy on a Linux host for native LAN visibility.
 
 You can override the binary path with:
 
