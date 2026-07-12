@@ -400,6 +400,7 @@ func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 				return
 			}
 			if expectedVersion != device.Version {
+				setVersionETag(w, device.Version)
 				handlePreconditionError(w, store.ErrConflict, "failed to persist ssh credential")
 				return
 			}
@@ -434,6 +435,11 @@ func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 				PasswordNonce:      nonce,
 				KeyVersion:         keyVersion,
 			}, sshPort, expectedVersion)
+			if errors.Is(err, store.ErrConflict) {
+				if currentDevice, currentErr := inventory.GetDevice(r.Context(), id); currentErr == nil {
+					setVersionETag(w, currentDevice.Version)
+				}
+			}
 			if handlePreconditionError(w, err, "failed to persist ssh credential") {
 				return
 			}
@@ -452,9 +458,16 @@ func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			if !ok {
 				return
 			}
-			if handlePreconditionError(w, inventory.DeleteSSHCredentialAndPort(r.Context(), id, version), "failed to delete ssh credential") {
+			err := inventory.DeleteSSHCredentialAndPort(r.Context(), id, version)
+			if errors.Is(err, store.ErrConflict) {
+				if currentDevice, currentErr := inventory.GetDevice(r.Context(), id); currentErr == nil {
+					setVersionETag(w, currentDevice.Version)
+				}
+			}
+			if handlePreconditionError(w, err, "failed to delete ssh credential") {
 				return
 			}
+			setVersionETag(w, version+1)
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodPut, http.MethodDelete)

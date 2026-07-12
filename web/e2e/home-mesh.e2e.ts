@@ -1,6 +1,6 @@
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test, type Page } from '@playwright/test'
-import { installDeterministicMocks } from './mock-api'
+import { emitMonitorScanEvent, installDeterministicMocks, inventoryFixture } from './mock-api'
 
 type RuntimeErrors = {
   console: string[]
@@ -67,6 +67,97 @@ test('renders the mocked inventory without browser or API errors', async ({ page
   expect(unexpectedRequests).toEqual([])
   expect(runtimeErrors.console).toEqual([])
   expect(runtimeErrors.page).toEqual([])
+})
+
+test('saves SSH credentials against the latest credential and monitor device version', async ({ page }) => {
+  const runtimeErrors = monitorRuntimeErrors(page)
+  const submittedIfMatches: Array<string | null> = []
+  const unexpectedRequests = await installDeterministicMocks(page, {
+    sshCredentialDeviceVersion: 4,
+    sshCredentialExpectedPutVersion: 5,
+    onSSHCredentialPut: (ifMatch) => submittedIfMatches.push(ifMatch),
+  })
+
+  await page.goto('/')
+  await expect(page.locator('#inventory-panel-devices').getByText('NAS Alpha', { exact: true })).toBeVisible()
+  await page.locator('#inventory-panel-devices').getByRole('button', { name: 'SSH' }).click()
+
+  const dialog = page.getByRole('dialog', { name: 'NAS Alpha' })
+  await expect(dialog).toBeVisible()
+  await emitMonitorScanEvent(page, 'device-updated', {
+    ...inventoryFixture.devices[0],
+    version: 5,
+    status: 'degraded',
+  })
+  await dialog.getByLabel('SSH username').fill('root')
+  await dialog.getByLabel('SSH password').fill('secret-password')
+  await dialog.getByRole('button', { name: 'Save SSH credentials' }).click()
+
+  await expect.poll(() => submittedIfMatches).toEqual(['"5"'])
+  await expect(page.getByText('SSH credentials saved for NAS Alpha.')).toBeVisible()
+  expect(unexpectedRequests).toEqual([])
+  expect(runtimeErrors.console).toEqual([])
+  expect(runtimeErrors.page).toEqual([])
+})
+
+test('rebases an SSH credential form after a concurrent device change', async ({ page }) => {
+  const submittedIfMatches: Array<string | null> = []
+  const unexpectedRequests = await installDeterministicMocks(page, {
+    sshCredentialDeviceVersion: 4,
+    sshCredentialConflictOnceVersion: 5,
+    onSSHCredentialPut: (ifMatch) => submittedIfMatches.push(ifMatch),
+  })
+
+  await page.goto('/')
+  await expect(page.locator('#inventory-panel-devices').getByText('NAS Alpha', { exact: true })).toBeVisible()
+  await page.locator('#inventory-panel-devices').getByRole('button', { name: 'SSH' }).click()
+
+  const dialog = page.getByRole('dialog', { name: 'NAS Alpha' })
+  await dialog.getByLabel('SSH username').fill('root')
+  await dialog.getByLabel('SSH password').fill('secret-password')
+  await dialog.getByRole('button', { name: 'Save SSH credentials' }).click()
+
+  await expect(dialog.getByRole('alert')).toContainText('Device changed while you were editing')
+  await expect(dialog.getByLabel('SSH password')).toHaveValue('secret-password')
+  await dialog.getByRole('button', { name: 'Save SSH credentials' }).click()
+
+  await expect(page.getByText('SSH credentials saved for NAS Alpha.')).toBeVisible()
+  expect(submittedIfMatches).toEqual(['"4"', '"5"'])
+  expect(unexpectedRequests).toEqual([])
+})
+
+test('refreshes global inventory when the SSH modal closes during a committed save', async ({ page }) => {
+  const submittedIfMatches: Array<string | null> = []
+  let inventoryGets = 0
+  const unexpectedRequests = await installDeterministicMocks(page, {
+    sshCredentialDeviceVersion: 4,
+    sshCredentialPutDelayMs: 100,
+    onSSHCredentialPut: (ifMatch) => submittedIfMatches.push(ifMatch),
+    onInventoryGet: () => { inventoryGets += 1 },
+  })
+
+  await page.goto('/')
+  await expect(page.locator('#inventory-panel-devices').getByText('NAS Alpha', { exact: true })).toBeVisible()
+  await page.locator('#inventory-panel-devices').getByRole('button', { name: 'SSH' }).click()
+
+  let dialog = page.getByRole('dialog', { name: 'NAS Alpha' })
+  await dialog.getByLabel('SSH username').fill('root')
+  await dialog.getByLabel('SSH password').fill('secret-password')
+  await dialog.getByRole('button', { name: 'Save SSH credentials' }).click()
+  await expect.poll(() => submittedIfMatches).toEqual(['"4"'])
+  await dialog.getByRole('button', { name: 'Close NAS Alpha' }).click()
+  await expect(dialog).toBeHidden()
+  await expect.poll(() => inventoryGets).toBeGreaterThanOrEqual(2)
+
+  await page.locator('#inventory-panel-devices').getByRole('button', { name: 'SSH' }).click()
+  dialog = page.getByRole('dialog', { name: 'NAS Alpha' })
+  await dialog.getByLabel('SSH username').fill('root')
+  await dialog.getByLabel('SSH password').fill('second-password')
+  await dialog.getByRole('button', { name: 'Save SSH credentials' }).click()
+
+  await expect(page.getByText('SSH credentials saved for NAS Alpha.')).toBeVisible()
+  expect(submittedIfMatches).toEqual(['"4"', '"5"'])
+  expect(unexpectedRequests).toEqual([])
 })
 
 test('keeps the dashboard and its topology scroller inside the viewport', async ({ page }) => {

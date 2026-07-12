@@ -5,6 +5,7 @@ import {
   normalizePanelURL,
   panelURLValidationError,
   parseBulkRefreshResponse,
+  parseResourceVersionETag,
   resolveSSHCapability,
   statusClassName,
   topologyEntityKey,
@@ -101,5 +102,19 @@ describe('SSH capability preflight', () => {
       available: false,
       reason: 'Master key missing.',
     })
+  })
+})
+
+describe('resource version ETag parsing', () => {
+  it('accepts only canonical positive strong version tags', () => {
+    expect(parseResourceVersionETag('"42"')).toBe(42)
+    expect(parseResourceVersionETag('W/"42"')).toBeNull()
+    expect(parseResourceVersionETag('"042"')).toBeNull()
+    expect(parseResourceVersionETag('"0"')).toBeNull()
+    expect(parseResourceVersionETag(null)).toBeNull()
+  })
+
+  it('rejects versions that cannot be represented safely in JavaScript', () => {
+    expect(parseResourceVersionETag('"9007199254740992"')).toBeNull()
   })
 })

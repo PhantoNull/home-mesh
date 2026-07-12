@@ -1,6 +1,15 @@
 import type { Page, Route } from '@playwright/test'
 import type { InventorySnapshot } from '../src/models'
 
+type DeterministicMockOptions = {
+  sshCredentialDeviceVersion?: number
+  sshCredentialExpectedPutVersion?: number
+  sshCredentialConflictOnceVersion?: number
+  sshCredentialPutDelayMs?: number
+  onSSHCredentialPut?: (ifMatch: string | null) => void
+  onInventoryGet?: () => void
+}
+
 export const inventoryFixture: InventorySnapshot = {
   devices: [
     {
@@ -78,15 +87,34 @@ export const inventoryFixture: InventorySnapshot = {
   ],
 }
 
-async function fulfillJSON(route: Route, body: unknown, status = 200) {
+async function fulfillJSON(route: Route, body: unknown, status = 200, headers?: Record<string, string>) {
   await route.fulfill({
     status,
     contentType: 'application/json',
+    headers,
     body: JSON.stringify(body),
   })
 }
 
-export async function installDeterministicMocks(page: Page): Promise<string[]> {
+export async function installDeterministicMocks(
+  page: Page,
+  options: DeterministicMockOptions = {},
+): Promise<string[]> {
+  let inventorySnapshot = structuredClone(inventoryFixture)
+  let currentSSHCredentialVersion = options.sshCredentialDeviceVersion ?? inventoryFixture.devices[0].version
+  let expectedSSHCredentialVersion = options.sshCredentialExpectedPutVersion
+    ?? currentSSHCredentialVersion
+  let shouldConflictSSHCredential = options.sshCredentialConflictOnceVersion !== undefined
+
+  const updateSSHDeviceVersion = (version: number) => {
+    inventorySnapshot = {
+      ...inventorySnapshot,
+      devices: inventorySnapshot.devices.map((device) =>
+        device.id === 'device-nas' ? { ...device, version } : device,
+      ),
+    }
+  }
+
   await page.addInitScript(() => {
     class DeterministicEventSource extends EventTarget {
       static readonly CONNECTING = 0
@@ -106,6 +134,9 @@ export async function installDeterministicMocks(page: Page): Promise<string[]> {
       constructor(url: string | URL) {
         super()
         this.url = String(url)
+        const testWindow = window as Window & { __homeMeshEventSources?: DeterministicEventSource[] }
+        testWindow.__homeMeshEventSources ??= []
+        testWindow.__homeMeshEventSources.push(this)
         window.setTimeout(() => {
           if (this.readyState === DeterministicEventSource.CLOSED) {
             return
@@ -139,8 +170,72 @@ export async function installDeterministicMocks(page: Page): Promise<string[]> {
         await fulfillJSON(route, { enabled: false, authenticated: true })
         return
       case 'GET /api/inventory':
-        await fulfillJSON(route, inventoryFixture)
+        options.onInventoryGet?.()
+        await fulfillJSON(route, inventorySnapshot)
         return
+      case 'GET /api/devices/device-nas/ssh-credential': {
+        await fulfillJSON(
+          route,
+          {
+            deviceId: 'device-nas',
+            username: '',
+            hasPassword: false,
+            keyVersion: 2,
+            sshPort: '22',
+            available: true,
+          },
+          200,
+          { ETag: `"${currentSSHCredentialVersion}"` },
+        )
+        return
+      }
+      case 'PUT /api/devices/device-nas/ssh-credential': {
+        const ifMatch = request.headers()['if-match'] ?? null
+        options.onSSHCredentialPut?.(ifMatch)
+        if (options.sshCredentialPutDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, options.sshCredentialPutDelayMs))
+        }
+        if (shouldConflictSSHCredential) {
+          shouldConflictSSHCredential = false
+          expectedSSHCredentialVersion = options.sshCredentialConflictOnceVersion!
+          currentSSHCredentialVersion = expectedSSHCredentialVersion
+          updateSSHDeviceVersion(expectedSSHCredentialVersion)
+          await fulfillJSON(
+            route,
+            { error: 'resource version no longer matches' },
+            412,
+            { ETag: `"${expectedSSHCredentialVersion}"` },
+          )
+          return
+        }
+        if (ifMatch !== `"${expectedSSHCredentialVersion}"`) {
+          await fulfillJSON(
+            route,
+            { error: 'resource version no longer matches' },
+            412,
+            { ETag: `"${expectedSSHCredentialVersion}"` },
+          )
+          return
+        }
+        const savedVersion = expectedSSHCredentialVersion + 1
+        expectedSSHCredentialVersion = savedVersion
+        currentSSHCredentialVersion = savedVersion
+        updateSSHDeviceVersion(savedVersion)
+        await fulfillJSON(
+          route,
+          {
+            deviceId: 'device-nas',
+            username: 'root',
+            hasPassword: true,
+            keyVersion: 2,
+            sshPort: '22',
+            available: true,
+          },
+          200,
+          { ETag: `"${savedVersion}"` },
+        )
+        return
+      }
       default:
         unexpectedRequests.push(key)
         await fulfillJSON(route, { error: `Unexpected E2E API request: ${key}` }, 501)
@@ -148,4 +243,25 @@ export async function installDeterministicMocks(page: Page): Promise<string[]> {
   })
 
   return unexpectedRequests
+}
+
+export async function emitMonitorScanEvent(page: Page, kind: string, data: unknown) {
+  await page.evaluate(
+    ({ eventKind, eventData }) => {
+      const testWindow = window as Window & {
+        __homeMeshEventSources?: Array<EventTarget & { readyState: number; url: string }>
+      }
+      const source = testWindow.__homeMeshEventSources
+        ?.slice()
+        .reverse()
+        .find((candidate) => candidate.url.endsWith('/api/events') && candidate.readyState !== 2)
+      if (!source) {
+        throw new Error('Monitor EventSource was not created')
+      }
+      source.dispatchEvent(new MessageEvent('scan', {
+        data: JSON.stringify({ kind: eventKind, data: eventData }),
+      }))
+    },
+    { eventKind: kind, eventData: data },
+  )
 }

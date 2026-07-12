@@ -33,6 +33,7 @@ import {
   normalizePanelURL,
   panelURLValidationError,
   parseBulkRefreshResponse,
+  parseResourceVersionETag,
   resolveSSHCapability,
   statusClassName,
   topologyEntityKey,
@@ -1494,6 +1495,7 @@ export default function App() {
   const [modalError, setModalError] = useState<string | null>(null)
   const [sshDraft, setSSHDraft] = useState<SSHCredentialDraft>(initialSSHCredentialDraft)
   const [sshModalDevice, setSSHModalDevice] = useState<Device | null>(null)
+  const [sshDeviceVersion, setSSHDeviceVersion] = useState<number | null>(null)
   const [sshModalError, setSSHModalError] = useState<string | null>(null)
   const [sshHasStoredPassword, setSSHHasStoredPassword] = useState(false)
   const [sshCapabilityAvailable, setSSHCapabilityAvailable] = useState(true)
@@ -1527,6 +1529,7 @@ export default function App() {
   const discoveryRequestRef = useRef<AbortController | null>(null)
   const discoveryGenerationRef = useRef(0)
   const sshRequestGenerationRef = useRef(0)
+  const sshModalDeviceIDRef = useRef<string | null>(null)
 
   useEffect(() => {
     stateRef.current = state
@@ -1540,6 +1543,27 @@ export default function App() {
     }
 
     return response
+  }
+
+  function updateSSHModalVersion(deviceID: string, version: number) {
+    if (sshModalDeviceIDRef.current !== deviceID) {
+      return
+    }
+    setSSHDeviceVersion((current) => Math.max(current ?? 0, version))
+    setSSHModalDevice((current) =>
+      current && current.id === deviceID && version > current.version
+        ? { ...current, version }
+        : current,
+    )
+  }
+
+  async function rebaseSSHModalAfterConflict(response: Response, deviceID: string): Promise<boolean> {
+    const currentVersion = parseResourceVersionETag(response.headers.get('ETag'))
+    if (currentVersion !== null) {
+      updateSSHModalVersion(deviceID, currentVersion)
+    }
+    const inventoryReloaded = await loadInventory()
+    return currentVersion !== null || inventoryReloaded
   }
 
   function invalidateDiscoveryStream(): number {
@@ -1670,6 +1694,12 @@ export default function App() {
               ? { kind: 'ready', data: updateDeviceInSnapshot(current.data, device) }
               : current,
           )
+          if (sshModalDeviceIDRef.current === device.id) {
+            setSSHModalDevice((current) =>
+              current && current.id === device.id && device.version >= current.version ? device : current,
+            )
+            setSSHDeviceVersion((current) => Math.max(current ?? 0, device.version))
+          }
           setRefreshingItems((current) => {
             const next = { ...current }
             delete next[device.id]
@@ -1706,7 +1736,7 @@ export default function App() {
     return () => source.close()
   }, [authState])
 
-  async function loadInventory() {
+  async function loadInventory(): Promise<boolean> {
     try {
       const response = await authFetch('/api/inventory')
       if (!response.ok) {
@@ -1715,11 +1745,25 @@ export default function App() {
 
       const data = (await response.json()) as InventorySnapshot
       setState({ kind: 'ready', data })
+      const modalDeviceID = sshModalDeviceIDRef.current
+      if (modalDeviceID) {
+        const latestDevice = data.devices.find((device) => device.id === modalDeviceID)
+        if (latestDevice) {
+          setSSHModalDevice((current) =>
+            current && current.id === latestDevice.id && latestDevice.version >= current.version
+              ? latestDevice
+              : current,
+          )
+          setSSHDeviceVersion((current) => Math.max(current ?? 0, latestDevice.version))
+        }
+      }
+      return true
     } catch (error) {
       setState({
         kind: 'error',
         message: error instanceof Error ? error.message : 'Unknown inventory error',
       })
+      return false
     }
   }
 
@@ -2208,8 +2252,10 @@ export default function App() {
 
   function closeSSHModal() {
     sshRequestGenerationRef.current += 1
+    sshModalDeviceIDRef.current = null
     setSSHModalError(null)
     setSSHModalDevice(null)
+    setSSHDeviceVersion(null)
     setSSHDraft({ ...initialSSHCredentialDraft })
     setSSHHasStoredPassword(false)
     setSSHCapabilityAvailable(true)
@@ -2223,8 +2269,10 @@ export default function App() {
   async function openSSHModal(device: Device) {
     const generation = sshRequestGenerationRef.current + 1
     sshRequestGenerationRef.current = generation
+    sshModalDeviceIDRef.current = device.id
     setActionState((current) => ({ ...current, [device.id]: 'ssh' }))
     setSSHModalDevice(device)
+    setSSHDeviceVersion(device.version)
     setSSHModalError(null)
     setSSHSubmitState('loading')
     setSSHDraft({ ...initialSSHCredentialDraft })
@@ -2245,6 +2293,10 @@ export default function App() {
       const credential = (await response.json()) as SSHCredential
       if (sshRequestGenerationRef.current !== generation) {
         return
+      }
+      const responseVersion = parseResourceVersionETag(response.headers.get('ETag'))
+      if (responseVersion !== null) {
+        updateSSHModalVersion(device.id, responseVersion)
       }
       const { available, reason: unavailableReason } = resolveSSHCapability(credential)
       setSSHDraft({
@@ -2709,12 +2761,13 @@ export default function App() {
     }
 
     const device = sshModalDevice
+    const expectedVersion = sshDeviceVersion ?? device.version
     const generation = sshRequestGenerationRef.current
     setSSHSubmitState('saving')
     try {
       const response = await authFetch(`/api/devices/${device.id}/ssh-credential`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json', 'If-Match': `"${device.version}"` },
+        headers: { 'Content-Type': 'application/json', 'If-Match': `"${expectedVersion}"` },
         body: JSON.stringify({
           username: sshDraft.username.trim(),
           password: sshDraft.password,
@@ -2724,30 +2777,39 @@ export default function App() {
 
       if (!response.ok) {
         const payload = (await response.json()) as { error?: string }
+        if (response.status === 412) {
+          const rebased = await rebaseSSHModalAfterConflict(response, device.id)
+          throw new Error(rebased
+            ? 'Device changed while you were editing. The form was rebased; review and save again.'
+            : 'Device changed while you were editing, and the latest version could not be loaded. Close and reopen SSH access.')
+        }
         throw new Error(payload.error ?? `SSH save failed with status ${response.status}`)
       }
       const savedCredential = (await response.json()) as SSHCredential
+      const savedVersion = parseResourceVersionETag(response.headers.get('ETag')) ?? expectedVersion + 1
 
-      if (sshRequestGenerationRef.current !== generation) {
-        return
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHConfigured((current) => ({ ...current, [device.id]: true }))
+        setSSHHasStoredPassword(true)
+        setSSHEditMode(false)
+        setSSHDraft((current) => ({ ...current, password: '' }))
+        setSSHConnectionState('Connecting...')
+        setSSHSessionKey((current) => current + 1)
+        setSSHDeviceVersion((current) => Math.max(current ?? 0, savedVersion))
+        setSSHModalDevice((current) =>
+          current && current.id === device.id
+            ? {
+                ...current,
+                version: Math.max(current.version, savedVersion),
+                metadata: { ...(current.metadata ?? {}), sshPort: savedCredential.sshPort || '22' },
+              }
+            : current,
+        )
       }
-      setSSHConfigured((current) => ({ ...current, [device.id]: true }))
-      setSSHHasStoredPassword(true)
-      setSSHEditMode(false)
-      setSSHDraft((current) => ({ ...current, password: '' }))
-      setSSHConnectionState('Connecting...')
-      setSSHSessionKey((current) => current + 1)
-      setSSHModalDevice((current) =>
-        current && current.id === device.id
-          ? {
-              ...current,
-              version: current.version + 1,
-              metadata: { ...(current.metadata ?? {}), sshPort: savedCredential.sshPort || '22' },
-            }
-          : current,
-      )
       await loadInventory()
-      setToast({ kind: 'success', message: `SSH credentials saved for ${device.name}.` })
+      if (sshRequestGenerationRef.current === generation) {
+        setToast({ kind: 'success', message: `SSH credentials saved for ${device.name}.` })
+      }
     } catch (error) {
       if (sshRequestGenerationRef.current === generation) {
         setSSHModalError(error instanceof Error ? error.message : 'Failed to save SSH credentials')
@@ -2765,36 +2827,43 @@ export default function App() {
     }
 
     const device = sshModalDevice
+    const expectedVersion = sshDeviceVersion ?? device.version
     const generation = sshRequestGenerationRef.current
     setSSHModalError(null)
     setSSHSubmitState('saving')
     try {
       const response = await authFetch(`/api/devices/${device.id}/ssh-credential`, {
         method: 'DELETE',
-        headers: { 'If-Match': `"${device.version}"` },
+        headers: { 'If-Match': `"${expectedVersion}"` },
       })
       if (!response.ok) {
         const payload = (await response.json()) as { error?: string }
+        if (response.status === 412) {
+          const rebased = await rebaseSSHModalAfterConflict(response, device.id)
+          throw new Error(rebased
+            ? 'Device changed while you were editing. The form was rebased; review and remove again.'
+            : 'Device changed while you were editing, and the latest version could not be loaded. Close and reopen SSH access.')
+        }
         throw new Error(payload.error ?? `SSH credential delete failed with status ${response.status}`)
       }
-      if (sshRequestGenerationRef.current !== generation) {
-        return
+      const deletedVersion = parseResourceVersionETag(response.headers.get('ETag')) ?? expectedVersion + 1
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHConfigured((current) => ({ ...current, [device.id]: false }))
+        setSSHHasStoredPassword(false)
+        setSSHEditMode(true)
+        setSSHDraft({ ...initialSSHCredentialDraft })
+        setSSHConnectionState('Credentials required')
+        setSSHSessionKey((current) => current + 1)
+        setSSHDeviceVersion((current) => Math.max(current ?? 0, deletedVersion))
+        setSSHModalDevice((current) => {
+          if (!current || current.id !== device.id) {
+            return current
+          }
+          const metadata = { ...(current.metadata ?? {}) }
+          delete metadata.sshPort
+          return { ...current, version: Math.max(current.version, deletedVersion), metadata }
+        })
       }
-
-      setSSHConfigured((current) => ({ ...current, [device.id]: false }))
-      setSSHHasStoredPassword(false)
-      setSSHEditMode(true)
-      setSSHDraft({ ...initialSSHCredentialDraft })
-      setSSHConnectionState('Credentials required')
-      setSSHSessionKey((current) => current + 1)
-      setSSHModalDevice((current) => {
-        if (!current || current.id !== device.id) {
-          return current
-        }
-        const metadata = { ...(current.metadata ?? {}) }
-        delete metadata.sshPort
-        return { ...current, version: current.version + 1, metadata }
-      })
       await loadInventory()
       if (sshRequestGenerationRef.current === generation) {
         setToast({ kind: 'success', message: `SSH credentials removed for ${device.name}.` })

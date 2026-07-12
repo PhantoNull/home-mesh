@@ -112,6 +112,16 @@ export function parseBulkRefreshResponse(value: unknown): BulkRefreshResponse {
   }
 }
 
+export function parseResourceVersionETag(value: string | null): number | null {
+  const match = /^"([1-9]\d*)"$/.exec(value ?? '')
+  if (!match) {
+    return null
+  }
+
+  const version = Number(match[1])
+  return Number.isSafeInteger(version) ? version : null
+}
+
 export function truncateTopologyLabel(value: string, maxLength = 24): string {
   if (value.length <= maxLength) {
     return value

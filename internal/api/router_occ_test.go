@@ -264,6 +264,9 @@ func TestSSHCredentialDeleteRequiresCurrentDeviceETag(t *testing.T) {
 	if staleResponse.Code != http.StatusPreconditionFailed {
 		t.Fatalf("stale If-Match status = %d, body = %s", staleResponse.Code, staleResponse.Body.String())
 	}
+	if staleResponse.Header().Get("ETag") != formatVersionETag(current.Version) {
+		t.Fatalf("stale delete ETag = %q, want %q", staleResponse.Header().Get("ETag"), formatVersionETag(current.Version))
+	}
 	if strings.Contains(staleResponse.Body.String(), secretSentinel) {
 		t.Fatalf("stale delete exposed ciphertext: %s", staleResponse.Body.String())
 	}
@@ -271,6 +274,9 @@ func TestSSHCredentialDeleteRequiresCurrentDeviceETag(t *testing.T) {
 	deletedResponse := serveOCCRequest(t, handler, http.MethodDelete, path, "", formatVersionETag(current.Version))
 	if deletedResponse.Code != http.StatusNoContent {
 		t.Fatalf("delete status = %d, body = %s", deletedResponse.Code, deletedResponse.Body.String())
+	}
+	if deletedResponse.Header().Get("ETag") != formatVersionETag(current.Version+1) {
+		t.Fatalf("delete ETag = %q, want %q", deletedResponse.Header().Get("ETag"), formatVersionETag(current.Version+1))
 	}
 	if _, err := inventory.GetSSHCredential(ctx, device.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("credential still exists: %v", err)
@@ -310,6 +316,9 @@ func TestSSHCredentialPutReturnsCanonicalPortAndNeverEchoesPassword(t *testing.T
 	staleResponse := serveOCCRequest(t, handler, http.MethodPut, path, body, formatVersionETag(device.Version+1))
 	if staleResponse.Code != http.StatusPreconditionFailed {
 		t.Fatalf("credential PUT with stale If-Match status = %d, body = %s", staleResponse.Code, staleResponse.Body.String())
+	}
+	if staleResponse.Header().Get("ETag") != formatVersionETag(device.Version) {
+		t.Fatalf("stale credential PUT ETag = %q, want %q", staleResponse.Header().Get("ETag"), formatVersionETag(device.Version))
 	}
 
 	putResponse := serveOCCRequest(t, handler, http.MethodPut, path, body, formatVersionETag(device.Version))
