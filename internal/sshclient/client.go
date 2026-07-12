@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 const (
@@ -87,6 +88,33 @@ func dialPassword(ctx context.Context, address string, username string, password
 		connectTimeout = defaultConnectTimeout
 	}
 
+	client, err := dialPasswordAttempt(ctx, address, username, password, connectTimeout, hostKeyCallback, nil)
+	if err == nil {
+		return client, nil
+	}
+
+	// A server can prefer an unpinned key type even when another key for the
+	// same host is pinned. Retry once using only algorithms derived from those
+	// pinned keys; SSH does not send authentication before host verification.
+	trustedAlgorithms := trustedHostKeyAlgorithms(err)
+	if len(trustedAlgorithms) == 0 {
+		return nil, err
+	}
+	client, retryErr := dialPasswordAttempt(ctx, address, username, password, connectTimeout, hostKeyCallback, trustedAlgorithms)
+	if retryErr == nil {
+		return client, nil
+	}
+	if ctx.Err() != nil {
+		return nil, retryErr
+	}
+	var negotiationErr *ssh.AlgorithmNegotiationError
+	if errors.As(retryErr, &negotiationErr) {
+		return nil, err
+	}
+	return nil, retryErr
+}
+
+func dialPasswordAttempt(ctx context.Context, address string, username string, password string, connectTimeout time.Duration, hostKeyCallback ssh.HostKeyCallback, hostKeyAlgorithms []string) (*ssh.Client, error) {
 	dialer := net.Dialer{Timeout: connectTimeout}
 	connection, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
@@ -105,11 +133,15 @@ func dialPassword(ctx context.Context, address string, username string, password
 	if err := connection.SetDeadline(deadline); err != nil {
 		stopCloseOnCancel()
 		_ = connection.Close()
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("connect ssh: %w", ctx.Err())
+		}
 		return nil, fmt.Errorf("set ssh handshake deadline: %w", err)
 	}
 
 	config := &ssh.ClientConfig{
-		User: username,
+		User:              username,
+		HostKeyAlgorithms: hostKeyAlgorithms,
 		Auth: []ssh.AuthMethod{
 			ssh.Password(password),
 		},
@@ -139,6 +171,47 @@ func dialPassword(ctx context.Context, address string, username string, password
 	}
 
 	return ssh.NewClient(clientConnection, channels, requests), nil
+}
+
+func trustedHostKeyAlgorithms(err error) []string {
+	var keyErr *knownhosts.KeyError
+	if !errors.As(err, &keyErr) || len(keyErr.Want) == 0 {
+		return nil
+	}
+
+	supported := make(map[string]struct{})
+	for _, algorithm := range ssh.SupportedAlgorithms().HostKeys {
+		supported[algorithm] = struct{}{}
+	}
+	algorithms := make([]string, 0, len(keyErr.Want))
+	seen := make(map[string]struct{})
+	appendSupported := func(candidates ...string) {
+		for _, candidate := range candidates {
+			if _, ok := supported[candidate]; !ok {
+				continue
+			}
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+			algorithms = append(algorithms, candidate)
+		}
+	}
+
+	for _, knownKey := range keyErr.Want {
+		if knownKey.Key == nil {
+			continue
+		}
+		switch knownKey.Key.Type() {
+		case ssh.KeyAlgoRSA:
+			appendSupported(ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256)
+		case ssh.CertAlgoRSAv01:
+			appendSupported(ssh.CertAlgoRSASHA512v01, ssh.CertAlgoRSASHA256v01)
+		default:
+			appendSupported(knownKey.Key.Type())
+		}
+	}
+	return algorithms
 }
 
 func sshSetupContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

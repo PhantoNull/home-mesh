@@ -2,13 +2,134 @@ package sshclient
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
+
+func TestDialPasswordRetriesAHostKeyAlgorithmAlreadyInKnownHosts(t *testing.T) {
+	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ECDSA host key: %v", err)
+	}
+	ecdsaSigner, err := ssh.NewSignerFromKey(ecdsaKey)
+	if err != nil {
+		t.Fatalf("create ECDSA host signer: %v", err)
+	}
+	_, ed25519Key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ED25519 host key: %v", err)
+	}
+	ed25519Signer, err := ssh.NewSignerFromKey(ed25519Key)
+	if err != nil {
+		t.Fatalf("create ED25519 host signer: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	var passwordChecks atomic.Int32
+	serverConfig := &ssh.ServerConfig{
+		PasswordCallback: func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			passwordChecks.Add(1)
+			if string(password) != "password" {
+				return nil, errors.New("invalid password")
+			}
+			return nil, nil
+		},
+	}
+	serverConfig.AddHostKey(ecdsaSigner)
+	serverConfig.AddHostKey(ed25519Signer)
+	go serveSSHHandshakes(listener, serverConfig)
+
+	knownHostsPath := filepath.Join(t.TempDir(), "known_hosts")
+	trustedLine := knownhosts.Line(
+		[]string{knownhosts.Normalize(listener.Addr().String())},
+		ed25519Signer.PublicKey(),
+	)
+	if err := os.WriteFile(knownHostsPath, []byte(trustedLine+"\n"), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+	knownHostsCallback, err := knownhosts.New(knownHostsPath)
+	if err != nil {
+		t.Fatalf("load known_hosts: %v", err)
+	}
+
+	var seenMu sync.Mutex
+	seenAlgorithms := make([]string, 0, 2)
+	callback := func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		seenMu.Lock()
+		seenAlgorithms = append(seenAlgorithms, key.Type())
+		seenMu.Unlock()
+		return knownHostsCallback(hostname, remote, key)
+	}
+
+	client, err := dialPassword(context.Background(), listener.Addr().String(), "user", "password", time.Second, callback)
+	if err != nil {
+		t.Fatalf("dial using trusted alternate host key: %v", err)
+	}
+	_ = client.Close()
+
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	if len(seenAlgorithms) != 2 || seenAlgorithms[0] != ssh.KeyAlgoECDSA256 || seenAlgorithms[1] != ssh.KeyAlgoED25519 {
+		t.Fatalf("host key algorithms = %v, want [%s %s]", seenAlgorithms, ssh.KeyAlgoECDSA256, ssh.KeyAlgoED25519)
+	}
+	if passwordChecks.Load() != 1 {
+		t.Fatalf("password authentication attempts = %d, want 1 after the trusted host key was selected", passwordChecks.Load())
+	}
+}
+
+func TestTrustedHostKeyAlgorithmsDoesNotRetryUnknownOrUnusableTrust(t *testing.T) {
+	for name, err := range map[string]error{
+		"unknown host":    &knownhosts.KeyError{},
+		"nil key":         &knownhosts.KeyError{Want: []knownhosts.KnownKey{{}}},
+		"unrelated error": errors.New("host key callback failed"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if algorithms := trustedHostKeyAlgorithms(err); len(algorithms) != 0 {
+				t.Fatalf("trusted algorithms = %v, want none", algorithms)
+			}
+		})
+	}
+}
+
+func serveSSHHandshakes(listener net.Listener, config *ssh.ServerConfig) {
+	for {
+		rawConnection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			connection, channels, requests, err := ssh.NewServerConn(rawConnection, config)
+			if err != nil {
+				_ = rawConnection.Close()
+				return
+			}
+			go ssh.DiscardRequests(requests)
+			go func() {
+				for channel := range channels {
+					_ = channel.Reject(ssh.UnknownChannelType, "test server does not accept channels")
+				}
+			}()
+			_ = connection.Wait()
+		}()
+	}
+}
 
 func TestDialPasswordBoundsStalledHandshake(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
