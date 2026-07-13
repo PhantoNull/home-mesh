@@ -52,6 +52,9 @@ func RunPasswordCommandContext(ctx context.Context, address string, username str
 	session.Stdout = output
 	session.Stderr = output
 
+	// This is the intentional remote-shell boundary: the command is sent as an
+	// SSH exec request to the authenticated device, never interpreted by the API host.
+	// codeql[go/command-injection]
 	if err := session.Start(command); err != nil {
 		setupCancellation.Stop()
 		return Result{}, fmt.Errorf("start ssh command: %w", preferContextError(setupCtx, err))
