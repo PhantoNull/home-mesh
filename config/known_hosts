@@ -1,0 +1,2 @@
+# Add OpenSSH known_hosts entries verified through a trusted channel.
+# SSH connections remain fail-closed until the target host key is listed here.

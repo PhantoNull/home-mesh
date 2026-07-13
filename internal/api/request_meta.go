@@ -1,104 +1,173 @@
 package api
 
 import (
-	"net"
+	"fmt"
 	"net/http"
+	"net/netip"
 	"strings"
 )
 
-func extractClientIP(r *http.Request) string {
-	peerIP := remoteIP(r)
-	if isTrustedProxy(peerIP) {
-		if clientIP := parseForwardedClientIP(r.Header.Get("X-Forwarded-For")); clientIP != "" {
-			return clientIP
+type requestMetadata struct {
+	trustedProxyCIDRs []netip.Prefix
+	allowedHosts      map[string]struct{}
+}
+
+func newRequestMetadata(cidrs []string, allowedHostLists ...[]string) (*requestMetadata, error) {
+	trustedProxyCIDRs := make([]netip.Prefix, 0, len(cidrs))
+	for _, value := range cidrs {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(value))
+		if err != nil {
+			return nil, fmt.Errorf("invalid HOME_MESH_TRUSTED_PROXY_CIDRS entry %q: %w", value, err)
 		}
-		if clientIP := parseForwardedClientIP(r.Header.Get("X-Real-IP")); clientIP != "" {
-			return clientIP
+		trustedProxyCIDRs = append(trustedProxyCIDRs, prefix.Masked())
+	}
+
+	allowedHosts := make(map[string]struct{})
+	for _, values := range allowedHostLists {
+		for _, value := range values {
+			host, ok := canonicalAllowedHost(value)
+			if !ok {
+				return nil, fmt.Errorf("invalid HOME_MESH_ALLOWED_HOSTS entry %q", value)
+			}
+			allowedHosts[host] = struct{}{}
 		}
 	}
 
-	return peerIP
+	return &requestMetadata{trustedProxyCIDRs: trustedProxyCIDRs, allowedHosts: allowedHosts}, nil
 }
 
-func effectiveRequestHost(r *http.Request) string {
-	peerIP := remoteIP(r)
-	if isTrustedProxy(peerIP) {
-		if host := parseForwardedHost(r.Header.Get("X-Forwarded-Host")); host != "" {
-			return host
-		}
-		if host := parseForwardedHostFromForwarded(r.Header.Get("Forwarded")); host != "" {
-			return host
-		}
-	}
-
-	return strings.TrimSpace(r.Host)
-}
-
-func remoteIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		if ip := net.ParseIP(strings.TrimSpace(r.RemoteAddr)); ip != nil {
-			return ip.String()
-		}
+func (m *requestMetadata) clientIP(r *http.Request) string {
+	peer, ok := remoteAddr(r)
+	if !ok {
 		return strings.TrimSpace(r.RemoteAddr)
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.String()
+	if !m.isTrustedProxy(peer) {
+		return peer.String()
 	}
-	return host
+
+	if forwardedFor := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwardedFor != "" {
+		chain, valid := parseForwardedFor(forwardedFor)
+		if !valid {
+			return peer.String()
+		}
+		for i := len(chain) - 1; i >= 0; i-- {
+			if !m.isTrustedProxy(chain[i]) {
+				return chain[i].String()
+			}
+		}
+		return chain[0].String()
+	}
+
+	if realIP, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get("X-Real-IP"))); err == nil {
+		return realIP.Unmap().String()
+	}
+	return peer.String()
 }
 
-func isTrustedProxy(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
+func (m *requestMetadata) effectiveScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+
+	peer, ok := remoteAddr(r)
+	if !ok || !m.isTrustedProxy(peer) {
+		return "http"
+	}
+
+	forwardedProto := strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")
+	if len(forwardedProto) == 0 {
+		return "http"
+	}
+	switch strings.ToLower(strings.TrimSpace(forwardedProto[len(forwardedProto)-1])) {
+	case "https":
+		return "https"
+	case "http":
+		return "http"
+	default:
+		return "http"
+	}
+}
+
+func (m *requestMetadata) isSecureRequest(r *http.Request) bool {
+	return m.effectiveScheme(r) == "https"
+}
+
+func (m *requestMetadata) isTrustedProxy(address netip.Addr) bool {
+	address = address.Unmap()
+	for _, prefix := range m.trustedProxyCIDRs {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *requestMetadata) isAllowedHost(hostport string) bool {
+	host, _, ok := splitHostPort(hostport)
+	if !ok {
 		return false
 	}
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+	if address, err := netip.ParseAddr(host); err == nil && address.IsValid() {
 		return true
 	}
-
-	if ipv4 := ip.To4(); ipv4 != nil {
-		return ipv4[0] == 10 ||
-			(ipv4[0] == 172 && ipv4[1] >= 16 && ipv4[1] <= 31) ||
-			(ipv4[0] == 192 && ipv4[1] == 168)
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "localhost" {
+		return true
 	}
-
-	return len(ip) == net.IPv6len && (ip[0]&0xfe) == 0xfc
+	_, allowed := m.allowedHosts[host]
+	return allowed
 }
 
-func parseForwardedClientIP(headerValue string) string {
-	for _, part := range strings.Split(headerValue, ",") {
+func canonicalAllowedHost(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "/?#@") {
+		return "", false
+	}
+	host, _, ok := splitHostPort(value)
+	if !ok {
+		return "", false
+	}
+	if address, err := netip.ParseAddr(host); err == nil && address.IsValid() {
+		return address.Unmap().String(), true
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" || len(host) > 253 {
+		return "", false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+				return "", false
+			}
+		}
+	}
+	return host, true
+}
+
+func remoteAddr(r *http.Request) (netip.Addr, bool) {
+	if addressPort, err := netip.ParseAddrPort(strings.TrimSpace(r.RemoteAddr)); err == nil {
+		return addressPort.Addr().Unmap(), true
+	}
+	address, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(r.RemoteAddr), "[]"))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return address.Unmap(), true
+}
+
+func parseForwardedFor(headerValue string) ([]netip.Addr, bool) {
+	parts := strings.Split(headerValue, ",")
+	chain := make([]netip.Addr, 0, len(parts))
+	for _, part := range parts {
 		candidate := strings.Trim(strings.TrimSpace(part), "\"")
-		if ip := net.ParseIP(candidate); ip != nil {
-			return ip.String()
+		address, err := netip.ParseAddr(candidate)
+		if err != nil {
+			return nil, false
 		}
+		chain = append(chain, address.Unmap())
 	}
-
-	return ""
-}
-
-func parseForwardedHost(headerValue string) string {
-	for _, part := range strings.Split(headerValue, ",") {
-		if host := strings.Trim(strings.TrimSpace(part), "\""); host != "" {
-			return host
-		}
-	}
-
-	return ""
-}
-
-func parseForwardedHostFromForwarded(headerValue string) string {
-	for _, section := range strings.Split(headerValue, ",") {
-		for _, field := range strings.Split(section, ";") {
-			name, value, ok := strings.Cut(field, "=")
-			if !ok || !strings.EqualFold(strings.TrimSpace(name), "host") {
-				continue
-			}
-			if host := strings.Trim(strings.TrimSpace(value), "\""); host != "" {
-				return host
-			}
-		}
-	}
-
-	return ""
+	return chain, len(chain) > 0
 }

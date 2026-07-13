@@ -1,13 +1,17 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,16 +22,13 @@ import (
 	"github.com/PhantoNull/home-mesh/internal/secrets"
 	"github.com/PhantoNull/home-mesh/internal/sshclient"
 	"github.com/PhantoNull/home-mesh/internal/store"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 )
 
 type healthResponse struct {
-	Name      string `json:"name"`
-	Status    string `json:"status"`
-	Timestamp string `json:"timestamp"`
-	Env       string `json:"env"`
-	NmapAvail bool   `json:"nmapAvailable"`
+	Status string `json:"status"`
 }
 
 type sshCredentialPayload struct {
@@ -37,27 +38,22 @@ type sshCredentialPayload struct {
 }
 
 type sshCredentialResponse struct {
-	DeviceID    string `json:"deviceId"`
-	Username    string `json:"username"`
-	HasPassword bool   `json:"hasPassword"`
-	KeyVersion  int    `json:"keyVersion"`
-	SSHPort     string `json:"sshPort"`
+	DeviceID          string `json:"deviceId"`
+	Username          string `json:"username"`
+	HasPassword       bool   `json:"hasPassword"`
+	KeyVersion        int    `json:"keyVersion"`
+	SSHPort           string `json:"sshPort"`
+	Available         bool   `json:"available"`
+	UnavailableReason string `json:"unavailableReason,omitempty"`
 }
 
 type sshCommandPayload struct {
 	Command string `json:"command"`
 }
 
-type terminalClientMessage struct {
-	Type string `json:"type"`
-	Data string `json:"data,omitempty"`
-	Cols int    `json:"cols,omitempty"`
-	Rows int    `json:"rows,omitempty"`
-}
-
-type terminalServerMessage struct {
-	Type string `json:"type"`
-	Data string `json:"data,omitempty"`
+type inventoryOrderPayload struct {
+	Kind  string                     `json:"kind"`
+	Items []store.InventoryOrderItem `json:"items"`
 }
 
 type discoveryScanPayload struct {
@@ -72,33 +68,88 @@ type discoveryScanResponse struct {
 	SegmentCandidates []discoverySegmentCandidate `json:"segmentCandidates,omitempty"`
 }
 
+type discoveryStreamError struct {
+	Error string `json:"error"`
+}
+
 type discoverySegmentCandidate struct {
 	CIDR string `json:"cidr"`
 	Name string `json:"name"`
 }
 
-func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService *discovery.Service, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (http.Handler, error) {
-	mux := http.NewServeMux()
-	upgrader := websocket.Upgrader{
-		CheckOrigin: checkWebSocketOrigin,
-	}
-	auth, err := newAuthManager(cfg, inventory)
+type discoveryScanner interface {
+	Capabilities() discovery.Capabilities
+	ScanCIDR(context.Context, string) (discovery.ScanResult, error)
+	ScanCIDRStream(context.Context, string, func(discovery.HostMatch) error) (discovery.ScanResult, error)
+}
+
+type inventoryRefresher interface {
+	RefreshAll(context.Context) (monitor.RefreshResult, error)
+}
+
+var errSSETransport = errors.New("sse transport failure")
+
+const maxJSONBodyBytes int64 = 1 << 20
+
+const (
+	synchronousOperationTimeout = 2*time.Minute + 15*time.Second
+	synchronousWriteTimeout     = synchronousOperationTimeout + 15*time.Second
+)
+
+var errJSONBodyTooLarge = errors.New("request body exceeds maximum size")
+
+func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback) (*Router, error) {
+	return newRouter(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback, newSSHConcurrencyLimits(maxConcurrentSSHCommands, maxConcurrentSSHTerminals))
+}
+
+func NewRouterWithHostKeyStore(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback, hostKeyStore *sshclient.HostKeyStore) (*Router, error) {
+	return newRouterWithHostKeyStore(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback, hostKeyStore, newSSHConcurrencyLimits(maxConcurrentSSHCommands, maxConcurrentSSHTerminals))
+}
+
+func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback, sshLimits *sshConcurrencyLimits) (*Router, error) {
+	return newRouterWithHostKeyStore(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback, nil, sshLimits)
+}
+
+func newRouterWithHostKeyStore(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback, hostKeyStore *sshclient.HostKeyStore, sshLimits *sshConcurrencyLimits) (*Router, error) {
+	requests, err := newRequestMetadata(cfg.TrustedProxyCIDRs, cfg.AllowedHosts)
 	if err != nil {
 		return nil, err
 	}
+
+	mux := http.NewServeMux()
+	upgrader := websocket.Upgrader{
+		CheckOrigin: requests.checkWebSocketOrigin,
+	}
+	auth, err := newAuthManager(cfg, inventory, requests)
+	if err != nil {
+		return nil, err
+	}
+	terminalConnections := newTerminalConnectionTracker()
 
 	mux.HandleFunc("/api/auth/session", auth.handleSession)
 	mux.HandleFunc("/api/auth/login", auth.handleLogin)
 	mux.HandleFunc("/api/auth/logout", auth.handleLogout)
 
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, healthResponse{
-			Name:      cfg.AppName,
-			Status:    "ok",
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Env:       cfg.Env,
-			NmapAvail: refresher.UsingNmap(),
-		})
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
+	})
+
+	mux.HandleFunc("/api/ready", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		if err := inventory.Ready(r.Context()); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, healthResponse{Status: "not_ready"})
+			return
+		}
+		writeJSON(w, http.StatusOK, healthResponse{Status: "ready"})
 	})
 
 	mux.HandleFunc("/api/events", handleSSE(bus))
@@ -114,37 +165,26 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load inventory"})
 			return
 		}
-		for i := range snapshot.Devices {
-			snapshot.Devices[i].Status = "unknown"
-		}
-		for i := range snapshot.NetworkNodes {
-			snapshot.NetworkNodes[i].Status = "unknown"
-		}
-
 		writeJSON(w, http.StatusOK, snapshot)
 	})
 
-	mux.HandleFunc("/api/actions", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			actionHistory, err := inventory.ListActions(r.Context())
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load actions"})
-				return
-			}
-
-			writeJSON(w, http.StatusOK, actionHistory)
-		case http.MethodDelete:
-			if err := inventory.ClearActions(r.Context()); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to clear actions"})
-				return
-			}
-
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			methodNotAllowed(w, http.MethodGet, http.MethodDelete)
+	mux.HandleFunc("/api/inventory/order", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			methodNotAllowed(w, http.MethodPut)
+			return
 		}
+
+		var payload inventoryOrderPayload
+		if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid inventory order payload") {
+			return
+		}
+		if handleStoreError(w, inventory.ReorderInventory(r.Context(), payload.Kind, payload.Items), "failed to reorder inventory") {
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
+
+	mux.HandleFunc("/api/actions", handleActionHistory(inventory))
 
 	mux.HandleFunc("/api/discovery/capabilities", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -155,66 +195,10 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		writeJSON(w, http.StatusOK, discoveryService.Capabilities())
 	})
 
-	mux.HandleFunc("/api/discovery/scan", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			methodNotAllowed(w, http.MethodPost)
-			return
-		}
+	mux.HandleFunc("/api/discovery/scan/stream", handleDiscoveryScanStream(inventory, discoveryService))
+	mux.HandleFunc("/api/discovery/scan", handleDiscoveryScan(inventory, discoveryService))
 
-		var payload discoveryScanPayload
-		if err := decodeJSON(r, &payload); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid discovery payload"})
-			return
-		}
-		result, err := discoveryService.ScanCIDR(r.Context(), payload.CIDR)
-		if errors.Is(err, discovery.ErrNmapUnavailable) {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "nmap is not available in the current runtime"})
-			return
-		}
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-			return
-		}
-
-		filteredHosts, segmentCandidates, err := filterDiscoveryResults(r.Context(), inventory, result)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to compare discovery results with inventory"})
-			return
-		}
-
-		writeJSON(w, http.StatusOK, discoveryScanResponse{
-			Provider:          result.Provider,
-			CIDR:              result.CIDR,
-			ScannedCIDRs:      result.ScannedCIDRs,
-			Hosts:             filteredHosts,
-			SegmentCandidates: segmentCandidates,
-		})
-	})
-
-	mux.HandleFunc("/api/devices/refresh", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			methodNotAllowed(w, http.MethodPost)
-			return
-		}
-
-		result, err := refresher.RefreshAll(r.Context())
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to refresh devices"})
-			return
-		}
-		snapshot, err := inventory.Snapshot(r.Context())
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load refreshed inventory"})
-			return
-		}
-		snapshot.Devices = result.Devices
-		snapshot.NetworkNodes = result.NetworkNodes
-
-		writeJSON(w, http.StatusOK, map[string]any{
-			"summary":  result.Summary,
-			"snapshot": snapshot,
-		})
-	})
+	mux.HandleFunc("/api/devices/refresh", handleInventoryRefresh(inventory, refresher))
 
 	mux.HandleFunc("/api/devices", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -228,8 +212,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			writeJSON(w, http.StatusOK, devices)
 		case http.MethodPost:
 			var payload store.Device
-			if err := decodeJSON(r, &payload); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid device payload"})
+			if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid device payload") {
 				return
 			}
 
@@ -240,14 +223,14 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			payload.Status = "unknown"
 
 			device, err := inventory.AddDevice(r.Context(), payload)
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create device"})
+			if handleStoreError(w, err, "failed to create device") {
 				return
 			}
 
 			_ = refresher.RefreshDeviceByID(r.Context(), device.ID)
 			device, _ = inventory.GetDevice(r.Context(), device.ID)
 
+			setVersionETag(w, device.Version)
 			writeJSON(w, http.StatusCreated, device)
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodPost)
@@ -261,11 +244,11 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			if handleStoreError(w, err, "failed to load device") {
 				return
 			}
+			setVersionETag(w, device.Version)
 			writeJSON(w, http.StatusOK, device)
 		case http.MethodPut:
 			var payload store.Device
-			if err := decodeJSON(r, &payload); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid device payload"})
+			if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid device payload") {
 				return
 			}
 			payload.ID = id
@@ -282,9 +265,14 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			if handleStoreError(w, err, "failed to update device") {
 				return
 			}
+			setVersionETag(w, device.Version)
 			writeJSON(w, http.StatusOK, device)
 		case http.MethodDelete:
-			if handleStoreError(w, inventory.DeleteDevice(r.Context(), id), "failed to delete device") {
+			version, ok := requireIfMatchVersion(w, r)
+			if !ok {
+				return
+			}
+			if handlePreconditionError(w, inventory.DeleteDeviceVersioned(r.Context(), id, version), "failed to delete device") {
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -304,6 +292,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			return
 		}
 
+		setVersionETag(w, device.Version)
 		writeJSON(w, http.StatusOK, device)
 	})
 	mux.HandleFunc("/api/devices/{id}/wake", func(w http.ResponseWriter, r *http.Request) {
@@ -325,36 +314,46 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 
 		startedAt := time.Now().UTC()
 		actionRecord := store.Action{
-			ID:            generateActionID("wake_on_lan", id, startedAt),
-			DeviceID:      id,
-			ActionType:    "wake_on_lan",
-			Status:        "completed",
-			ResultSummary: "Magic packet sent successfully.",
+			ID:         generateActionID("wake_on_lan"),
+			DeviceID:   id,
+			ActionType: "wake_on_lan",
 			Metadata: map[string]string{
 				"deviceName": device.Name,
 				"macAddress": device.MACAddress,
 			},
-			StartedAt:  startedAt,
-			FinishedAt: startedAt,
+			StartedAt: startedAt,
 		}
 
-		if err := actions.SendWakeOnLAN(device.MACAddress); err != nil {
-			actionRecord.Status = "failed"
-			actionRecord.ResultSummary = err.Error()
+		actionResult, err := executeAuditedAction(r.Context(), inventory, actionRecord, func() auditedOperationOutcome {
+			sendErr := actions.SendWakeOnLANContext(r.Context(), device.MACAddress)
+			if sendErr != nil {
+				return auditedOperationOutcome{
+					Err:           sendErr,
+					ResultSummary: "Wake-on-LAN failed.",
+					Metadata:      map[string]string{"terminationReason": "send_error"},
+				}
+			}
+			return auditedOperationOutcome{
+				ResultSummary: "Magic packet sent successfully.",
+				Metadata:      map[string]string{"terminationReason": "packet_sent"},
+			}
+		})
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to start wake action"})
+			return
+		}
+		if actionResult.FinalAuditErr != nil {
+			log.Printf("finalize wake action %s: %v", actionResult.Action.ID, actionResult.FinalAuditErr)
 		}
 
-		recorded, recordErr := inventory.AddAction(r.Context(), actionRecord)
-		if recordErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist wake action"})
+		response := actionResponse(actionResult.Action, actionResult.FinalAuditErr == nil)
+		if actionResult.OperationErr != nil {
+			response["error"] = actionResult.OperationErr.Error()
+			writeJSON(w, http.StatusBadGateway, response)
 			return
 		}
 
-		if actionRecord.Status == "failed" {
-			writeJSON(w, http.StatusBadGateway, recorded)
-			return
-		}
-
-		writeJSON(w, http.StatusCreated, recorded)
+		writeJSON(w, http.StatusCreated, response)
 	})
 	mux.HandleFunc("/api/devices/{id}/ssh-credential", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
@@ -366,14 +365,22 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 
 		switch r.Method {
 		case http.MethodGet:
+			available := sshAccessAvailable(secretService, hostKeyCallback)
+			unavailableReason := ""
+			if !available {
+				unavailableReason = sshUnavailableReason
+			}
 			credential, err := inventory.GetSSHCredential(r.Context(), id)
 			if errors.Is(err, store.ErrNotFound) {
+				setVersionETag(w, device.Version)
 				writeJSON(w, http.StatusOK, sshCredentialResponse{
-					DeviceID:    id,
-					Username:    "",
-					HasPassword: false,
-					KeyVersion:  1,
-					SSHPort:     sshPortForDevice(device),
+					DeviceID:          id,
+					Username:          "",
+					HasPassword:       false,
+					KeyVersion:        currentSecretVersion(secretService),
+					SSHPort:           sshPortForDevice(device),
+					Available:         available,
+					UnavailableReason: unavailableReason,
 				})
 				return
 			}
@@ -381,22 +388,32 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 				return
 			}
 
+			setVersionETag(w, device.Version)
 			writeJSON(w, http.StatusOK, sshCredentialResponse{
-				DeviceID:    credential.DeviceID,
-				Username:    credential.Username,
-				HasPassword: credential.HasPassword,
-				KeyVersion:  credential.KeyVersion,
-				SSHPort:     sshPortForDevice(device),
+				DeviceID:          credential.DeviceID,
+				Username:          credential.Username,
+				HasPassword:       credential.HasPassword,
+				KeyVersion:        credential.KeyVersion,
+				SSHPort:           sshPortForDevice(device),
+				Available:         available,
+				UnavailableReason: unavailableReason,
 			})
 		case http.MethodPut:
-			if secretService == nil {
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ssh credential storage is not configured; set HOME_MESH_MASTER_KEY"})
+			if !sshAccessAvailable(secretService, hostKeyCallback) {
+				writeSSHUnavailable(w)
 				return
 			}
-
+			expectedVersion, ok := requireIfMatchVersion(w, r)
+			if !ok {
+				return
+			}
+			if expectedVersion != device.Version {
+				setVersionETag(w, device.Version)
+				handlePreconditionError(w, store.ErrConflict, "failed to persist ssh credential")
+				return
+			}
 			var payload sshCredentialPayload
-			if err := decodeJSON(r, &payload); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ssh credential payload"})
+			if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid ssh credential payload") {
 				return
 			}
 			if strings.TrimSpace(payload.Username) == "" {
@@ -413,54 +430,77 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 				return
 			}
 
-			ciphertext, nonce, err := secretService.Encrypt(payload.Password)
+			ciphertext, nonce, keyVersion, err := secretService.EncryptFor(sshCredentialScope(id), payload.Password)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encrypt ssh password"})
 				return
 			}
 
-			credential, err := inventory.UpsertSSHCredential(r.Context(), store.SSHCredential{
+			credential, err := inventory.UpsertSSHCredentialAndPortVersioned(r.Context(), store.SSHCredential{
 				DeviceID:           id,
 				Username:           strings.TrimSpace(payload.Username),
 				PasswordCiphertext: ciphertext,
 				PasswordNonce:      nonce,
-				KeyVersion:         1,
-			})
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist ssh credential"})
+				KeyVersion:         keyVersion,
+			}, sshPort, expectedVersion)
+			if errors.Is(err, store.ErrConflict) {
+				if currentDevice, currentErr := inventory.GetDevice(r.Context(), id); currentErr == nil {
+					setVersionETag(w, currentDevice.Version)
+				}
+			}
+			if handlePreconditionError(w, err, "failed to persist ssh credential") {
 				return
 			}
-
-			if device.Metadata == nil {
-				device.Metadata = map[string]string{}
-			}
-			device.Metadata["sshPort"] = sshPort
-			device, err = inventory.UpdateDevice(r.Context(), device)
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist ssh port"})
-				return
-			}
+			setVersionETag(w, expectedVersion+1)
 
 			writeJSON(w, http.StatusOK, sshCredentialResponse{
 				DeviceID:    credential.DeviceID,
 				Username:    credential.Username,
 				HasPassword: credential.HasPassword,
 				KeyVersion:  credential.KeyVersion,
-				SSHPort:     sshPortForDevice(device),
+				SSHPort:     sshPort,
+				Available:   true,
 			})
+		case http.MethodDelete:
+			version, ok := requireIfMatchVersion(w, r)
+			if !ok {
+				return
+			}
+			err := inventory.DeleteSSHCredentialAndPort(r.Context(), id, version)
+			if errors.Is(err, store.ErrConflict) {
+				if currentDevice, currentErr := inventory.GetDevice(r.Context(), id); currentErr == nil {
+					setVersionETag(w, currentDevice.Version)
+				}
+			}
+			if handlePreconditionError(w, err, "failed to delete ssh credential") {
+				return
+			}
+			setVersionETag(w, version+1)
+			w.WriteHeader(http.StatusNoContent)
 		default:
-			methodNotAllowed(w, http.MethodGet, http.MethodPut)
+			methodNotAllowed(w, http.MethodGet, http.MethodPut, http.MethodDelete)
 		}
+	})
+	mux.HandleFunc("/api/devices/{id}/ssh-host-key/probe", func(w http.ResponseWriter, r *http.Request) {
+		handleSSHHostKeyProbe(w, r, inventory, hostKeyStore, sshLimits.probes)
+	})
+	mux.HandleFunc("/api/devices/{id}/ssh-host-key/approve", func(w http.ResponseWriter, r *http.Request) {
+		handleSSHHostKeyApproval(w, r, inventory, hostKeyStore, sshLimits.probes)
 	})
 	mux.HandleFunc("/api/devices/{id}/ssh-command", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
 			return
 		}
-		if secretService == nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ssh execution is not configured; set HOME_MESH_MASTER_KEY"})
+		if !sshAccessAvailable(secretService, hostKeyCallback) {
+			writeSSHUnavailable(w)
 			return
 		}
+		release, ok := acquireSSHRequestSlot(w, r, sshLimits.commands)
+		if !ok {
+			return
+		}
+		defer release()
 
 		id := r.PathValue("id")
 		device, err := inventory.GetDevice(r.Context(), id)
@@ -478,8 +518,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		}
 
 		var payload sshCommandPayload
-		if err := decodeJSON(r, &payload); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ssh command payload"})
+		if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid ssh command payload") {
 			return
 		}
 		commandText := strings.TrimSpace(payload.Command)
@@ -488,7 +527,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			return
 		}
 
-		password, err := secretService.Decrypt(credential.PasswordCiphertext, credential.PasswordNonce)
+		password, err := decryptAndRotateSSHCredential(r.Context(), inventory, secretService, credential)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to decrypt ssh password"})
 			return
@@ -502,47 +541,64 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 
 		startedAt := time.Now().UTC()
 		actionRecord := store.Action{
-			ID:         generateActionID("ssh_command", id, startedAt),
+			ID:         generateActionID("ssh_command"),
 			DeviceID:   id,
 			ActionType: "ssh_command",
-			Status:     "completed",
 			Metadata: map[string]string{
 				"deviceName": device.Name,
 				"address":    address,
-				"command":    commandText,
 			},
 			StartedAt: startedAt,
 		}
 
-		result, runErr := sshclient.RunPasswordCommand(address, credential.Username, password, commandText, 10*time.Second, hostKeyCallback)
-		actionRecord.FinishedAt = time.Now().UTC()
-		actionRecord.Metadata["output"] = result.Output
-
-		if runErr != nil {
-			actionRecord.Status = "failed"
-			actionRecord.ResultSummary = summarizeOutput(result.Output, runErr.Error())
-		} else {
-			actionRecord.ResultSummary = summarizeOutput(result.Output, "SSH command completed.")
-		}
-
-		recorded, recordErr := inventory.AddAction(r.Context(), actionRecord)
-		if recordErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to persist ssh action"})
+		var result sshclient.Result
+		actionResult, err := executeAuditedAction(r.Context(), inventory, actionRecord, func() auditedOperationOutcome {
+			commandContext, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			defer cancel()
+			var runErr error
+			result, runErr = sshclient.RunPasswordCommandContext(
+				commandContext,
+				address,
+				credential.Username,
+				password,
+				commandText,
+				10*time.Second,
+				sshclient.DefaultMaxCommandOutput,
+				hostKeyCallback,
+			)
+			summary := "SSH command completed."
+			if runErr != nil {
+				summary = "SSH command failed."
+			}
+			return auditedOperationOutcome{
+				Err:           runErr,
+				ResultSummary: summary,
+				Metadata:      sshCommandCompletionMetadata(result, runErr),
+			}
+		})
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to start ssh action"})
 			return
+		}
+		if actionResult.FinalAuditErr != nil {
+			log.Printf("finalize SSH command action %s: %v", actionResult.Action.ID, actionResult.FinalAuditErr)
 		}
 
 		response := map[string]any{
-			"id":            recorded.ID,
-			"deviceId":      recorded.DeviceID,
-			"status":        recorded.Status,
-			"resultSummary": recorded.ResultSummary,
-			"command":       commandText,
-			"output":        result.Output,
-			"startedAt":     recorded.StartedAt,
-			"finishedAt":    recorded.FinishedAt,
+			"id":              actionResult.Action.ID,
+			"deviceId":        actionResult.Action.DeviceID,
+			"status":          actionResult.Action.Status,
+			"resultSummary":   actionResult.Action.ResultSummary,
+			"command":         commandText,
+			"output":          result.Output,
+			"outputTruncated": result.Truncated,
+			"startedAt":       actionResult.Action.StartedAt,
+			"finishedAt":      actionResult.Action.FinishedAt,
+			"auditPersisted":  actionResult.FinalAuditErr == nil,
 		}
 
-		if recorded.Status == "failed" {
+		if actionResult.OperationErr != nil {
+			response["error"] = actionResult.OperationErr.Error()
 			writeJSON(w, http.StatusBadGateway, response)
 			return
 		}
@@ -554,10 +610,15 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			methodNotAllowed(w, http.MethodGet)
 			return
 		}
-		if secretService == nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ssh execution is not configured; set HOME_MESH_MASTER_KEY"})
+		if !sshAccessAvailable(secretService, hostKeyCallback) {
+			writeSSHUnavailable(w)
 			return
 		}
+		release, ok := acquireSSHRequestSlot(w, r, sshLimits.terminals)
+		if !ok {
+			return
+		}
+		defer release()
 
 		id := r.PathValue("id")
 		device, err := inventory.GetDevice(r.Context(), id)
@@ -574,7 +635,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			return
 		}
 
-		password, err := secretService.Decrypt(credential.PasswordCiphertext, credential.PasswordNonce)
+		password, err := decryptAndRotateSSHCredential(r.Context(), inventory, secretService, credential)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to decrypt ssh password"})
 			return
@@ -586,6 +647,13 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			return
 		}
 
+		releaseConnection, ok := terminalConnections.acquire()
+		if !ok {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "server is shutting down"})
+			return
+		}
+		defer releaseConnection()
+
 		socket, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -593,106 +661,51 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 
 		startedAt := time.Now().UTC()
 		actionRecord := store.Action{
-			ID:         generateActionID("ssh_terminal", id, startedAt),
+			ID:         generateActionID("ssh_terminal"),
 			DeviceID:   id,
 			ActionType: "ssh_terminal",
-			Status:     "completed",
 			Metadata: map[string]string{
 				"deviceName": device.Name,
 				"address":    address,
 			},
 			StartedAt: startedAt,
 		}
-
-		session, err := sshclient.StartPasswordTerminal(address, credential.Username, password, 120, 36, 10*time.Second, hostKeyCallback)
+		actionRecord, err = startAuditedAction(r.Context(), inventory, actionRecord)
 		if err != nil {
-			actionRecord.Status = "failed"
-			actionRecord.FinishedAt = time.Now().UTC()
-			actionRecord.ResultSummary = err.Error()
-			_, _ = inventory.AddAction(r.Context(), actionRecord)
+			log.Printf("start SSH terminal audit %s: %v", actionRecord.ID, err)
+			_ = socket.SetWriteDeadline(time.Now().Add(terminalWriteTimeout))
+			_ = socket.WriteJSON(terminalServerMessage{Type: "error", Data: "SSH terminal audit is unavailable."})
+			_ = socket.Close()
+			return
+		}
+
+		session, err := sshclient.StartPasswordTerminalContext(r.Context(), address, credential.Username, password, 120, 36, 10*time.Second, hostKeyCallback)
+		if err != nil {
+			if _, auditErr := finishAuditedAction(r.Context(), inventory, actionRecord, auditedOperationOutcome{
+				Err:           err,
+				ResultSummary: "Interactive SSH session failed to connect.",
+				Metadata:      map[string]string{"terminationReason": "connect_error"},
+			}); auditErr != nil {
+				log.Printf("finalize SSH terminal action %s: %v", actionRecord.ID, auditErr)
+			}
+			_ = socket.SetWriteDeadline(time.Now().Add(terminalWriteTimeout))
 			_ = socket.WriteJSON(terminalServerMessage{Type: "error", Data: err.Error()})
 			_ = socket.Close()
 			return
 		}
-		defer session.Close()
-		defer socket.Close()
 
-		send := make(chan terminalServerMessage, 32)
-		writerDone := make(chan struct{})
-		go func() {
-			defer close(writerDone)
-			for message := range send {
-				if err := socket.WriteJSON(message); err != nil {
-					return
-				}
-			}
-		}()
-
-		send <- terminalServerMessage{Type: "status", Data: "connected"}
-
-		streamDone := make(chan struct{}, 2)
-		for _, reader := range []io.Reader{session.Stdout(), session.Stderr()} {
-			go func(reader io.Reader) {
-				defer func() { streamDone <- struct{}{} }()
-				buffer := make([]byte, 2048)
-				for {
-					n, readErr := reader.Read(buffer)
-					if n > 0 {
-						send <- terminalServerMessage{Type: "output", Data: string(buffer[:n])}
-					}
-					if readErr != nil {
-						return
-					}
-				}
-			}(reader)
+		result := runTerminalBridge(r.Context(), socket, session)
+		resultSummary := "Interactive SSH session closed."
+		if result.Err != nil {
+			resultSummary = "Interactive SSH session failed."
 		}
-
-		readDone := make(chan struct{})
-		go func() {
-			defer close(readDone)
-			defer session.Close()
-			for {
-				var message terminalClientMessage
-				if err := socket.ReadJSON(&message); err != nil {
-					return
-				}
-
-				switch message.Type {
-				case "input":
-					if _, err := session.Write([]byte(message.Data)); err != nil {
-						send <- terminalServerMessage{Type: "error", Data: err.Error()}
-						return
-					}
-				case "resize":
-					if err := session.Resize(message.Cols, message.Rows); err != nil {
-						send <- terminalServerMessage{Type: "error", Data: err.Error()}
-						return
-					}
-				case "ping":
-					send <- terminalServerMessage{Type: "pong"}
-				case "close":
-					return
-				}
-			}
-		}()
-
-		waitErr := session.Wait()
-		<-readDone
-		<-streamDone
-		<-streamDone
-
-		actionRecord.FinishedAt = time.Now().UTC()
-		if waitErr != nil && !strings.Contains(strings.ToLower(waitErr.Error()), "closed") {
-			actionRecord.Status = "failed"
-			actionRecord.ResultSummary = waitErr.Error()
-			send <- terminalServerMessage{Type: "error", Data: waitErr.Error()}
-		} else {
-			actionRecord.ResultSummary = "Interactive SSH session closed."
+		if _, auditErr := finishAuditedAction(r.Context(), inventory, actionRecord, auditedOperationOutcome{
+			Err:           result.Err,
+			ResultSummary: resultSummary,
+			Metadata:      map[string]string{"terminationReason": result.TerminationReason},
+		}); auditErr != nil {
+			log.Printf("finalize SSH terminal action %s: %v", actionRecord.ID, auditErr)
 		}
-		_, _ = inventory.AddAction(r.Context(), actionRecord)
-		send <- terminalServerMessage{Type: "status", Data: "closed"}
-		close(send)
-		<-writerDone
 	})
 
 	mux.HandleFunc("/api/network-nodes", func(w http.ResponseWriter, r *http.Request) {
@@ -707,8 +720,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			writeJSON(w, http.StatusOK, nodes)
 		case http.MethodPost:
 			var payload store.NetworkNode
-			if err := decodeJSON(r, &payload); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid network node payload"})
+			if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid network node payload") {
 				return
 			}
 
@@ -719,11 +731,11 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			payload.Status = "unknown"
 
 			node, err := inventory.AddNetworkNode(r.Context(), payload)
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create network node"})
+			if handleStoreError(w, err, "failed to create network node") {
 				return
 			}
 
+			setVersionETag(w, node.Version)
 			writeJSON(w, http.StatusCreated, node)
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodPost)
@@ -737,11 +749,11 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			if handleStoreError(w, err, "failed to load network node") {
 				return
 			}
+			setVersionETag(w, node.Version)
 			writeJSON(w, http.StatusOK, node)
 		case http.MethodPut:
 			var payload store.NetworkNode
-			if err := decodeJSON(r, &payload); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid network node payload"})
+			if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid network node payload") {
 				return
 			}
 			payload.ID = id
@@ -758,9 +770,14 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			if handleStoreError(w, err, "failed to update network node") {
 				return
 			}
+			setVersionETag(w, node.Version)
 			writeJSON(w, http.StatusOK, node)
 		case http.MethodDelete:
-			if handleStoreError(w, inventory.DeleteNetworkNode(r.Context(), id), "failed to delete network node") {
+			version, ok := requireIfMatchVersion(w, r)
+			if !ok {
+				return
+			}
+			if handlePreconditionError(w, inventory.DeleteNetworkNodeVersioned(r.Context(), id, version), "failed to delete network node") {
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -780,6 +797,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			return
 		}
 
+		setVersionETag(w, node.Version)
 		writeJSON(w, http.StatusOK, node)
 	})
 
@@ -795,8 +813,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			writeJSON(w, http.StatusOK, segments)
 		case http.MethodPost:
 			var payload store.NetworkSegment
-			if err := decodeJSON(r, &payload); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid network segment payload"})
+			if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid network segment payload") {
 				return
 			}
 
@@ -806,11 +823,11 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			}
 
 			segment, err := inventory.AddNetworkSegment(r.Context(), payload)
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create network segment"})
+			if handleStoreError(w, err, "failed to create network segment") {
 				return
 			}
 
+			setVersionETag(w, segment.Version)
 			writeJSON(w, http.StatusCreated, segment)
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodPost)
@@ -824,11 +841,11 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			if handleStoreError(w, err, "failed to load network segment") {
 				return
 			}
+			setVersionETag(w, segment.Version)
 			writeJSON(w, http.StatusOK, segment)
 		case http.MethodPut:
 			var payload store.NetworkSegment
-			if err := decodeJSON(r, &payload); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid network segment payload"})
+			if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid network segment payload") {
 				return
 			}
 			payload.ID = id
@@ -840,9 +857,14 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			if handleStoreError(w, err, "failed to update network segment") {
 				return
 			}
+			setVersionETag(w, segment.Version)
 			writeJSON(w, http.StatusOK, segment)
 		case http.MethodDelete:
-			if handleStoreError(w, inventory.DeleteNetworkSegment(r.Context(), id), "failed to delete network segment") {
+			version, ok := requireIfMatchVersion(w, r)
+			if !ok {
+				return
+			}
+			if handlePreconditionError(w, inventory.DeleteNetworkSegmentVersioned(r.Context(), id, version), "failed to delete network segment") {
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -863,8 +885,7 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			writeJSON(w, http.StatusOK, relations)
 		case http.MethodPost:
 			var payload store.Relation
-			if err := decodeJSON(r, &payload); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid relation payload"})
+			if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid relation payload") {
 				return
 			}
 
@@ -874,11 +895,11 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			}
 
 			relation, err := inventory.AddRelation(r.Context(), payload)
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create relation"})
+			if handleStoreError(w, err, "failed to create relation") {
 				return
 			}
 
+			setVersionETag(w, relation.Version)
 			writeJSON(w, http.StatusCreated, relation)
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodPost)
@@ -892,11 +913,11 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			if handleStoreError(w, err, "failed to load relation") {
 				return
 			}
+			setVersionETag(w, relation.Version)
 			writeJSON(w, http.StatusOK, relation)
 		case http.MethodPut:
 			var payload store.Relation
-			if err := decodeJSON(r, &payload); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid relation payload"})
+			if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid relation payload") {
 				return
 			}
 			payload.ID = id
@@ -908,9 +929,14 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 			if handleStoreError(w, err, "failed to update relation") {
 				return
 			}
+			setVersionETag(w, relation.Version)
 			writeJSON(w, http.StatusOK, relation)
 		case http.MethodDelete:
-			if handleStoreError(w, inventory.DeleteRelation(r.Context(), id), "failed to delete relation") {
+			version, ok := requireIfMatchVersion(w, r)
+			if !ok {
+				return
+			}
+			if handlePreconditionError(w, inventory.DeleteRelationVersioned(r.Context(), id, version), "failed to delete relation") {
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -931,17 +957,203 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		})
 	})
 
-	return withCORS(auth.middleware(mux)), nil
+	return &Router{
+		handler:             withOriginPolicy(requests, auth.middleware(mux)),
+		terminalConnections: terminalConnections,
+	}, nil
 }
 
-func withCORS(next http.Handler) http.Handler {
+func handleInventoryRefresh(inventory *store.Store, refresher inventoryRefresher) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		r, finish := withSynchronousOperationDeadline(w, r)
+		defer finish()
+
+		result, err := refresher.RefreshAll(r.Context())
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "inventory refresh timed out"})
+				return
+			}
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to refresh devices"})
+			return
+		}
+		snapshot, err := inventory.Snapshot(r.Context())
+		if err != nil {
+			if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+				writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "inventory refresh timed out"})
+				return
+			}
+			if errors.Is(r.Context().Err(), context.Canceled) {
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load refreshed inventory"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"summary":  result.Summary,
+			"snapshot": snapshot,
+		})
+	}
+}
+
+func handleDiscoveryScanStream(inventory *store.Store, discoveryService discoveryScanner) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+
+		if _, ok := w.(http.Flusher); !ok {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming not supported"})
+			return
+		}
+
+		filterState, err := loadDiscoveryFilterState(r.Context(), inventory)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load discovery filter state"})
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		if err := writeSSEComment(w, "connected"); err != nil {
+			return
+		}
+		if err := flushSSE(w); err != nil {
+			return
+		}
+
+		cidr := strings.TrimSpace(r.URL.Query().Get("cidr"))
+		if err := validateDiscoveryCIDR(cidr); err != nil {
+			_ = writeAndFlushSSEJSON(w, "discovery-error", discoveryStreamError{Error: err.Error()})
+			return
+		}
+
+		result, err := discoveryService.ScanCIDRStream(r.Context(), cidr, func(host discovery.HostMatch) error {
+			if ctxErr := r.Context().Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if !filterState.shouldIncludeHost(host) {
+				return nil
+			}
+			return writeAndFlushSSEJSON(w, "discovery-host", host)
+		})
+		if err != nil {
+			if r.Context().Err() != nil || errors.Is(err, errSSETransport) {
+				return
+			}
+
+			_ = writeAndFlushSSEJSON(w, "discovery-error", discoveryStreamError{Error: discoveryClientMessage(err)})
+			return
+		}
+
+		filteredHosts, segmentCandidates := filterState.finalize(result)
+		_ = writeAndFlushSSEJSON(w, "discovery-complete", discoveryScanResponse{
+			Provider:          result.Provider,
+			CIDR:              result.CIDR,
+			ScannedCIDRs:      result.ScannedCIDRs,
+			Hosts:             filteredHosts,
+			SegmentCandidates: segmentCandidates,
+		})
+	}
+}
+
+func handleDiscoveryScan(inventory *store.Store, discoveryService discoveryScanner) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		r, finish := withSynchronousOperationDeadline(w, r)
+		defer finish()
+
+		var payload discoveryScanPayload
+		if handleJSONDecodeError(w, decodeJSON(r, &payload), "invalid discovery payload") {
+			return
+		}
+		if err := validateDiscoveryCIDR(payload.CIDR); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		result, err := discoveryService.ScanCIDR(r.Context(), payload.CIDR)
+		if err != nil {
+			if errors.Is(r.Context().Err(), context.Canceled) {
+				return
+			}
+			writeJSON(w, discoveryErrorStatus(err), map[string]string{"error": discoveryClientMessage(err)})
+			return
+		}
+
+		filteredHosts, segmentCandidates, err := filterDiscoveryResults(r.Context(), inventory, result)
+		if err != nil {
+			if errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+				writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "discovery scan timed out"})
+				return
+			}
+			if errors.Is(r.Context().Err(), context.Canceled) {
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to compare discovery results with inventory"})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, discoveryScanResponse{
+			Provider:          result.Provider,
+			CIDR:              result.CIDR,
+			ScannedCIDRs:      result.ScannedCIDRs,
+			Hosts:             filteredHosts,
+			SegmentCandidates: segmentCandidates,
+		})
+	}
+}
+
+func withSynchronousOperationDeadline(w http.ResponseWriter, r *http.Request) (*http.Request, func()) {
+	controller := http.NewResponseController(w)
+	if err := controller.SetWriteDeadline(time.Now().Add(synchronousWriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		log.Printf("extend synchronous response write deadline: %v", err)
+	}
+	operationContext, cancel := context.WithTimeout(r.Context(), synchronousOperationTimeout)
+	return r.WithContext(operationContext), cancel
+}
+
+func writeAndFlushSSEJSON(w http.ResponseWriter, eventName string, payload any) error {
+	if err := writeSSEJSONEvent(w, eventName, payload); err != nil {
+		return fmt.Errorf("%w: write event: %v", errSSETransport, err)
+	}
+	if err := flushSSE(w); err != nil {
+		return fmt.Errorf("%w: flush event: %v", errSSETransport, err)
+	}
+	return nil
+}
+
+func withOriginPolicy(requests *requestMetadata, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin != "" && isSameOrigin(effectiveRequestHost(r), origin) {
+		if !requests.isAllowedHost(r.Host) {
+			writeJSON(w, http.StatusMisdirectedRequest, map[string]string{"error": "request host is not allowed"})
+			return
+		}
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" {
+			w.Header().Add("Vary", "Origin")
+			if !requests.isSameOrigin(r, origin) {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin request forbidden"})
+				return
+			}
+
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, If-Match")
+			w.Header().Set("Access-Control-Expose-Headers", "ETag")
 		}
 
 		if r.Method == http.MethodOptions {
@@ -953,17 +1165,26 @@ func withCORS(next http.Handler) http.Handler {
 	})
 }
 
-func isSameOrigin(host string, origin string) bool {
-	if host == "" || origin == "" {
+func (m *requestMetadata) isSameOrigin(r *http.Request, origin string) bool {
+	return isSameOrigin(m.effectiveScheme(r), r.Host, origin)
+}
+
+func isSameOrigin(requestScheme string, requestHost string, origin string) bool {
+	requestScheme = strings.ToLower(strings.TrimSpace(requestScheme))
+	if defaultOriginPort(requestScheme) == "" || requestHost == "" || origin == "" {
 		return false
 	}
 
 	parsedOrigin, err := url.Parse(origin)
-	if err != nil || parsedOrigin.Host == "" {
+	if err != nil || parsedOrigin.Host == "" || parsedOrigin.User != nil || parsedOrigin.RawQuery != "" || parsedOrigin.Fragment != "" || (parsedOrigin.Path != "" && parsedOrigin.Path != "/") {
+		return false
+	}
+	originScheme := strings.ToLower(parsedOrigin.Scheme)
+	if defaultOriginPort(originScheme) == "" || originScheme != requestScheme {
 		return false
 	}
 
-	requestHost, requestPort, ok := splitHostPort(host)
+	requestHostname, requestPort, ok := splitHostPort(requestHost)
 	if !ok {
 		return false
 	}
@@ -974,21 +1195,21 @@ func isSameOrigin(host string, origin string) bool {
 	}
 
 	if requestPort == "" {
-		requestPort = defaultOriginPort(parsedOrigin.Scheme)
+		requestPort = defaultOriginPort(requestScheme)
 	}
 	if originPort == "" {
-		originPort = defaultOriginPort(parsedOrigin.Scheme)
+		originPort = defaultOriginPort(originScheme)
 	}
 
-	return strings.EqualFold(requestHost, originHost) && requestPort == originPort
+	return strings.EqualFold(requestHostname, originHost) && requestPort == originPort
 }
 
-func checkWebSocketOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
+func (m *requestMetadata) checkWebSocketOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
 		return true
 	}
-	return isSameOrigin(effectiveRequestHost(r), origin)
+	return m.isSameOrigin(r, origin)
 }
 
 func splitHostPort(hostport string) (string, string, bool) {
@@ -1037,9 +1258,20 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func decodeJSON(r *http.Request, target any) error {
+	if r.Body == nil {
+		return io.EOF
+	}
 	defer r.Body.Close()
 
-	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(body)) > maxJSONBodyBytes {
+		return errJSONBodyTooLarge
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return err
@@ -1056,6 +1288,18 @@ func decodeJSON(r *http.Request, target any) error {
 	return nil
 }
 
+func handleJSONDecodeError(w http.ResponseWriter, err error, invalidMessage string) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errJSONBodyTooLarge) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body exceeds 1 MiB"})
+		return true
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": invalidMessage})
+	return true
+}
+
 func methodNotAllowed(w http.ResponseWriter, methods ...string) {
 	w.Header().Set("Allow", joinMethods(methods))
 	writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -1065,32 +1309,36 @@ func handleStoreError(w http.ResponseWriter, err error, message string) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, store.ErrNotFound) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "resource not found"})
-		return true
+	case errors.Is(err, store.ErrValidation):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, store.ErrConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "resource version conflict"})
+	default:
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": message})
 	}
-
-	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": message})
 	return true
 }
 
-func generateActionID(actionType string, deviceID string, startedAt time.Time) string {
+func generateActionID(actionType string) string {
 	sanitizedAction := strings.ReplaceAll(actionType, " ", "_")
-	return sanitizedAction + "-" + deviceID + "-" + startedAt.Format("20060102T150405.000000000")
+	return sanitizedAction + "-" + uuid.NewString()
 }
 
-func summarizeOutput(output string, fallback string) string {
-	trimmed := strings.TrimSpace(output)
-	if trimmed == "" {
-		return fallback
+func actionResponse(action store.Action, auditPersisted bool) map[string]any {
+	return map[string]any{
+		"id":             action.ID,
+		"deviceId":       action.DeviceID,
+		"actionType":     action.ActionType,
+		"status":         action.Status,
+		"resultSummary":  action.ResultSummary,
+		"metadata":       action.Metadata,
+		"startedAt":      action.StartedAt,
+		"finishedAt":     action.FinishedAt,
+		"auditPersisted": auditPersisted,
 	}
-
-	lines := strings.Split(trimmed, "\n")
-	if len(lines[0]) <= 180 {
-		return lines[0]
-	}
-
-	return lines[0][:180]
 }
 
 func resolveSSHAddress(device store.Device) (string, error) {
@@ -1121,11 +1369,11 @@ func normalizeSSHPort(value string) (string, error) {
 		return "22", nil
 	}
 
-	if _, err := net.LookupPort("tcp", port); err != nil {
+	resolved, err := net.LookupPort("tcp", strings.ToLower(port))
+	if err != nil || resolved < 1 || resolved > 65535 {
 		return "", errors.New("ssh port must be a valid TCP port")
 	}
-
-	return port, nil
+	return strconv.Itoa(resolved), nil
 }
 
 func joinMethods(methods []string) string {
@@ -1141,18 +1389,50 @@ func joinMethods(methods []string) string {
 	return result
 }
 
+func parseBoundedQueryInt(r *http.Request, name string, fallback int, minimum int, maximum int) (int, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < minimum || value > maximum {
+		return 0, fmt.Errorf("%s must be an integer between %d and %d", name, minimum, maximum)
+	}
+	return value, nil
+}
+
 func filterDiscoveryResults(ctx context.Context, inventory *store.Store, result discovery.ScanResult) ([]discovery.HostMatch, []discoverySegmentCandidate, error) {
-	devices, err := inventory.ListDevices(ctx)
+	filterState, err := loadDiscoveryFilterState(ctx, inventory)
 	if err != nil {
 		return nil, nil, err
+	}
+	for _, host := range result.Hosts {
+		filterState.shouldIncludeHost(host)
+	}
+	filteredHosts, segmentCandidates := filterState.finalize(result)
+	return filteredHosts, segmentCandidates, nil
+}
+
+type discoveryFilterState struct {
+	knownIPs        map[string]bool
+	knownMACs       map[string]bool
+	knownCIDRs      map[string]bool
+	filteredHosts   map[string]discovery.HostMatch
+	filteredHostIPs []string
+}
+
+func loadDiscoveryFilterState(ctx context.Context, inventory *store.Store) (*discoveryFilterState, error) {
+	devices, err := inventory.ListDevices(ctx)
+	if err != nil {
+		return nil, err
 	}
 	nodes, err := inventory.ListNetworkNodes(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	segments, err := inventory.ListNetworkSegments(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	knownIPs := map[string]bool{}
@@ -1166,28 +1446,52 @@ func filterDiscoveryResults(ctx context.Context, inventory *store.Store, result 
 		knownMACs[strings.ToUpper(strings.TrimSpace(node.MACAddress))] = true
 	}
 
-	filteredHosts := make([]discovery.HostMatch, 0, len(result.Hosts))
-	for _, host := range result.Hosts {
-		ip := strings.TrimSpace(host.IPAddress)
-		mac := strings.ToUpper(strings.TrimSpace(host.MACAddress))
-		if knownIPs[ip] {
-			continue
-		}
-		if mac != "" && knownMACs[mac] {
-			continue
-		}
-		filteredHosts = append(filteredHosts, host)
-	}
-
 	knownCIDRs := map[string]bool{}
 	for _, segment := range segments {
 		knownCIDRs[strings.TrimSpace(segment.CIDR)] = true
 	}
 
+	return &discoveryFilterState{
+		knownIPs:      knownIPs,
+		knownMACs:     knownMACs,
+		knownCIDRs:    knownCIDRs,
+		filteredHosts: map[string]discovery.HostMatch{},
+	}, nil
+}
+
+func (f *discoveryFilterState) shouldIncludeHost(host discovery.HostMatch) bool {
+	ip := strings.TrimSpace(host.IPAddress)
+	mac := strings.ToUpper(strings.TrimSpace(host.MACAddress))
+	if ip == "" {
+		return false
+	}
+	if f.knownIPs[ip] {
+		return false
+	}
+	if mac != "" && f.knownMACs[mac] {
+		return false
+	}
+	if _, exists := f.filteredHosts[ip]; !exists {
+		f.filteredHostIPs = append(f.filteredHostIPs, ip)
+	}
+	f.filteredHosts[ip] = host
+	return true
+}
+
+func (f *discoveryFilterState) finalize(result discovery.ScanResult) ([]discovery.HostMatch, []discoverySegmentCandidate) {
+	filteredHosts := make([]discovery.HostMatch, 0, len(f.filteredHostIPs))
+	for _, ip := range f.filteredHostIPs {
+		host, ok := f.filteredHosts[ip]
+		if !ok {
+			continue
+		}
+		filteredHosts = append(filteredHosts, host)
+	}
+
 	segmentCandidates := make([]discoverySegmentCandidate, 0, len(result.ScannedCIDRs))
 	for _, cidr := range result.ScannedCIDRs {
 		trimmed := strings.TrimSpace(cidr)
-		if trimmed == "" || knownCIDRs[trimmed] {
+		if trimmed == "" || f.knownCIDRs[trimmed] {
 			continue
 		}
 		segmentCandidates = append(segmentCandidates, discoverySegmentCandidate{
@@ -1196,5 +1500,5 @@ func filterDiscoveryResults(ctx context.Context, inventory *store.Store, result 
 		})
 	}
 
-	return filteredHosts, segmentCandidates, nil
+	return filteredHosts, segmentCandidates
 }

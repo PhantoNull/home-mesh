@@ -4,6 +4,7 @@ import "time"
 
 type Device struct {
 	ID             string            `json:"id"`
+	Version        int64             `json:"version"`
 	Name           string            `json:"name"`
 	Hostname       string            `json:"hostname"`
 	Role           string            `json:"role"`
@@ -20,6 +21,7 @@ type Device struct {
 
 type NetworkNode struct {
 	ID           string            `json:"id"`
+	Version      int64             `json:"version"`
 	Name         string            `json:"name"`
 	NodeType     string            `json:"nodeType"`
 	ManagementIP string            `json:"managementIp"`
@@ -35,6 +37,7 @@ type NetworkNode struct {
 
 type NetworkSegment struct {
 	ID          string            `json:"id"`
+	Version     int64             `json:"version"`
 	Name        string            `json:"name"`
 	SegmentType string            `json:"segmentType"`
 	CIDR        string            `json:"cidr"`
@@ -48,6 +51,7 @@ type NetworkSegment struct {
 
 type Relation struct {
 	ID           string            `json:"id"`
+	Version      int64             `json:"version"`
 	SourceKind   string            `json:"sourceKind"`
 	SourceID     string            `json:"sourceId"`
 	TargetKind   string            `json:"targetKind"`
@@ -64,6 +68,11 @@ type InventorySnapshot struct {
 	NetworkSegments []NetworkSegment `json:"networkSegments"`
 	Relations       []Relation       `json:"relations"`
 	Actions         []Action         `json:"actions"`
+}
+
+type InventoryOrderItem struct {
+	ID      string `json:"id"`
+	Version int64  `json:"version"`
 }
 
 type Action struct {

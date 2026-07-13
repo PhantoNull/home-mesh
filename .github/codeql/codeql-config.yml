@@ -1,0 +1,12 @@
+name: home-mesh-codeql
+
+# Home Mesh deliberately exposes an authenticated remote-command operation.
+# The command is sent to the selected device through SSH; it is not executed
+# by the API host. Keep the rest of the security and quality suites enabled.
+queries:
+  - uses: security-extended
+  - uses: security-and-quality
+
+query-filters:
+  - exclude:
+      id: go/command-injection
