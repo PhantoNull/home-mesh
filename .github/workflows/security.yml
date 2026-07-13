@@ -48,10 +48,8 @@ jobs:
         include:
           - language: go
             build-mode: autobuild
-            suppression-pack: codeql/go-queries:AlertSuppression.ql
           - language: javascript-typescript
             build-mode: none
-            suppression-pack: codeql/javascript-queries:AlertSuppression.ql
 
     steps:
       - name: Check out repository
@@ -62,8 +60,7 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          packs: ${{ matrix.suppression-pack }}
-          queries: security-extended,security-and-quality
+          config-file: .github/codeql/codeql-config.yml
 
       - name: Analyze source
         uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
