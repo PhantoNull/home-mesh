@@ -236,6 +236,28 @@ export async function installDeterministicMocks(
         )
         return
       }
+      case 'POST /api/devices/device-nas/ssh-host-key/probe':
+        await fulfillJSON(route, {
+          deviceId: 'device-nas',
+          address: '192.168.10.20:22',
+          sshPort: '22',
+          status: 'unknown',
+          algorithm: 'ssh-ed25519',
+          fingerprint: 'SHA256:fixture-host-key',
+          authorizedKey: 'ssh-ed25519 AAAAFixtureHostKey fixture',
+        })
+        return
+      case 'POST /api/devices/device-nas/ssh-host-key/approve':
+        await fulfillJSON(route, {
+          deviceId: 'device-nas',
+          address: '192.168.10.20:22',
+          sshPort: '22',
+          status: 'trusted',
+          algorithm: 'ssh-ed25519',
+          fingerprint: 'SHA256:fixture-host-key',
+          authorizedKey: 'ssh-ed25519 AAAAFixtureHostKey fixture',
+        })
+        return
       default:
         unexpectedRequests.push(key)
         await fulfillJSON(route, { error: `Unexpected E2E API request: ${key}` }, 501)

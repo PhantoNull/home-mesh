@@ -120,6 +120,8 @@ For an authenticated deployment with SSH credential storage, configure:
 - optionally `HOME_MESH_TRUSTED_PROXY_CIDRS` when running behind an explicit reverse proxy
 - optionally `HOME_MESH_ALLOWED_HOSTS` when the UI is served through DNS hostnames
 - optionally `HOME_MESH_NMAP_PATH`
+- optionally `HOME_MESH_DNS_SERVER` when the LAN DNS server should be used
+  directly for forward and reverse lookups (for example, a Pi-hole address)
 - optionally `HOME_MESH_DISCOVERY_ALLOW_PUBLIC` for an explicit, high-risk
   public-range scan opt-in
 - optionally `HOME_MESH_SEED_DEMO_DATA=true` for a disposable, empty database
@@ -320,15 +322,29 @@ the host file selected by `HOME_MESH_SSH_KNOWN_HOSTS_FILE` (default
 channel before opening an SSH session. The file should be readable by the
 container user and must not contain unverified keys.
 
-The API entrypoint copies that read-only mount into its private tmpfs with mode
-`0600` before startup. This preserves permission validation on Linux and avoids
-Docker Desktop's synthetic bind-mount permissions disabling SSH on Windows.
+The API entrypoint imports that read-only mount into the Docker-managed data
+volume as `/data/known_hosts` with mode `0600`. The running API uses this
+persistent, private copy for strict verification and can reload it after an
+explicit host-key approval from the UI. This preserves permission validation on
+Linux and avoids Docker Desktop's synthetic bind-mount permissions disabling
+SSH on Windows. Recreating the data volume removes UI-enrolled keys; copy the
+managed `/data/known_hosts` file into the configured source file before doing
+so if you need to preserve those approvals.
 
 Native execution can override the default user known-hosts file with:
 
 - `HOME_MESH_SSH_KNOWN_HOSTS_PATH`
 
 Unverified SSH host keys are rejected; there is no insecure host-key mode.
+
+When a saved SSH credential reaches a new host, open the device's SSH panel and
+choose **Check host key**. Home Mesh performs the SSH handshake without sending
+the stored password and displays the algorithm, SHA-256 fingerprint, and
+authorized-key line. Compare the fingerprint through a trusted channel, then
+choose **Trust this host key**. The API probes again before writing, so a key
+that changes between review and approval is rejected. A different key of the
+same algorithm is treated as a rotation and must be investigated manually;
+additional algorithms can be enrolled without replacing existing keys.
 
 ### Database
 

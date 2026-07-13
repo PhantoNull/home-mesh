@@ -1291,6 +1291,61 @@ body {
   flex: 0 0 auto;
 }
 
+.ssh-host-key-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid rgba(71, 190, 166, 0.28);
+  border-radius: 8px;
+  background: rgba(20, 35, 31, 0.58);
+}
+
+.ssh-host-key-panel h3 {
+  margin: 0;
+  font-size: 0.98rem;
+}
+
+.ssh-host-key-panel .panel-title-row > svg {
+  width: 20px;
+  height: 20px;
+  color: #62d5b9;
+}
+
+.ssh-host-key-details {
+  display: grid;
+  gap: 6px;
+}
+
+.ssh-host-key-details code,
+.ssh-host-key-authorized code {
+  color: #d9f5eb;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.ssh-host-key-fingerprint {
+  letter-spacing: 0.02em;
+}
+
+.ssh-host-key-authorized {
+  border-top: 1px solid rgba(194, 199, 191, 0.12);
+  padding-top: 8px;
+}
+
+.ssh-host-key-authorized summary {
+  color: #b6bab3;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.ssh-host-key-authorized code {
+  display: block;
+  margin-top: 8px;
+  line-height: 1.45;
+}
+
 .ssh-terminal-host {
   margin-top: 8px;
   flex: 1 1 auto;

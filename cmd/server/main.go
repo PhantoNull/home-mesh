@@ -20,6 +20,7 @@ import (
 	"github.com/PhantoNull/home-mesh/internal/secrets"
 	"github.com/PhantoNull/home-mesh/internal/sshclient"
 	"github.com/PhantoNull/home-mesh/internal/store"
+	"golang.org/x/crypto/ssh"
 )
 
 const (
@@ -43,12 +44,16 @@ func run() error {
 		return err
 	}
 
-	hostKeyCallback, err := sshclient.HostKeyCallback(cfg.SSHHostKeyMode, cfg.KnownHostsPath)
+	hostKeyStore, err := sshclient.NewHostKeyStore(cfg.SSHHostKeyMode, cfg.KnownHostsPath)
 	if errors.Is(err, sshclient.ErrHostKeyTrustUnavailable) {
 		log.Printf("SSH disabled: %v", err)
-		hostKeyCallback = nil
+		hostKeyStore = nil
 	} else if err != nil {
 		return err
+	}
+	var hostKeyCallback ssh.HostKeyCallback
+	if hostKeyStore != nil {
+		hostKeyCallback = hostKeyStore.Callback
 	}
 
 	inventory, err := store.NewWithOptions(cfg.DBPath, store.Options{SeedDemo: cfg.SeedDemoData})
@@ -75,7 +80,7 @@ func run() error {
 		AllowPublicNetworks: cfg.DiscoveryAllowPublic,
 		Coordinator:         scanCoordinator,
 	})
-	router, err := api.NewRouter(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback)
+	router, err := api.NewRouterWithHostKeyStore(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback, hostKeyStore)
 	if err != nil {
 		return err
 	}

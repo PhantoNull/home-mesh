@@ -102,7 +102,15 @@ func NewRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 	return newRouter(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback, newSSHConcurrencyLimits(maxConcurrentSSHCommands, maxConcurrentSSHTerminals))
 }
 
+func NewRouterWithHostKeyStore(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback, hostKeyStore *sshclient.HostKeyStore) (*Router, error) {
+	return newRouterWithHostKeyStore(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback, hostKeyStore, newSSHConcurrencyLimits(maxConcurrentSSHCommands, maxConcurrentSSHTerminals))
+}
+
 func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback, sshLimits *sshConcurrencyLimits) (*Router, error) {
+	return newRouterWithHostKeyStore(cfg, inventory, refresher, bus, discoveryService, secretService, hostKeyCallback, nil, sshLimits)
+}
+
+func newRouterWithHostKeyStore(cfg config.Config, inventory *store.Store, refresher *monitor.Refresher, bus *monitor.EventBus, discoveryService discoveryScanner, secretService *secrets.Service, hostKeyCallback ssh.HostKeyCallback, hostKeyStore *sshclient.HostKeyStore, sshLimits *sshConcurrencyLimits) (*Router, error) {
 	requests, err := newRequestMetadata(cfg.TrustedProxyCIDRs, cfg.AllowedHosts)
 	if err != nil {
 		return nil, err
@@ -472,6 +480,12 @@ func newRouter(cfg config.Config, inventory *store.Store, refresher *monitor.Ref
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodPut, http.MethodDelete)
 		}
+	})
+	mux.HandleFunc("/api/devices/{id}/ssh-host-key/probe", func(w http.ResponseWriter, r *http.Request) {
+		handleSSHHostKeyProbe(w, r, inventory, hostKeyStore, sshLimits.probes)
+	})
+	mux.HandleFunc("/api/devices/{id}/ssh-host-key/approve", func(w http.ResponseWriter, r *http.Request) {
+		handleSSHHostKeyApproval(w, r, inventory, hostKeyStore, sshLimits.probes)
 	})
 	mux.HandleFunc("/api/devices/{id}/ssh-command", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

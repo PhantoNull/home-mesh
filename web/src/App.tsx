@@ -7,6 +7,7 @@ import {
   Columns3,
   ExternalLink,
   History,
+  KeyRound,
   List,
   LogOut,
   Network,
@@ -15,6 +16,7 @@ import {
   Power,
   RefreshCw,
   ScanLine,
+  ShieldCheck,
   SquareTerminal,
   Trash2,
   UserCircle,
@@ -55,6 +57,7 @@ import {
   type Relation,
   type SSHCredential,
   type SSHCredentialDraft,
+  type SSHHostKey,
   type ToastState,
   deviceTagOptions,
   initialDeviceDraft,
@@ -112,6 +115,7 @@ type SSHTerminalPaneProps = {
   deviceId: string
   enabled: boolean
   unavailableReason?: string | null
+  blockedReason?: string | null
   sessionKey: number
   onConnectionState: (message: string) => void
   onReconnect: () => void
@@ -183,6 +187,14 @@ function isValidCIDR(value: string): boolean {
   }
 
   return !(Number.isNaN(prefix) || prefix < 0 || prefix > 32)
+}
+
+type SSHHostKeyEnrollmentProps = {
+  hostKey: SSHHostKey | null
+  action: 'idle' | 'probing' | 'approving'
+  errorMessage: string | null
+  onProbe: () => Promise<void>
+  onApprove: () => Promise<void>
 }
 
 function createRelationID(): string {
@@ -514,12 +526,66 @@ function SSHCredentialForm({
   )
 }
 
-function SSHTerminalPane({ deviceId, enabled, unavailableReason, sessionKey, onConnectionState, onReconnect }: SSHTerminalPaneProps) {
+function SSHHostKeyEnrollment({ hostKey, action, errorMessage, onProbe, onApprove }: SSHHostKeyEnrollmentProps) {
+  const isBusy = action !== 'idle'
+  const status = hostKey?.status
+  const changed = status === 'changed'
+  const trusted = status === 'trusted'
+
+  return (
+    <section className="ssh-host-key-panel" aria-labelledby="ssh-host-key-title">
+      <div className="panel-title-row">
+        <div>
+          <p className="section-label">SSH host verification</p>
+          <h3 id="ssh-host-key-title">{trusted ? 'Host key trusted' : 'Verify this host'}</h3>
+        </div>
+        <KeyRound aria-hidden="true" />
+      </div>
+      {errorMessage ? <div className="inline-error" role="alert">{errorMessage}</div> : null}
+      {changed ? (
+        <div className="inline-error" role="alert">
+          A different key is already trusted for this address. Do not approve this key until you have verified a host-key rotation.
+        </div>
+      ) : null}
+      {hostKey ? (
+        <div className="ssh-host-key-details">
+          <p className="modal-device-meta__row">
+            <span className="modal-device-meta__label">ALGORITHM</span>
+            <code>{hostKey.algorithm}</code>
+          </p>
+          <p className="modal-device-meta__row">
+            <span className="modal-device-meta__label">FINGERPRINT</span>
+            <code className="ssh-host-key-fingerprint">{hostKey.fingerprint}</code>
+          </p>
+          <details className="ssh-host-key-authorized">
+            <summary>Show authorized key</summary>
+            <code>{hostKey.authorizedKey}</code>
+          </details>
+        </div>
+      ) : (
+        <p className="form-note">Home Mesh will read the SSH host key without sending credentials. Review its fingerprint before trusting it.</p>
+      )}
+      <div className="form-actions">
+        <button type="button" className="secondary-button" onClick={() => void onProbe()} disabled={isBusy}>
+          <ShieldCheck aria-hidden="true" />
+          {action === 'probing' ? 'Checking host key...' : trusted ? 'Check again' : 'Check host key'}
+        </button>
+        {hostKey && !trusted && !changed ? (
+          <button type="button" className="action-button" onClick={() => void onApprove()} disabled={isBusy}>
+            {action === 'approving' ? 'Trusting...' : 'Trust this host key'}
+          </button>
+        ) : null}
+      </div>
+    </section>
+  )
+}
+
+function SSHTerminalPane({ deviceId, enabled, unavailableReason, blockedReason, sessionKey, onConnectionState, onReconnect }: SSHTerminalPaneProps) {
   const hostRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     if (!enabled || !hostRef.current) {
-      onConnectionState(unavailableReason ? 'SSH unavailable' : 'Credentials required')
+      onConnectionState(unavailableReason ? 'SSH unavailable' : blockedReason ? 'Host verification required' : 'Credentials required')
       return
     }
 
@@ -658,17 +724,17 @@ function SSHTerminalPane({ deviceId, enabled, unavailableReason, sessionKey, onC
       cancelled = true
       cleanup?.()
     }
-  }, [deviceId, enabled, onConnectionState, sessionKey, unavailableReason])
+  }, [blockedReason, deviceId, enabled, onConnectionState, sessionKey, unavailableReason])
 
   if (!enabled) {
     return (
       <section className="ssh-console">
         <div className="modal-panel__heading">
           <p className="section-label">SSH console</p>
-          <h2>{unavailableReason ? 'SSH unavailable' : 'Credentials required'}</h2>
+          <h2>{unavailableReason ? 'SSH unavailable' : blockedReason ? 'Host verification required' : 'Credentials required'}</h2>
         </div>
-        <div className={unavailableReason ? 'inline-error' : 'form-note'} role={unavailableReason ? 'alert' : undefined}>
-          {unavailableReason ?? 'Save SSH credentials for this device to open an interactive shell.'}
+        <div className={unavailableReason || blockedReason ? 'inline-error' : 'form-note'} role={unavailableReason || blockedReason ? 'alert' : undefined}>
+          {unavailableReason ?? blockedReason ?? 'Save SSH credentials for this device to open an interactive shell.'}
         </div>
       </section>
     )
@@ -1504,6 +1570,9 @@ export default function App() {
   const [sshSubmitState, setSSHSubmitState] = useState<'idle' | 'loading' | 'saving'>('idle')
   const [sshSessionKey, setSSHSessionKey] = useState(0)
   const [sshConnectionState, setSSHConnectionState] = useState('Idle')
+  const [sshHostKey, setSSHHostKey] = useState<SSHHostKey | null>(null)
+  const [sshHostKeyAction, setSSHHostKeyAction] = useState<'idle' | 'probing' | 'approving'>('idle')
+  const [sshHostKeyError, setSSHHostKeyError] = useState<string | null>(null)
   const [toast, setToast] = useState<ToastState>(null)
   const [authState, setAuthState] = useState<'checking' | 'authenticated' | 'unauthenticated'>('checking')
   const [authEnabled, setAuthEnabled] = useState(true)
@@ -2264,6 +2333,9 @@ export default function App() {
     setSSHSubmitState('idle')
     setSSHSessionKey(0)
     setSSHConnectionState('Idle')
+    setSSHHostKey(null)
+    setSSHHostKeyAction('idle')
+    setSSHHostKeyError(null)
   }
 
   async function openSSHModal(device: Device) {
@@ -2282,6 +2354,9 @@ export default function App() {
     setSSHEditMode(false)
     setSSHSessionKey(0)
     setSSHConnectionState('Loading credentials...')
+    setSSHHostKey(null)
+    setSSHHostKeyAction('idle')
+    setSSHHostKeyError(null)
 
     try {
       const response = await authFetch(`/api/devices/${device.id}/ssh-credential`)
@@ -2329,6 +2404,83 @@ export default function App() {
         delete next[device.id]
         return next
       })
+    }
+  }
+
+  async function probeSSHHostKey() {
+    const device = sshModalDevice
+    if (!device || !sshCapabilityAvailable) {
+      return
+    }
+    const generation = sshRequestGenerationRef.current
+    setSSHHostKeyAction('probing')
+    setSSHHostKeyError(null)
+    try {
+      const response = await authFetch(`/api/devices/${device.id}/ssh-host-key/probe`, { method: 'POST' })
+      const payload = (await response.json()) as SSHHostKey & { error?: string }
+      if (!response.ok) {
+        throw new Error(payload.error ?? `Host-key probe failed with status ${response.status}`)
+      }
+      if (sshRequestGenerationRef.current !== generation) {
+        return
+      }
+      setSSHHostKey(payload)
+      if (payload.status === 'trusted') {
+        setSSHConnectionState('Connecting...')
+        setSSHSessionKey((current) => current + 1)
+      } else {
+        setSSHConnectionState('Host verification required')
+      }
+    } catch (error) {
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHHostKeyError(error instanceof Error ? error.message : 'Host-key probe failed')
+        setSSHConnectionState('Host-key probe failed')
+      }
+    } finally {
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHHostKeyAction('idle')
+      }
+    }
+  }
+
+  async function approveSSHHostKey() {
+    const device = sshModalDevice
+    const fingerprint = sshHostKey?.fingerprint
+    if (!device || !fingerprint || !sshCapabilityAvailable) {
+      return
+    }
+    const generation = sshRequestGenerationRef.current
+    setSSHHostKeyAction('approving')
+    setSSHHostKeyError(null)
+    try {
+      const response = await authFetch(`/api/devices/${device.id}/ssh-host-key/approve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fingerprint }),
+      })
+      const payload = (await response.json()) as SSHHostKey & { error?: string }
+      if (!response.ok) {
+        if (payload.status === 'changed' || response.status === 409) {
+          setSSHHostKey(payload)
+        }
+        throw new Error(payload.error ?? `Host-key approval failed with status ${response.status}`)
+      }
+      if (sshRequestGenerationRef.current !== generation) {
+        return
+      }
+      setSSHHostKey(payload)
+      setSSHConnectionState('Connecting...')
+      setSSHSessionKey((current) => current + 1)
+      setToast({ kind: 'success', message: `SSH host key trusted for ${device.name}.` })
+    } catch (error) {
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHHostKeyError(error instanceof Error ? error.message : 'Host-key approval failed')
+        setSSHConnectionState('Host-key approval failed')
+      }
+    } finally {
+      if (sshRequestGenerationRef.current === generation) {
+        setSSHHostKeyAction('idle')
+      }
     }
   }
 
@@ -3434,6 +3586,15 @@ export default function App() {
                   }}
                 />
               ) : null}
+              {sshCapabilityAvailable && sshHasStoredPassword && !sshEditMode ? (
+                <SSHHostKeyEnrollment
+                  hostKey={sshHostKey}
+                  action={sshHostKeyAction}
+                  errorMessage={sshHostKeyError}
+                  onProbe={probeSSHHostKey}
+                  onApprove={approveSSHHostKey}
+                />
+              ) : null}
               </>
             ) : null}
           </CollapsibleSection>
@@ -3445,8 +3606,15 @@ export default function App() {
           ) : (
             <SSHTerminalPane
               deviceId={sshModalDevice.id}
-              enabled={sshCapabilityAvailable && sshHasStoredPassword && !sshEditMode}
+              enabled={sshCapabilityAvailable && sshHasStoredPassword && !sshEditMode && sshHostKey?.status !== 'unknown' && sshHostKey?.status !== 'changed'}
               unavailableReason={sshUnavailableReason}
+              blockedReason={
+                sshHostKey?.status === 'changed'
+                  ? 'A different key is already trusted. Verify the host-key rotation before continuing.'
+                  : sshHostKey?.status === 'unknown'
+                    ? 'Review the fingerprint above and trust the host key before opening the SSH session.'
+                    : null
+              }
               sessionKey={sshSessionKey}
               onConnectionState={setSSHConnectionState}
               onReconnect={() => setSSHSessionKey((current) => current + 1)}

@@ -118,6 +118,7 @@ jobs:
               --env HOME_MESH_DB_PATH=/tmp/home-mesh.db \
               --env HOME_MESH_SESSION_SECRET=ci-only-session-secret-with-at-least-32-bytes \
               --env HOME_MESH_SSH_KNOWN_HOSTS_SOURCE=/etc/home-mesh/known_hosts \
+              --env HOME_MESH_SSH_KNOWN_HOSTS_PERSIST_PATH=/tmp/known_hosts \
               --volume "${{ github.workspace }}/config/known_hosts:/etc/home-mesh/known_hosts:ro" \
               "${{ matrix.image }}"
           else

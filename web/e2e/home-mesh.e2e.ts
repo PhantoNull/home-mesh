@@ -100,6 +100,23 @@ test('saves SSH credentials against the latest credential and monitor device ver
   expect(runtimeErrors.page).toEqual([])
 })
 
+test('probes and explicitly approves an unknown SSH host key', async ({ page }) => {
+  const unexpectedRequests = await installDeterministicMocks(page)
+
+  await page.goto('/')
+  await page.locator('#inventory-panel-devices').getByRole('button', { name: 'SSH' }).click()
+  const dialog = page.getByRole('dialog', { name: 'NAS Alpha' })
+  await dialog.getByLabel('SSH username').fill('root')
+  await dialog.getByLabel('SSH password').fill('secret-password')
+  await dialog.getByRole('button', { name: 'Save SSH credentials' }).click()
+
+  await dialog.getByRole('button', { name: 'Check host key' }).click()
+  await expect(dialog.locator('.ssh-host-key-fingerprint')).toHaveText('SHA256:fixture-host-key')
+  await dialog.getByRole('button', { name: 'Trust this host key' }).click()
+  await expect(dialog.locator('.ssh-host-key-panel')).toContainText('Host key trusted')
+  expect(unexpectedRequests).toEqual([])
+})
+
 test('rebases an SSH credential form after a concurrent device change', async ({ page }) => {
   const submittedIfMatches: Array<string | null> = []
   const unexpectedRequests = await installDeterministicMocks(page, {

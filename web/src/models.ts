@@ -72,6 +72,17 @@ export type SSHCredential = {
   unavailableReason?: string
 }
 
+export type SSHHostKey = {
+  deviceId: string
+  address: string
+  sshPort: string
+  status: 'unknown' | 'trusted' | 'changed'
+  algorithm: string
+  fingerprint: string
+  authorizedKey: string
+  error?: string
+}
+
 export type InventorySnapshot = {
   devices: Device[]
   networkNodes: NetworkNode[]

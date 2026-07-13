@@ -18,6 +18,9 @@ func TestNmapArgumentsDoNotFilterHostsWithoutOpenPorts(t *testing.T) {
 	if slices.Contains(arguments, "--open") {
 		t.Fatalf("arguments unexpectedly contain --open: %v", arguments)
 	}
+	if !slices.Contains(arguments, "-PS22,80,443") || !slices.Contains(arguments, "-PA22,80,443") {
+		t.Fatalf("TCP host-discovery probes missing: %v", arguments)
+	}
 	portIndex := slices.Index(arguments, "-p")
 	if portIndex < 0 || portIndex+1 >= len(arguments) || arguments[portIndex+1] != "80,443" {
 		t.Fatalf("port argument = %v", arguments)

@@ -8,9 +8,10 @@ import (
 )
 
 const (
-	maxConcurrentSSHCommands  = 32
-	maxConcurrentSSHTerminals = 16
-	sshLimitRetryAfter        = "1"
+	maxConcurrentSSHCommands      = 32
+	maxConcurrentSSHTerminals     = 16
+	maxConcurrentSSHHostKeyProbes = 8
+	sshLimitRetryAfter            = "1"
 )
 
 var errSSHConcurrencyLimit = errors.New("SSH concurrency limit reached")
@@ -18,6 +19,7 @@ var errSSHConcurrencyLimit = errors.New("SSH concurrency limit reached")
 type sshConcurrencyLimits struct {
 	commands  *sshRequestLimiter
 	terminals *sshRequestLimiter
+	probes    *sshRequestLimiter
 }
 
 type sshRequestLimiter struct {
@@ -28,6 +30,7 @@ func newSSHConcurrencyLimits(commandLimit, terminalLimit int) *sshConcurrencyLim
 	return &sshConcurrencyLimits{
 		commands:  newSSHRequestLimiter(commandLimit),
 		terminals: newSSHRequestLimiter(terminalLimit),
+		probes:    newSSHRequestLimiter(maxConcurrentSSHHostKeyProbes),
 	}
 }
 

@@ -24,6 +24,9 @@ func TestDefaultSSHConcurrencyLimitsMatchOperationalCaps(t *testing.T) {
 	if got := cap(limits.terminals.slots); got != 16 {
 		t.Fatalf("terminal capacity = %d, want 16", got)
 	}
+	if got := cap(limits.probes.slots); got != maxConcurrentSSHHostKeyProbes {
+		t.Fatalf("host-key probe capacity = %d, want %d", got, maxConcurrentSSHHostKeyProbes)
+	}
 }
 
 func TestSSHRequestLimiterHonorsCanceledContext(t *testing.T) {

@@ -142,6 +142,8 @@ func nmapArguments(ips []string, ports []int) []string {
 	args := []string{
 		"-sT",
 		"-T4",
+		"-PS22,80,443",
+		"-PA22,80,443",
 		"-oX", "-",
 	}
 	if portList := joinPorts(ports); portList != "" {

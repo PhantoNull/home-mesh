@@ -4,6 +4,11 @@ services:
       context: .
       dockerfile: Dockerfile.api
     network_mode: host
+    # Use the LAN resolver when one is configured so reverse-DNS names are
+    # available to discovery; Docker's embedded resolver does not forward all
+    # private PTR lookups.
+    dns:
+      - "${HOME_MESH_DNS_SERVER:-172.29.0.7}"
     init: true
     restart: unless-stopped
     read_only: true
@@ -30,6 +35,7 @@ services:
       HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD: "${HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD:-}"
       HOME_MESH_SSH_HOST_KEY_MODE: "${HOME_MESH_SSH_HOST_KEY_MODE:-known_hosts}"
       HOME_MESH_SSH_KNOWN_HOSTS_SOURCE: /etc/home-mesh/known_hosts
+      HOME_MESH_SSH_KNOWN_HOSTS_PERSIST_PATH: /data/known_hosts
       HOME_MESH_NMAP_PATH: "${HOME_MESH_NMAP_PATH:-nmap}"
       HOME_MESH_DISCOVERY_ALLOW_PUBLIC: "${HOME_MESH_DISCOVERY_ALLOW_PUBLIC:-false}"
       HOME_MESH_SCAN_INTERVAL: "${HOME_MESH_SCAN_INTERVAL:-30s}"
