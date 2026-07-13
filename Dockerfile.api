@@ -46,16 +46,16 @@ COPY --chown=root:root --chmod=0555 docker-entrypoint-api.sh /usr/local/bin/home
 
 WORKDIR /app
 ENV HOME=/tmp \
-    HOME_MESH_HTTP_ADDR=:8080 \
+    HOME_MESH_API_PORT=18080 \
     HOME_MESH_DB_PATH=/data/home-mesh.db
 
 VOLUME ["/data"]
-EXPOSE 8080
+EXPOSE 18080
 
 USER 10001:10001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -q -T 3 -O /dev/null http://127.0.0.1:8080/api/ready || exit 1
+    CMD wget -q -T 3 -O /dev/null "http://127.0.0.1:${HOME_MESH_API_PORT:-18080}/api/ready" || exit 1
 
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/home-mesh-entrypoint"]

@@ -2,6 +2,14 @@ package config
 
 import "testing"
 
+func TestLoadUsesHomeMeshAPIListenPortByDefault(t *testing.T) {
+	t.Setenv("HOME_MESH_HTTP_ADDR", "")
+
+	if cfg := mustLoad(t); cfg.HTTPAddr != ":18080" {
+		t.Fatalf("HTTP address %q want :18080", cfg.HTTPAddr)
+	}
+}
+
 func TestLoadAuthDisabledRequiresExplicitTrue(t *testing.T) {
 	t.Setenv("HOME_MESH_AUTH_DISABLED", "true")
 	if cfg := mustLoad(t); !cfg.AuthDisabled {

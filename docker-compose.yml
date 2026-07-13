@@ -20,7 +20,7 @@ services:
     mem_limit: 512m
     cpus: 2.0
     environment:
-      HOME_MESH_HTTP_ADDR: ":8080"
+      HOME_MESH_API_PORT: "${HOME_MESH_API_PORT:-18080}"
       HOME_MESH_DB_PATH: /data/home-mesh.db
       HOME_MESH_MASTER_KEY: "${HOME_MESH_MASTER_KEY}"
       HOME_MESH_MASTER_KEY_VERSION: "${HOME_MESH_MASTER_KEY_VERSION:-2}"
@@ -69,6 +69,8 @@ services:
     pids_limit: 128
     mem_limit: 256m
     cpus: 1.0
+    environment:
+      HOME_MESH_API_PORT: "${HOME_MESH_API_PORT:-18080}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

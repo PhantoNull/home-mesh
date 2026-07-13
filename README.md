@@ -105,9 +105,11 @@ The project is split into two main parts:
 
 Create a local `.env` from `.env.example` for Docker Compose. Native execution
 does not load dotenv files automatically: export the applicable application
-variables in the process environment before running `go run`. The `WEB_*` and
-`HOME_MESH_SSH_KNOWN_HOSTS_FILE` settings are Compose-only; a native backend uses
-`HOME_MESH_SSH_KNOWN_HOSTS_PATH` for its verified host-key file.
+variables in the process environment before running `go run`.
+`HOME_MESH_API_PORT`, the `WEB_*` settings, and
+`HOME_MESH_SSH_KNOWN_HOSTS_FILE` are Compose-only; a native backend uses
+`HOME_MESH_HTTP_ADDR` for its listener and `HOME_MESH_SSH_KNOWN_HOSTS_PATH` for
+its verified host-key file.
 
 For an authenticated deployment with SSH credential storage, configure:
 
@@ -125,6 +127,8 @@ For an authenticated deployment with SSH credential storage, configure:
 - optionally `HOME_MESH_DISCOVERY_ALLOW_PUBLIC` for an explicit, high-risk
   public-range scan opt-in
 - optionally `HOME_MESH_SEED_DEMO_DATA=true` for a disposable, empty database
+- optionally `HOME_MESH_API_PORT` to change the Compose API listener and Nginx
+  upstream together
 - optionally `HOME_MESH_WEB_BIND` to publish the UI beyond loopback
 - optionally `HOME_MESH_WEB_PORT`
 
@@ -147,7 +151,8 @@ HOME_MESH_SSH_KNOWN_HOSTS_FILE=./config/known_hosts
 HOME_MESH_NMAP_PATH=nmap
 HOME_MESH_DISCOVERY_ALLOW_PUBLIC=false
 HOME_MESH_SCAN_INTERVAL=30s
-HOME_MESH_HTTP_ADDR=:8080
+HOME_MESH_API_PORT=18080
+HOME_MESH_HTTP_ADDR=:18080
 HOME_MESH_WEB_BIND=127.0.0.1
 HOME_MESH_WEB_PORT=3000
 ```
@@ -172,9 +177,9 @@ PowerShell:
 go run ./cmd/server
 ```
 
-The backend listens on:
+By default, the backend listens on:
 
-- `http://localhost:8080`
+- `http://localhost:18080`
 
 ### Run Frontend Natively
 
@@ -223,7 +228,7 @@ Current Docker layout:
   - includes `nmap` in the container image for discovery and background scans
 - `web`
   - frontend served by Nginx
-  - proxies `/api` to the backend via `host.docker.internal:8080`
+  - proxies `/api` to the backend via `host.docker.internal:18080` by default
   - maps `host.docker.internal` through Docker's `host-gateway` on Linux
   - preserves the canonical Host header and forwards controlled client/protocol
     metadata required by SSH WebSockets, rate limiting, and origin checks
@@ -243,10 +248,13 @@ Compose defaults:
 - the UI binds only to `127.0.0.1`; set `HOME_MESH_WEB_BIND` to a specific LAN
   address when other trusted devices must reach it
 - `HOME_MESH_WEB_PORT` controls the published frontend port.
+- `HOME_MESH_API_PORT` controls both the host-network API listener and the
+  Nginx upstream; it defaults to `18080`.
 - the API uses host networking for LAN discovery and Wake-on-LAN, while Nginx is
   the supported browser entry point
-- host networking also makes port `8080` reachable wherever the host firewall
-  permits it; restrict that port to the local host or trusted management network
+- host networking also makes the configured API port reachable wherever the
+  host firewall permits it; restrict that port to the local host or trusted
+  management network
 - both containers run non-root with read-only root filesystems, bounded resources,
   health checks, restart policy, and dropped Linux capabilities
 

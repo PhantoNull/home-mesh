@@ -22,7 +22,8 @@ RUN apk upgrade --no-cache \
     && find /etc -type f -name '*.apk-new' -delete \
     && rm -f /etc/nginx/conf.d/default.conf
 
-COPY web/nginx.conf /etc/nginx/nginx.conf
+COPY web/nginx.conf /etc/nginx/nginx.conf.template
+COPY --chmod=0555 web/docker-entrypoint.sh /usr/local/bin/home-mesh-web-entrypoint
 COPY --from=build --chown=nginx:nginx /app/dist /usr/share/nginx/html
 
 EXPOSE 8080
@@ -32,4 +33,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD wget -q -T 3 -O /dev/null http://127.0.0.1:8080/healthz || exit 1
 
 STOPSIGNAL SIGQUIT
-CMD ["nginx", "-g", "daemon off;"]
+CMD ["/usr/local/bin/home-mesh-web-entrypoint"]
