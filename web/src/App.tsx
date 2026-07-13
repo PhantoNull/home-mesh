@@ -23,6 +23,7 @@ import {
 } from 'lucide-react'
 import DraggableModal from './DraggableModal'
 import RelationEditor, { type RelationDraft } from './RelationEditor'
+import TopologyGraph from './TopologyGraph'
 import { parseSSHServerMessage } from './ssh-events'
 import {
   parseDiscoveryCompleteEvent,
@@ -38,8 +39,6 @@ import {
   parseResourceVersionETag,
   resolveSSHCapability,
   statusClassName,
-  topologyEntityKey,
-  truncateTopologyLabel,
 } from './frontend-utils'
 import {
   type Action,
@@ -1220,193 +1219,6 @@ function SegmentList({
           </div>
         </article>
       ))}
-    </div>
-  )
-}
-
-function TopologyGraph({
-  devices,
-  networkNodes,
-  networkSegments,
-  relations,
-}: {
-  devices: Device[]
-  networkNodes: NetworkNode[]
-  networkSegments: NetworkSegment[]
-  relations: Relation[]
-}) {
-  if (
-    (!devices || devices.length === 0) &&
-    (!networkNodes || networkNodes.length === 0) &&
-    (!networkSegments || networkSegments.length === 0) &&
-    (!relations || relations.length === 0)
-  ) {
-    return <div className="empty-state">Empty</div>
-  }
-
-  const laneX = {
-    segment: 160,
-    node: 480,
-    device: 800,
-  }
-
-  const buildLaneNodes = <T extends { id: string; name: string }>(
-    items: T[],
-    kind: 'segment' | 'node' | 'device',
-    entityKind: Relation['sourceKind'],
-    subtitle: (item: T) => string,
-  ) =>
-    items.map((item, index) => ({
-      id: item.id,
-      kind,
-      entityKind,
-      label: item.name,
-      subtitle: subtitle(item),
-      x: laneX[kind],
-      y: 90 + index * 120,
-    }))
-
-  const graphNodes = [
-    ...buildLaneNodes(networkSegments ?? [], 'segment', 'networkSegment', (segment) => segment.cidr || segment.segmentType || 'segment'),
-    ...buildLaneNodes(networkNodes ?? [], 'node', 'networkNode', (node) => node.nodeType || 'node'),
-    ...buildLaneNodes(devices ?? [], 'device', 'device', (device) => device.ipAddress || device.hostname || 'device'),
-  ]
-
-  const nodeWidth = 208
-  const nodeHeight = 68
-  const nodeHalfWidth = nodeWidth / 2
-  const nodeHalfHeight = nodeHeight / 2
-
-  const anchorForDirection = (
-    node: (typeof graphNodes)[number],
-    toward: { x: number; y: number },
-  ) => {
-    const dx = toward.x - node.x
-    const dy = toward.y - node.y
-
-    if (Math.abs(dx) >= Math.abs(dy)) {
-      return dx >= 0
-        ? { x: node.x + nodeHalfWidth, y: node.y, side: 'right' as const }
-        : { x: node.x - nodeHalfWidth, y: node.y, side: 'left' as const }
-    }
-
-    return dy >= 0
-      ? { x: node.x, y: node.y + nodeHalfHeight, side: 'bottom' as const }
-      : { x: node.x, y: node.y - nodeHalfHeight, side: 'top' as const }
-  }
-
-  const nodeLookup = new Map(graphNodes.map((node) => [topologyEntityKey(node.entityKind, node.id), node]))
-  const graphEdges = (relations ?? [])
-    .map((relation, relationIndex) => {
-      const source = nodeLookup.get(topologyEntityKey(relation.sourceKind, relation.sourceId))
-      const target = nodeLookup.get(topologyEntityKey(relation.targetKind, relation.targetId))
-      if (!source || !target) {
-        return null
-      }
-
-      const start = anchorForDirection(source, target)
-      const end = anchorForDirection(target, source)
-      const controlOffset = 72
-      const controlPoint = (anchor: typeof start, direction: 1 | -1) => {
-        switch (anchor.side) {
-          case 'right':
-            return { x: anchor.x + controlOffset * direction, y: anchor.y }
-          case 'left':
-            return { x: anchor.x - controlOffset * direction, y: anchor.y }
-          case 'bottom':
-            return { x: anchor.x, y: anchor.y + controlOffset * direction }
-          case 'top':
-            return { x: anchor.x, y: anchor.y - controlOffset * direction }
-        }
-      }
-
-      const c1 = controlPoint(start, 1)
-      const c2 = controlPoint(end, 1)
-      const label = truncateTopologyLabel(relation.relationType, 22)
-      const crossesLanes = Math.abs(end.x - start.x) > nodeWidth
-      const labelX = crossesLanes ? (start.x + end.x) / 2 : start.x + nodeHalfWidth + 48
-      const labelY = (start.y + end.y) / 2 - 10 + (relationIndex % 2) * 16
-
-      return {
-        id: relation.id,
-        label,
-        confidence: relation.confidence,
-        x1: start.x,
-        y1: start.y,
-        x2: end.x,
-        y2: end.y,
-        c1x: c1.x,
-        c1y: c1.y,
-        c2x: c2.x,
-        c2y: c2.y,
-        labelX,
-        labelY,
-      }
-    })
-    .filter(Boolean)
-
-  const laneCounts = [networkSegments.length, networkNodes.length, devices.length]
-  const maxLaneItems = Math.max(...laneCounts, 1)
-  const graphHeight = Math.max(360, 120 + maxLaneItems * 120)
-
-  return (
-    <div className="topology-graph">
-      <div className="topology-graph__legend">
-        <span className="topology-legend-pill topology-legend-pill--segment">Segments</span>
-        <span className="topology-legend-pill topology-legend-pill--node">Network nodes</span>
-        <span className="topology-legend-pill topology-legend-pill--device">Devices</span>
-      </div>
-      <div className="topology-graph__canvas" role="region" aria-label="Scrollable network topology" tabIndex={0}>
-        <svg viewBox={`0 0 960 ${graphHeight}`} className="topology-graph__svg" role="img" aria-label="Network topology graph">
-          <g>
-            <text x="160" y="36" textAnchor="middle" className="topology-graph__lane-label">
-              Segments
-            </text>
-            <text x="480" y="36" textAnchor="middle" className="topology-graph__lane-label">
-              Network nodes
-            </text>
-            <text x="800" y="36" textAnchor="middle" className="topology-graph__lane-label">
-              Devices
-            </text>
-          </g>
-
-          {graphEdges.map((edge) => (
-            <g key={edge!.id}>
-              <title>{`${edge!.label}${edge!.confidence ? ` (${edge!.confidence})` : ''}`}</title>
-              <path
-                d={`M ${edge!.x1} ${edge!.y1} C ${edge!.c1x} ${edge!.c1y}, ${edge!.c2x} ${edge!.c2y}, ${edge!.x2} ${edge!.y2}`}
-                className="topology-graph__edge"
-              />
-              <text
-                x={edge!.labelX}
-                y={edge!.labelY}
-                textAnchor="middle"
-                className="topology-graph__edge-label"
-              >
-                {edge!.label}
-              </text>
-            </g>
-          ))}
-
-          {graphNodes.map((node) => (
-            <g key={`${node.entityKind}:${node.id}`} transform={`translate(${node.x - nodeHalfWidth}, ${node.y - nodeHalfHeight})`}>
-              <title>{`${node.label}: ${node.subtitle}`}</title>
-              <rect
-                width={nodeWidth}
-                height={nodeHeight}
-                rx="8"
-                className={`topology-graph__node topology-graph__node--${node.kind}`}
-              />
-              <text x="18" y="28" className="topology-graph__node-title">
-                {truncateTopologyLabel(node.label)}
-              </text>
-              <text x="18" y="49" className="topology-graph__node-subtitle">
-                {truncateTopologyLabel(node.subtitle, 28)}
-              </text>
-            </g>
-          ))}
-        </svg>
-      </div>
     </div>
   )
 }
