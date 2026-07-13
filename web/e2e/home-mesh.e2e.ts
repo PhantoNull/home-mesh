@@ -61,8 +61,38 @@ test('renders the mocked inventory without browser or API errors', async ({ page
   await expect(page.getByRole('heading', { level: 2, name: 'Devices' })).toBeVisible()
   await expect(page.getByRole('heading', { level: 2, name: 'Network nodes' })).toBeVisible()
   await expect(page.getByRole('heading', { level: 2, name: 'Network segments' })).toBeVisible()
-  await expect(page.getByRole('img', { name: 'Network topology graph' })).toBeVisible()
+  await expect(page.getByRole('group', { name: 'Network topology graph' })).toBeVisible()
   await expect(page.getByRole('status')).toContainText('Live: on')
+
+  expect(unexpectedRequests).toEqual([])
+  expect(runtimeErrors.console).toEqual([])
+  expect(runtimeErrors.page).toEqual([])
+})
+
+test('focuses topology paths and exposes stable view controls', async ({ page }) => {
+  const { runtimeErrors, unexpectedRequests } = await openDashboard(page)
+
+  const graph = page.getByRole('group', { name: 'Network topology graph' })
+  await expect(page.getByLabel('Topology summary')).toContainText('3 entities')
+  await expect(page.getByLabel('Topology summary')).toContainText('2 links')
+
+  const device = graph.getByRole('button', { name: /Device NAS Alpha/ })
+  await device.click()
+  await expect(device).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.locator('.topology-graph__selection')).toContainText('NAS Alpha')
+
+  await page.getByRole('button', { name: 'Zoom in topology' }).click()
+  await expect(page.locator('.topology-graph__zoom')).toHaveText('125%')
+  await page.getByRole('button', { name: 'Reset topology zoom' }).click()
+  await expect(page.locator('.topology-graph__zoom')).toHaveText('100%')
+
+  const labelsToggle = page.getByRole('button', { name: 'Toggle relation labels' })
+  await labelsToggle.click()
+  await expect(labelsToggle).toHaveAttribute('aria-pressed', 'false')
+
+  await device.focus()
+  await device.press('Enter')
+  await expect(device).toHaveAttribute('aria-pressed', 'false')
 
   expect(unexpectedRequests).toEqual([])
   expect(runtimeErrors.console).toEqual([])
