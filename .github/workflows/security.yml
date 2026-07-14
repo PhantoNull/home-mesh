@@ -118,7 +118,7 @@ jobs:
               --cap-drop ALL \
               --security-opt no-new-privileges \
               --tmpfs /tmp:uid=10001,gid=10001,mode=0700 \
-              --publish 127.0.0.1:${{ matrix.port }}:8080 \
+              --publish 127.0.0.1:${{ matrix.port }}:18080 \
               --env HOME_MESH_AUTH_DISABLED=true \
               --env HOME_MESH_DB_PATH=/tmp/home-mesh.db \
               --env HOME_MESH_SESSION_SECRET=ci-only-session-secret-with-at-least-32-bytes \

@@ -74,7 +74,7 @@ func Load() (Config, error) {
 	}
 
 	return Config{
-		HTTPAddr:               getEnv("HOME_MESH_HTTP_ADDR", ":8080"),
+		HTTPAddr:               getEnv("HOME_MESH_HTTP_ADDR", ":18080"),
 		AppName:                getEnv("HOME_MESH_APP_NAME", "home-mesh"),
 		Env:                    getEnv("HOME_MESH_ENV", "development"),
 		DBPath:                 getEnv("HOME_MESH_DB_PATH", "data/home-mesh.db"),
