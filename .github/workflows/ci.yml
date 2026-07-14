@@ -158,6 +158,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          bundle="${RUNNER_TEMP}/home-mesh-linux-smoke"
+          mkdir -p "$bundle/config"
+          cp deploy/linux/compose.yml "$bundle/compose.yml"
+          cp config/known_hosts "$bundle/config/known_hosts"
+          chmod 0644 "$bundle/config/known_hosts"
+          compose_file="$bundle/compose.yml"
           env_file="${RUNNER_TEMP}/home-mesh-linux.env"
           cat > "$env_file" <<'EOF'
           HOME_MESH_IMAGE_TAG=linux-smoke
@@ -186,16 +192,16 @@ jobs:
             status=$?
             trap - EXIT
             if [[ "$status" -ne 0 ]]; then
-              docker compose --env-file "$env_file" -f deploy/linux/compose.yml ps --all || true
-              docker compose --env-file "$env_file" -f deploy/linux/compose.yml logs --no-color api web || true
+              docker compose --env-file "$env_file" -f "$compose_file" ps --all || true
+              docker compose --env-file "$env_file" -f "$compose_file" logs --no-color api web || true
             fi
-            docker compose --env-file "$env_file" -f deploy/linux/compose.yml \
+            docker compose --env-file "$env_file" -f "$compose_file" \
               down --volumes --remove-orphans >/dev/null 2>&1 || true
             exit "$status"
           }
           trap cleanup EXIT
 
-          docker compose --env-file "$env_file" -f deploy/linux/compose.yml \
+          docker compose --env-file "$env_file" -f "$compose_file" \
             up -d --wait --wait-timeout 120
           curl --fail --silent --show-error http://127.0.0.1:39000/healthz >/dev/null
           curl --fail --silent --show-error http://127.0.0.1:39000/api/ready >/dev/null
@@ -204,8 +210,8 @@ jobs:
             echo "API unexpectedly listened on loopback instead of only the proxy gateway" >&2
             exit 1
           fi
-          test "$(docker compose --env-file "$env_file" -f deploy/linux/compose.yml exec -T api id -u)" != "0"
-          test "$(docker compose --env-file "$env_file" -f deploy/linux/compose.yml exec -T web id -u)" != "0"
+          test "$(docker compose --env-file "$env_file" -f "$compose_file" exec -T api id -u)" != "0"
+          test "$(docker compose --env-file "$env_file" -f "$compose_file" exec -T web id -u)" != "0"
 
   containers:
     name: Multiarch image (${{ matrix.name }})
