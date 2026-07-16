@@ -129,6 +129,8 @@ For an authenticated deployment with SSH credential storage, configure:
 - optionally `HOME_MESH_SEED_DEMO_DATA=true` for a disposable, empty database
 - optionally `HOME_MESH_API_PORT` to change the Compose API listener and Nginx
   upstream together
+- optionally `HOME_MESH_API_BIND` to constrain the Compose API listener to a
+  host address (the Linux product bundle binds it to its private proxy gateway)
 - optionally `HOME_MESH_WEB_BIND` to publish the UI beyond loopback
 - optionally `HOME_MESH_WEB_PORT`
 
@@ -152,6 +154,8 @@ HOME_MESH_NMAP_PATH=nmap
 HOME_MESH_DISCOVERY_ALLOW_PUBLIC=false
 HOME_MESH_SCAN_INTERVAL=30s
 HOME_MESH_API_PORT=18080
+HOME_MESH_API_BIND=
+HOME_MESH_API_HEALTH_HOST=127.0.0.1
 HOME_MESH_HTTP_ADDR=:18080
 HOME_MESH_WEB_BIND=127.0.0.1
 HOME_MESH_WEB_PORT=3000
@@ -215,9 +219,11 @@ npm run build
 npm run test:e2e
 ```
 
-## Docker Compose
+## Source Docker Compose
 
-The project can also run via Docker Compose.
+The repository Compose file builds the current checkout and is intended for
+development and pre-release verification. The versioned Linux product bundle is
+documented under [Deployment](#deployment).
 
 Current Docker layout:
 
@@ -438,39 +444,52 @@ clean success.
 
 ## Deployment
 
-There are two realistic deployment modes for Home Mesh.
+Home Mesh has one supported product deployment and one native development mode.
 
-### 1. Docker Compose on a Thin Client or Mini PC
+### 1. Linux Product Bundle
 
-This is the current recommended deployment path.
+The supported product deployment is Docker Engine plus Compose v2 on a physical
+Linux host connected to the managed LAN. Release images are published for
+`linux/amd64` and `linux/arm64`; each release includes a versioned deployment
+bundle with Compose, secure bootstrap, health validation, update, and consistent
+backup commands.
 
-Best host targets for running Home Mesh itself:
+Suitable hosts include:
 
 - Linux thin client
 - mini PC
 - Raspberry Pi class edge node
 
-Recommended steps:
+Install from the matching `home-mesh-linux-<version>.tar.gz` GitHub release:
 
-1. clone the repository
-2. create `.env`
-3. set a real `HOME_MESH_MASTER_KEY`
-4. run:
-
-```bash
-docker compose up -d --build
+```sh
+tar -xzf home-mesh-linux-<version>.tar.gz
+cd home-mesh-linux-<version>
+./home-mesh.sh init
 ```
 
-Why this works well:
+Review the generated `.env`, then validate and start:
 
-- simple updates
-- reproducible deployment
-- persistent SQLite data on disk
-- backend can run close to the network edge
+```sh
+./home-mesh.sh doctor
+./home-mesh.sh up
+```
 
-Important note:
+The product Compose model:
 
-- for Wake-on-LAN, ARP, and LAN probing, Linux host networking is much more reliable than Docker Desktop on Windows
+- pulls versioned GHCR images instead of compiling on the target
+- uses real Linux host networking for WOL and LAN discovery
+- exposes the API only on a deterministic private proxy bridge gateway
+- publishes Nginx on loopback by default
+- stores SQLite and enrolled SSH host keys in a named volume
+- creates a consistent data-and-key backup before updates
+
+See [`deploy/linux/README.md`](deploy/linux/README.md) for install, network, WOL,
+backup, update, rollback, and restore procedures.
+
+Docker Desktop, macOS, FreeBSD, and generic Unix systems are not product WOL
+acceptance targets. Docker Desktop host networking does not provide the same
+physical-interface contract as Docker Engine on Linux.
 
 ### 2. Native Backend + Static Frontend
 
