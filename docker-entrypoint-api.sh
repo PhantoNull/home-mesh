@@ -2,6 +2,7 @@
 set -eu
 
 api_port="${HOME_MESH_API_PORT:-18080}"
+api_bind="${HOME_MESH_API_BIND:-}"
 
 case "$api_port" in
   ''|*[!0-9]*)
@@ -16,7 +17,11 @@ if [ "$api_port" -lt 1 ] || [ "$api_port" -gt 65535 ]; then
 fi
 
 export HOME_MESH_API_PORT="$api_port"
-export HOME_MESH_HTTP_ADDR=":$api_port"
+case "$api_bind" in
+  "") export HOME_MESH_HTTP_ADDR=":$api_port" ;;
+  *:*) export HOME_MESH_HTTP_ADDR="[$api_bind]:$api_port" ;;
+  *) export HOME_MESH_HTTP_ADDR="$api_bind:$api_port" ;;
+esac
 
 known_hosts_source="${HOME_MESH_SSH_KNOWN_HOSTS_SOURCE:-}"
 known_hosts_path="${HOME_MESH_SSH_KNOWN_HOSTS_PERSIST_PATH:-/data/known_hosts}"

@@ -1,14 +1,11 @@
+name: home-mesh
+
 services:
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
+    image: "${HOME_MESH_API_IMAGE:-ghcr.io/phantonull/home-mesh-api}:${HOME_MESH_IMAGE_TAG:-latest}"
     network_mode: host
-    # Use the LAN resolver when one is configured so reverse-DNS names are
-    # available to discovery; Docker's embedded resolver does not forward all
-    # private PTR lookups.
     dns:
-      - "${HOME_MESH_DNS_SERVER:-172.29.0.7}"
+      - "${HOME_MESH_DNS_SERVER:?HOME_MESH_DNS_SERVER is required}"
     init: true
     restart: unless-stopped
     read_only: true
@@ -21,29 +18,29 @@ services:
     cpus: 2.0
     environment:
       HOME_MESH_API_PORT: "${HOME_MESH_API_PORT:-18080}"
-      HOME_MESH_API_BIND: "${HOME_MESH_API_BIND:-}"
-      HOME_MESH_API_HEALTH_HOST: "${HOME_MESH_API_HEALTH_HOST:-127.0.0.1}"
+      HOME_MESH_API_BIND: "${HOME_MESH_PROXY_GATEWAY:-172.30.0.1}"
+      HOME_MESH_API_HEALTH_HOST: "${HOME_MESH_PROXY_GATEWAY:-172.30.0.1}"
       HOME_MESH_DB_PATH: /data/home-mesh.db
-      HOME_MESH_MASTER_KEY: "${HOME_MESH_MASTER_KEY}"
+      HOME_MESH_MASTER_KEY: "${HOME_MESH_MASTER_KEY:?HOME_MESH_MASTER_KEY is required}"
       HOME_MESH_MASTER_KEY_VERSION: "${HOME_MESH_MASTER_KEY_VERSION:-2}"
       HOME_MESH_PREVIOUS_MASTER_KEYS: "${HOME_MESH_PREVIOUS_MASTER_KEYS:-}"
       HOME_MESH_SEED_DEMO_DATA: "${HOME_MESH_SEED_DEMO_DATA:-false}"
-      HOME_MESH_SESSION_SECRET: "${HOME_MESH_SESSION_SECRET}"
+      HOME_MESH_SESSION_SECRET: "${HOME_MESH_SESSION_SECRET:?HOME_MESH_SESSION_SECRET is required}"
       HOME_MESH_SESSION_DURATION: "${HOME_MESH_SESSION_DURATION:-1h}"
-      HOME_MESH_AUTH_DISABLED: "${HOME_MESH_AUTH_DISABLED:-false}"
-      HOME_MESH_TRUSTED_PROXY_CIDRS: "${HOME_MESH_TRUSTED_PROXY_CIDRS:-172.16.0.0/12}"
+      HOME_MESH_AUTH_DISABLED: "false"
+      HOME_MESH_TRUSTED_PROXY_CIDRS: "${HOME_MESH_PROXY_SUBNET:-172.30.0.0/24}"
       HOME_MESH_ALLOWED_HOSTS: "${HOME_MESH_ALLOWED_HOSTS:-}"
       HOME_MESH_BOOTSTRAP_ADMIN_USERNAME: "${HOME_MESH_BOOTSTRAP_ADMIN_USERNAME:-root}"
       HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD: "${HOME_MESH_BOOTSTRAP_ADMIN_PASSWORD:-}"
-      HOME_MESH_SSH_HOST_KEY_MODE: "${HOME_MESH_SSH_HOST_KEY_MODE:-known_hosts}"
+      HOME_MESH_SSH_HOST_KEY_MODE: known_hosts
       HOME_MESH_SSH_KNOWN_HOSTS_SOURCE: /etc/home-mesh/known_hosts
       HOME_MESH_SSH_KNOWN_HOSTS_PERSIST_PATH: /data/known_hosts
-      HOME_MESH_NMAP_PATH: "${HOME_MESH_NMAP_PATH:-nmap}"
+      HOME_MESH_NMAP_PATH: nmap
       HOME_MESH_DISCOVERY_ALLOW_PUBLIC: "${HOME_MESH_DISCOVERY_ALLOW_PUBLIC:-false}"
       HOME_MESH_SCAN_INTERVAL: "${HOME_MESH_SCAN_INTERVAL:-30s}"
     volumes:
       - home_mesh_data:/data
-      - "${HOME_MESH_SSH_KNOWN_HOSTS_FILE:-./config/known_hosts}:/etc/home-mesh/known_hosts:ro"
+      - ./config/known_hosts:/etc/home-mesh/known_hosts:ro
     tmpfs:
       - /tmp:uid=10001,gid=10001,mode=0700
     stop_grace_period: 30s
@@ -54,13 +51,13 @@ services:
         max-file: "3"
 
   web:
-    build:
-      context: .
-      dockerfile: web/Dockerfile
+    image: "${HOME_MESH_WEB_IMAGE:-ghcr.io/phantonull/home-mesh-web}:${HOME_MESH_IMAGE_TAG:-latest}"
     depends_on:
       api:
         condition: service_healthy
         restart: true
+    networks:
+      - proxy
     init: true
     restart: unless-stopped
     read_only: true
@@ -74,7 +71,7 @@ services:
     environment:
       HOME_MESH_API_PORT: "${HOME_MESH_API_PORT:-18080}"
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "host.docker.internal:${HOME_MESH_PROXY_GATEWAY:-172.30.0.1}"
     ports:
       - "${HOME_MESH_WEB_BIND:-127.0.0.1}:${HOME_MESH_WEB_PORT:-3000}:8080"
     tmpfs:
@@ -86,5 +83,15 @@ services:
         max-size: 10m
         max-file: "3"
 
+networks:
+  proxy:
+    name: home-mesh-proxy
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "${HOME_MESH_PROXY_SUBNET:-172.30.0.0/24}"
+          gateway: "${HOME_MESH_PROXY_GATEWAY:-172.30.0.1}"
+
 volumes:
   home_mesh_data:
+    name: home-mesh-data
