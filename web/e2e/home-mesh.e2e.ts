@@ -200,6 +200,26 @@ test('focuses topology paths and exposes stable view controls', async ({ page })
   expect(runtimeErrors.page).toEqual([])
 })
 
+test('reports an empty login gateway response without exposing a JSON parser error', async ({ page }) => {
+  const runtimeErrors = monitorRuntimeErrors(page)
+  await page.route('**/api/auth/session', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ enabled: true, authenticated: false }),
+  }))
+  await page.route('**/api/auth/login', (route) => route.fulfill({ status: 502, body: '' }))
+
+  await page.goto('/')
+  await page.getByLabel('Username').fill('root')
+  await page.getByLabel('Password').fill('not-the-real-password')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  await expect(page.getByRole('alert')).toHaveText('Login failed with status 502 (empty response)')
+  await expect(page.getByRole('alert')).not.toContainText('JSON.parse')
+  expect(runtimeErrors.console.filter((message) => !message.includes('status of 502'))).toEqual([])
+  expect(runtimeErrors.page).toEqual([])
+})
+
 test('preserves topology selection and viewport during a live status update', async ({ page }) => {
   const { runtimeErrors, unexpectedRequests } = await openDashboard(page)
   const graph = page.getByRole('region', { name: 'Interactive network topology' })
