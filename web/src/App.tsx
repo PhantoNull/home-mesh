@@ -37,6 +37,7 @@ import {
   panelURLValidationError,
   parseBulkRefreshResponse,
   parseResourceVersionETag,
+  readAPIError,
   resolveSSHCapability,
   statusClassName,
 } from './frontend-utils'
@@ -1880,8 +1881,7 @@ export default function App() {
       })
 
       if (!response.ok) {
-        const payload = (await response.json()) as { error?: string }
-        throw new Error(payload.error ?? `Login failed with status ${response.status}`)
+        throw new Error(await readAPIError(response, `Login failed with status ${response.status}`))
       }
 
       setAuthState('authenticated')
@@ -3177,6 +3177,11 @@ export default function App() {
             networkNodes={state.data.networkNodes}
             networkSegments={state.data.networkSegments}
             relations={state.data.relations}
+            onEditDevice={openEditDeviceModal}
+            onEditNetworkNode={openEditNodeModal}
+            onEditNetworkSegment={openEditSegmentModal}
+            onOpenSSH={(device) => void openSSHModal(device)}
+            onWake={(device) => void triggerWake(device)}
           />
         </article>
       </>

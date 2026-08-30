@@ -122,6 +122,28 @@ export function parseResourceVersionETag(value: string | null): number | null {
   return Number.isSafeInteger(version) ? version : null
 }
 
+export async function readAPIError(response: Response, fallback: string): Promise<string> {
+  let body: string
+  try {
+    body = await response.text()
+  } catch {
+    return `${fallback} (unreadable response)`
+  }
+  if (!body.trim()) {
+    return `${fallback} (empty response)`
+  }
+
+  try {
+    const payload: unknown = JSON.parse(body)
+    if (isRecord(payload) && typeof payload.error === 'string' && payload.error.trim()) {
+      return payload.error.trim()
+    }
+    return fallback
+  } catch {
+    return `${fallback} (non-JSON response)`
+  }
+}
+
 export function truncateTopologyLabel(value: string, maxLength = 24): string {
   if (value.length <= maxLength) {
     return value

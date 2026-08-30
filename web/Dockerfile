@@ -24,6 +24,7 @@ RUN apk upgrade --no-cache \
 
 COPY web/nginx.conf /etc/nginx/nginx.conf.template
 COPY --chmod=0555 web/docker-entrypoint.sh /usr/local/bin/home-mesh-web-entrypoint
+RUN sed -i 's/\r$//' /usr/local/bin/home-mesh-web-entrypoint
 COPY --from=build --chown=nginx:nginx /app/dist /usr/share/nginx/html
 
 EXPOSE 8080

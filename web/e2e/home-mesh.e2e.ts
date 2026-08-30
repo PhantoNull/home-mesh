@@ -1,5 +1,6 @@
 import AxeBuilder from '@axe-core/playwright'
 import { expect, test, type Page } from '@playwright/test'
+import type { InventorySnapshot } from '../src/models'
 import { emitMonitorScanEvent, installDeterministicMocks, inventoryFixture } from './mock-api'
 
 type RuntimeErrors = {
@@ -54,6 +55,73 @@ async function expectNoAxeViolations(page: Page) {
   expect(result.violations, JSON.stringify(summary, null, 2)).toEqual([])
 }
 
+function denseTopologyFixture(entityCount: number): InventorySnapshot {
+  const nodeCount = Math.max(1, Math.floor(entityCount / 10))
+  const deviceCount = entityCount - nodeCount - 1
+  const networkNodes = Array.from({ length: nodeCount }, (_, index) => ({
+    id: `node-${index}`,
+    version: 1,
+    name: `Access switch ${index}`,
+    nodeType: 'switch',
+    managementIp: `10.0.0.${index + 1}`,
+    macAddress: '',
+    vendor: 'Home Mesh Labs',
+    model: 'HM-S24',
+    status: index % 12 === 0 ? 'degraded' : 'online',
+    tags: ['access'],
+  }))
+  const devices = Array.from({ length: deviceCount }, (_, index) => ({
+    id: `device-${index}`,
+    version: 1,
+    name: `Endpoint ${index}`,
+    hostname: `endpoint-${index}.home.arpa`,
+    role: 'workstation',
+    deviceType: 'desktop',
+    ipAddress: `10.${Math.floor(index / 254) + 1}.0.${(index % 254) + 1}`,
+    macAddress: '',
+    networkSegment: 'segment-main',
+    status: index % 17 === 0 ? 'offline' : 'online',
+    tags: ['managed'],
+  }))
+  return {
+    devices,
+    networkNodes,
+    networkSegments: [{
+      id: 'segment-main',
+      version: 1,
+      name: 'Managed LAN',
+      segmentType: 'lan',
+      cidr: '10.0.0.0/8',
+      vlanId: 10,
+      gatewayIp: '10.0.0.1',
+      dnsDomain: 'home.arpa',
+    }],
+    relations: [
+      ...networkNodes.map((node) => ({
+        id: `segment-${node.id}`,
+        version: 1,
+        sourceKind: 'networkSegment',
+        sourceId: 'segment-main',
+        targetKind: 'networkNode',
+        targetId: node.id,
+        relationType: 'routed_by',
+        confidence: 'observed',
+      })),
+      ...devices.map((device, index) => ({
+        id: `node-device-${index}`,
+        version: 1,
+        sourceKind: 'networkNode',
+        sourceId: networkNodes[index % networkNodes.length].id,
+        targetKind: 'device',
+        targetId: device.id,
+        relationType: 'connected_to',
+        confidence: 'observed',
+      })),
+    ],
+    actions: [],
+  }
+}
+
 test('renders the mocked inventory without browser or API errors', async ({ page }) => {
   const { runtimeErrors, unexpectedRequests } = await openDashboard(page)
 
@@ -61,8 +129,8 @@ test('renders the mocked inventory without browser or API errors', async ({ page
   await expect(page.getByRole('heading', { level: 2, name: 'Devices' })).toBeVisible()
   await expect(page.getByRole('heading', { level: 2, name: 'Network nodes' })).toBeVisible()
   await expect(page.getByRole('heading', { level: 2, name: 'Network segments' })).toBeVisible()
-  await expect(page.getByRole('group', { name: 'Network topology graph' })).toBeVisible()
-  await expect(page.getByRole('status')).toContainText('Live: on')
+  await expect(page.getByRole('region', { name: 'Interactive network topology' })).toBeVisible()
+  await expect(page.getByRole('status', { name: '' }).filter({ hasText: 'Live: on' })).toBeVisible()
 
   expect(unexpectedRequests).toEqual([])
   expect(runtimeErrors.console).toEqual([])
@@ -72,28 +140,148 @@ test('renders the mocked inventory without browser or API errors', async ({ page
 test('focuses topology paths and exposes stable view controls', async ({ page }) => {
   const { runtimeErrors, unexpectedRequests } = await openDashboard(page)
 
-  const graph = page.getByRole('group', { name: 'Network topology graph' })
+  const graph = page.getByRole('region', { name: 'Interactive network topology' })
+  const explorer = page.getByRole('complementary', { name: 'Topology explorer' })
+  const inspector = page.getByRole('complementary', { name: 'Selected topology entity' })
+  await expect(page.locator('.topology-layout-state')).toBeHidden()
   await expect(page.getByLabel('Topology summary')).toContainText('3 entities')
-  await expect(page.getByLabel('Topology summary')).toContainText('2 links')
+  await expect(page.getByLabel('Topology summary')).toContainText('3 links')
+  await expect(page.getByLabel('Topology summary')).toContainText('1 physical')
+  await expect(page.getByLabel('Topology summary')).toContainText('1 automatic')
 
-  const device = graph.getByRole('button', { name: /Device NAS Alpha/ })
+  const device = explorer.getByRole('button', { name: /NAS Alpha/ })
   await device.click()
   await expect(device).toHaveAttribute('aria-pressed', 'true')
-  await expect(page.locator('.topology-graph__selection')).toContainText('NAS Alpha')
+  await expect(inspector.getByRole('heading', { level: 3, name: 'NAS Alpha' })).toBeVisible()
+  await expect(inspector).toContainText('Physical / connected to')
+  await expect(inspector).toContainText('Logical / member of VLAN 10')
+  await expect(inspector).toContainText('Automatic / inventory.networkSegment')
+  await expect(graph.locator('.react-flow__node.selected')).toContainText('NAS Alpha')
 
-  await page.getByRole('button', { name: 'Zoom in topology' }).click()
-  await expect(page.locator('.topology-graph__zoom')).toHaveText('125%')
-  await page.getByRole('button', { name: 'Reset topology zoom' }).click()
-  await expect(page.locator('.topology-graph__zoom')).toHaveText('100%')
+  const viewport = graph.locator('.react-flow__viewport')
+  const initialTransform = await viewport.getAttribute('style')
+  const zoomIn = graph.locator('.react-flow__controls-zoomin')
+  await expect(zoomIn).toBeEnabled()
+  await expect(graph.locator('.react-flow__controls-zoomout')).toBeEnabled()
+  await expect(graph.locator('.react-flow__controls-fitview')).toBeEnabled()
+  await zoomIn.click()
+  await expect.poll(() => viewport.getAttribute('style')).not.toBe(initialTransform)
+  const zoomedTransform = await viewport.getAttribute('style')
+
+  const pane = graph.locator('.react-flow__pane')
+  const paneBox = await pane.boundingBox()
+  expect(paneBox).not.toBeNull()
+  await page.mouse.move(paneBox!.x + paneBox!.width / 2, paneBox!.y + paneBox!.height / 2)
+  await page.mouse.wheel(80, 60)
+  await expect.poll(() => viewport.getAttribute('style')).not.toBe(zoomedTransform)
+  const pannedTransform = await viewport.getAttribute('style')
+  await graph.locator('.react-flow__controls-fitview').click()
+  await expect.poll(() => viewport.getAttribute('style')).not.toBe(pannedTransform)
+
+  const verticalLayout = page.getByRole('button', { name: 'Use vertical topology layout' })
+  await verticalLayout.click()
+  await expect(verticalLayout).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.locator('.topology-layout-state')).toBeHidden()
 
   const labelsToggle = page.getByRole('button', { name: 'Toggle relation labels' })
   await labelsToggle.click()
   await expect(labelsToggle).toHaveAttribute('aria-pressed', 'false')
 
-  await device.focus()
-  await device.press('Enter')
-  await expect(device).toHaveAttribute('aria-pressed', 'false')
+  const search = explorer.getByRole('textbox', { name: 'Search topology' })
+  await search.fill('192.168.10.20')
+  await expect(explorer.getByText('1/3')).toBeVisible()
+  await explorer.getByRole('button', { name: 'Clear topology search' }).click()
+  await expect(explorer.getByText('3/3')).toBeVisible()
 
+  const graphDevice = graph.getByRole('button', { name: /Device NAS Alpha/ })
+  await graphDevice.focus()
+  await graphDevice.press('Enter')
+  await expect(inspector.getByRole('heading', { level: 3, name: 'NAS Alpha' })).toBeVisible()
+
+  expect(unexpectedRequests).toEqual([])
+  expect(runtimeErrors.console).toEqual([])
+  expect(runtimeErrors.page).toEqual([])
+})
+
+test('reports an empty login gateway response without exposing a JSON parser error', async ({ page }) => {
+  const runtimeErrors = monitorRuntimeErrors(page)
+  await page.route('**/api/auth/session', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ enabled: true, authenticated: false }),
+  }))
+  await page.route('**/api/auth/login', (route) => route.fulfill({ status: 502, body: '' }))
+
+  await page.goto('/')
+  await page.getByLabel('Username').fill('root')
+  await page.getByLabel('Password').fill('not-the-real-password')
+  await page.getByRole('button', { name: 'Sign in' }).click()
+
+  await expect(page.getByRole('alert')).toHaveText('Login failed with status 502 (empty response)')
+  await expect(page.getByRole('alert')).not.toContainText('JSON.parse')
+  expect(runtimeErrors.console.filter((message) => !message.includes('status of 502'))).toEqual([])
+  expect(runtimeErrors.page).toEqual([])
+})
+
+test('preserves topology selection and viewport during a live status update', async ({ page }) => {
+  const { runtimeErrors, unexpectedRequests } = await openDashboard(page)
+  const graph = page.getByRole('region', { name: 'Interactive network topology' })
+  const explorer = page.getByRole('complementary', { name: 'Topology explorer' })
+  await expect(page.locator('.topology-layout-state')).toBeHidden()
+  await page.waitForTimeout(400)
+  await explorer.getByRole('button', { name: /NAS Alpha/ }).click()
+
+  const graphDevice = graph.getByRole('button', { name: /Device NAS Alpha/ })
+  const viewportBefore = await graph.locator('.react-flow__viewport').getAttribute('style')
+  const positionBefore = await graphDevice.getAttribute('style')
+  await emitMonitorScanEvent(page, 'device-updated', {
+    ...inventoryFixture.devices[0],
+    version: 4,
+    status: 'degraded',
+  })
+
+  await expect(graphDevice).toContainText('degraded')
+  await expect(page.getByRole('complementary', { name: 'Selected topology entity' })).toContainText('degraded')
+  await expect(graph.locator('.react-flow__viewport')).toHaveAttribute('style', viewportBefore ?? '')
+  await expect(graphDevice).toHaveAttribute('style', positionBefore ?? '')
+  expect(unexpectedRequests).toEqual([])
+  expect(runtimeErrors.console).toEqual([])
+  expect(runtimeErrors.page).toEqual([])
+})
+
+test('makes 250 entities interactive within budget and completes layout', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'Scale timing runs once on desktop Chromium.')
+  const runtimeErrors = monitorRuntimeErrors(page)
+  const unexpectedRequests = await installDeterministicMocks(page, { inventory: denseTopologyFixture(250) })
+
+  await page.goto('/')
+  const workspace = page.locator('.topology-workspace')
+  await expect(workspace.getByLabel('Topology summary')).toContainText('250 entities')
+  await expect(page.getByRole('region', { name: 'Interactive network topology' }).locator('.react-flow__controls-zoomin')).toBeEnabled()
+  const interactiveAt = Number(await workspace.getAttribute('data-interactive-at-ms'))
+  expect(interactiveAt).toBeGreaterThan(0)
+  expect(interactiveAt).toBeLessThan(2_000)
+  await expect(page.locator('.topology-layout-state')).toBeHidden({ timeout: 8_000 })
+  expect(unexpectedRequests).toEqual([])
+  expect(runtimeErrors.console).toEqual([])
+  expect(runtimeErrors.page).toEqual([])
+})
+
+test('keeps a 1000-entity topology usable through search and label suppression', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', 'Large-graph behavior runs once on desktop Chromium.')
+  const runtimeErrors = monitorRuntimeErrors(page)
+  const unexpectedRequests = await installDeterministicMocks(page, { inventory: denseTopologyFixture(1_000) })
+
+  await page.goto('/')
+  await expect(page.getByLabel('Topology summary')).toContainText('1000 entities')
+  await expect(page.getByText('Relation labels are shown on selection for this graph size.')).toBeVisible()
+  await expect(page.getByText('Fast grouped layout is active for this graph size.')).toBeVisible()
+  await expect(page.getByText('The canvas shows the first 300 of 1000 matches. Refine search or filters to inspect the rest.')).toBeVisible()
+  const explorer = page.getByRole('complementary', { name: 'Topology explorer' })
+  await explorer.getByRole('textbox', { name: 'Search topology' }).fill('endpoint-898.home.arpa')
+  await expect(explorer.getByText('1/1000')).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Interactive network topology' }).locator('.react-flow__edge-text')).toHaveCount(0)
+  await expect(page.locator('.topology-layout-state')).toBeHidden({ timeout: 10_000 })
   expect(unexpectedRequests).toEqual([])
   expect(runtimeErrors.console).toEqual([])
   expect(runtimeErrors.page).toEqual([])
@@ -211,13 +399,13 @@ test('keeps the dashboard and its topology scroller inside the viewport', async 
   await openDashboard(page)
 
   await expectNoDocumentOverflow(page)
-  const topologyScroller = page.locator('.topology-graph__canvas')
+  const topologyScroller = page.locator('.topology-workspace__canvas')
   await expect(topologyScroller).toBeVisible()
   const topologyOverflow = await topologyScroller.evaluate((element) => ({
     clientWidth: element.clientWidth,
     scrollWidth: element.scrollWidth,
   }))
-  expect(topologyOverflow.scrollWidth).toBeGreaterThanOrEqual(topologyOverflow.clientWidth)
+  expect(topologyOverflow.scrollWidth).toBeLessThanOrEqual(topologyOverflow.clientWidth + 1)
 })
 
 test('traps modal focus, stays in the viewport, and restores focus on Escape', async ({ page }) => {

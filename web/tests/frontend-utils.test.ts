@@ -6,6 +6,7 @@ import {
   panelURLValidationError,
   parseBulkRefreshResponse,
   parseResourceVersionETag,
+  readAPIError,
   resolveSSHCapability,
   statusClassName,
   topologyEntityKey,
@@ -116,5 +117,25 @@ describe('resource version ETag parsing', () => {
 
   it('rejects versions that cannot be represented safely in JavaScript', () => {
     expect(parseResourceVersionETag('"9007199254740992"')).toBeNull()
+  })
+})
+
+describe('API error responses', () => {
+  it('uses a backend JSON error when available', async () => {
+    const response = new Response(JSON.stringify({ error: 'Invalid credentials' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' },
+    })
+    await expect(readAPIError(response, 'Login failed with status 401')).resolves.toBe('Invalid credentials')
+  })
+
+  it('describes an empty upstream response without leaking a JSON parser error', async () => {
+    const response = new Response('', { status: 502 })
+    await expect(readAPIError(response, 'Login failed with status 502')).resolves.toBe('Login failed with status 502 (empty response)')
+  })
+
+  it('describes a non-JSON upstream response', async () => {
+    const response = new Response('<html>Bad Gateway</html>', { status: 502, headers: { 'Content-Type': 'text/html' } })
+    await expect(readAPIError(response, 'Login failed with status 502')).resolves.toBe('Login failed with status 502 (non-JSON response)')
   })
 })
