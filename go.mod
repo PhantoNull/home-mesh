@@ -1,6 +1,6 @@
 module github.com/PhantoNull/home-mesh
 
-go 1.25.12
+go 1.25.13
 
 require (
 	github.com/google/uuid v1.6.0
