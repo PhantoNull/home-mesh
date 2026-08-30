@@ -2,6 +2,7 @@ import type { Page, Route } from '@playwright/test'
 import type { InventorySnapshot } from '../src/models'
 
 type DeterministicMockOptions = {
+  inventory?: InventorySnapshot
   sshCredentialDeviceVersion?: number
   sshCredentialExpectedPutVersion?: number
   sshCredentialConflictOnceVersion?: number
@@ -100,7 +101,7 @@ export async function installDeterministicMocks(
   page: Page,
   options: DeterministicMockOptions = {},
 ): Promise<string[]> {
-  let inventorySnapshot = structuredClone(inventoryFixture)
+  let inventorySnapshot = structuredClone(options.inventory ?? inventoryFixture)
   let currentSSHCredentialVersion = options.sshCredentialDeviceVersion ?? inventoryFixture.devices[0].version
   let expectedSSHCredentialVersion = options.sshCredentialExpectedPutVersion
     ?? currentSSHCredentialVersion

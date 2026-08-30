@@ -3177,6 +3177,11 @@ export default function App() {
             networkNodes={state.data.networkNodes}
             networkSegments={state.data.networkSegments}
             relations={state.data.relations}
+            onEditDevice={openEditDeviceModal}
+            onEditNetworkNode={openEditNodeModal}
+            onEditNetworkSegment={openEditSegmentModal}
+            onOpenSSH={(device) => void openSSHModal(device)}
+            onWake={(device) => void triggerWake(device)}
           />
         </article>
       </>
