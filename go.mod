@@ -1,12 +1,12 @@
 module github.com/PhantoNull/home-mesh
 
-go 1.25.13
+go 1.25.14
 
 require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
-	golang.org/x/crypto v0.52.0
-	golang.org/x/sys v0.45.0
+	golang.org/x/crypto v0.55.0
+	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.48.1
 )
 

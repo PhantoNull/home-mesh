@@ -96,7 +96,7 @@ The project is split into two main parts:
 
 ### Prerequisites
 
-- Go 1.25.13 (or Go 1.26.6 and newer)
+- Go 1.25.14 (or Go 1.26.7 and newer)
 - Node.js 24+
 - npm 11+
 - Docker Desktop or Docker Engine
