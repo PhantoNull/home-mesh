@@ -16,3 +16,4 @@ web/tsconfig.tsbuildinfo
 web/node_modules/
 web/dist/
 .documentation/
+deploy/linux/backups/
