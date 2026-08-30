@@ -213,6 +213,7 @@ function TopologyWorkspace({
   const [layoutRevision, setLayoutRevision] = useState(0)
   const [layoutState, setLayoutState] = useState<'idle' | 'running' | 'ready' | 'fallback' | 'scaled'>('idle')
   const layoutRequestId = useRef(0)
+  const firstRenderAt = useRef(performance.now())
   const { fitView } = useReactFlow<TopologyFlowNode, TopologyFlowEdge>()
 
   const structureKey = useMemo(() => JSON.stringify({
@@ -387,7 +388,7 @@ function TopologyWorkspace({
   }
 
   return (
-    <div className="topology-workspace">
+    <div className="topology-workspace" data-interactive-at-ms={Math.round(firstRenderAt.current)}>
       <header className="topology-workspace__toolbar">
         <div className="topology-workspace__stats" aria-label="Topology summary">
           <span><strong>{model.entities.length}</strong> entities</span>
