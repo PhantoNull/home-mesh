@@ -35,6 +35,7 @@ import type { TopologyLayoutRequest, TopologyLayoutResponse } from './topology-l
 import {
   allTopologyConfidences,
   allTopologyKinds,
+  allTopologyLayers,
   allTopologyStatuses,
   buildTopologyModel,
   connectedTopologyIds,
@@ -46,12 +47,17 @@ import {
   type TopologyEntity,
   type TopologyFilters,
   type TopologyKind,
+  type TopologyLayer,
+  type TopologyLinkKind,
   type TopologyLinkState,
   type TopologyStatus,
 } from './topology-model'
 
 type TopologyEdgeData = {
   confidence: TopologyConfidence
+  layer: TopologyLayer
+  kind: TopologyLinkKind
+  automatic: boolean
   [key: string]: unknown
 }
 
@@ -94,14 +100,36 @@ function confidenceLabel(confidence: TopologyConfidence) {
   return confidence.charAt(0).toUpperCase() + confidence.slice(1)
 }
 
-function edgeColor(confidence: TopologyConfidence) {
-  if (confidence === 'observed') {
+function layerLabel(layer: TopologyLayer) {
+  if (layer === 'physical') {
+    return 'Physical'
+  }
+  if (layer === 'logical') {
+    return 'Logical'
+  }
+  if (layer === 'reachability') {
+    return 'Reachability'
+  }
+  return 'Unclassified'
+}
+
+function edgeColor(kind: TopologyLinkKind) {
+  if (kind === 'physical') {
+    return '#70b7d2'
+  }
+  if (kind === 'membership') {
+    return '#d7b45b'
+  }
+  if (kind === 'gateway') {
+    return '#9bc975'
+  }
+  if (kind === 'management' || kind === 'logical') {
+    return '#9c8ed8'
+  }
+  if (kind === 'reachability') {
     return '#5fc394'
   }
-  if (confidence === 'manual') {
-    return '#70a9c4'
-  }
-  return '#d7b45b'
+  return '#88928c'
 }
 
 function miniMapColor(node: TopologyFlowNode) {
@@ -130,21 +158,30 @@ function createFlowNodes(entities: TopologyEntity[], direction: TopologyDirectio
 }
 
 function createFlowEdges(model: ReturnType<typeof buildTopologyModel>): TopologyFlowEdge[] {
-  return model.links.map((link) => ({
-    id: link.id,
-    source: link.source,
-    target: link.target,
-    type: 'smoothstep',
-    data: { confidence: link.confidence },
-    label: link.label,
-    markerEnd: { type: MarkerType.ArrowClosed, width: 17, height: 17, color: edgeColor(link.confidence) },
-    style: { stroke: edgeColor(link.confidence), strokeWidth: 2 },
-    labelStyle: { fill: '#d9dfda', fontSize: 11, fontWeight: 600 },
-    labelBgStyle: { fill: '#151a17', fillOpacity: 0.94, stroke: '#39423d', strokeWidth: 1 },
-    labelBgPadding: [7, 4],
-    labelBgBorderRadius: 4,
-    ariaLabel: `${link.label} relation, ${link.confidence}`,
-  }))
+  return model.links.map((link) => {
+    const color = edgeColor(link.kind)
+    const directional = link.kind === 'gateway' || link.kind === 'logical' || link.kind === 'reachability' || link.kind === 'unknown'
+    return {
+      id: link.id,
+      source: link.source,
+      target: link.target,
+      type: 'smoothstep',
+      data: {
+        confidence: link.confidence,
+        layer: link.layer,
+        kind: link.kind,
+        automatic: link.evidence.automatic,
+      },
+      label: link.label,
+      ...(directional ? { markerEnd: { type: MarkerType.ArrowClosed, width: 17, height: 17, color } } : {}),
+      style: { stroke: color, strokeWidth: link.kind === 'physical' ? 2.6 : 2 },
+      labelStyle: { fill: '#d9dfda', fontSize: 11, fontWeight: 600 },
+      labelBgStyle: { fill: '#151a17', fillOpacity: 0.94, stroke: color, strokeWidth: 1 },
+      labelBgPadding: [7, 4] as [number, number],
+      labelBgBorderRadius: 4,
+      ariaLabel: `${link.label}, ${layerLabel(link.layer)}, ${link.confidence}, ${link.evidence.automatic ? 'automatic' : 'stored'}`,
+    }
+  })
 }
 
 function toggleSetValue<T>(current: ReadonlySet<T>, value: T) {
@@ -210,6 +247,7 @@ function TopologyWorkspace({
   const [kinds, setKinds] = useState<ReadonlySet<TopologyKind>>(() => new Set(allTopologyKinds))
   const [statuses, setStatuses] = useState<ReadonlySet<TopologyStatus>>(() => new Set(allTopologyStatuses))
   const [confidences, setConfidences] = useState<ReadonlySet<TopologyConfidence>>(() => new Set(allTopologyConfidences))
+  const [layers, setLayers] = useState<ReadonlySet<TopologyLayer>>(() => new Set(allTopologyLayers))
   const [layoutRevision, setLayoutRevision] = useState(0)
   const [layoutState, setLayoutState] = useState<'idle' | 'running' | 'ready' | 'fallback' | 'scaled'>('idle')
   const layoutRequestId = useRef(0)
@@ -305,8 +343,9 @@ function TopologyWorkspace({
     kinds,
     statuses,
     confidences,
+    layers,
     linkState,
-  }), [confidences, kinds, linkState, query, statuses])
+  }), [confidences, kinds, layers, linkState, query, statuses])
   const visible = useMemo(() => visibleTopologyIds(model, filters), [filters, model])
   const canvasEntityIds = useMemo(() => {
     if (visible.entityIds.size <= topologyCanvasEntityLimit) {
@@ -341,12 +380,13 @@ function TopologyWorkspace({
   )).map((edge) => {
     const active = !selectedId || connected.linkIds.has(edge.id)
     const confidence = edge.data?.confidence ?? 'inferred'
+    const kind = edge.data?.kind ?? 'unknown'
     return {
       ...edge,
       label: (showLabels && !labelsSuppressedForScale) || (selectedId && active)
         ? model.links.find((link) => link.id === edge.id)?.label
         : undefined,
-      className: active ? `topology-flow-edge topology-flow-edge--${confidence}${selectedId ? ' topology-flow-edge--active' : ''}` : 'topology-flow-edge topology-flow-edge--dimmed',
+      className: active ? `topology-flow-edge topology-flow-edge--${kind} topology-flow-edge--${confidence}${edge.data?.automatic ? ' topology-flow-edge--automatic' : ''}${selectedId ? ' topology-flow-edge--active' : ''}` : 'topology-flow-edge topology-flow-edge--dimmed',
       zIndex: selectedId && active ? 4 : 0,
     }
   }), [canvasEntityIds, connected.linkIds, edges, labelsSuppressedForScale, model.links, selectedId, showLabels, visible.linkIds])
@@ -356,6 +396,7 @@ function TopologyWorkspace({
     setKinds(new Set(allTopologyKinds))
     setStatuses(new Set(allTopologyStatuses))
     setConfidences(new Set(allTopologyConfidences))
+    setLayers(new Set(allTopologyLayers))
     setLinkState('all')
   }, [])
 
@@ -363,11 +404,14 @@ function TopologyWorkspace({
   const outlineEntities = filteredEntities.slice(0, topologyOutlineLimit)
   const onlineCount = model.entities.filter((entity) => entity.status === 'online').length
   const unlinkedCount = model.entities.filter((entity) => entity.connectionCount === 0).length
+  const automaticCount = model.links.filter((link) => link.evidence.automatic).length
+  const physicalCount = model.links.filter((link) => link.layer === 'physical').length
   const hasFilters = query.trim() !== ''
     || linkState !== 'all'
     || kinds.size !== allTopologyKinds.length
     || statuses.size !== allTopologyStatuses.length
     || confidences.size !== allTopologyConfidences.length
+    || layers.size !== allTopologyLayers.length
   const panelLink = selectedEntity ? getSafePanelLink(selectedEntity.raw.metadata) : ''
 
   const editSelected = () => {
@@ -384,7 +428,7 @@ function TopologyWorkspace({
   }
 
   if (model.entities.length === 0) {
-    return <div className="topology-empty"><Network aria-hidden="true" /><strong>No topology yet</strong><span>Add inventory entities and relations to build the map.</span></div>
+    return <div className="topology-empty"><Network aria-hidden="true" /><strong>No topology yet</strong><span>Discover inventory and segment data to assemble the map.</span></div>
   }
 
   return (
@@ -393,6 +437,8 @@ function TopologyWorkspace({
         <div className="topology-workspace__stats" aria-label="Topology summary">
           <span><strong>{model.entities.length}</strong> entities</span>
           <span><strong>{model.links.length}</strong> links</span>
+          <span><strong>{physicalCount}</strong> physical</span>
+          {automaticCount > 0 ? <span className="topology-workspace__automatic"><strong>{automaticCount}</strong> automatic</span> : null}
           <span className="topology-workspace__online"><strong>{onlineCount}</strong> online</span>
           {unlinkedCount > 0 ? <span className="topology-workspace__warning"><strong>{unlinkedCount}</strong> unlinked</span> : null}
         </div>
@@ -426,6 +472,10 @@ function TopologyWorkspace({
             <fieldset>
               <legend>Status</legend>
               {allTopologyStatuses.map((status) => <label key={status}><input type="checkbox" checked={statuses.has(status)} onChange={() => setStatuses((current) => toggleSetValue(current, status))} /><span className={`topology-filter-dot topology-filter-dot--${status}`} aria-hidden="true" />{statusLabel(status)}</label>)}
+            </fieldset>
+            <fieldset>
+              <legend>Link layer</legend>
+              {allTopologyLayers.map((layer) => <label key={layer}><input type="checkbox" checked={layers.has(layer)} onChange={() => setLayers((current) => toggleSetValue(current, layer))} /><span className={`topology-link-key topology-link-key--${layer}`} aria-hidden="true" />{layerLabel(layer)}</label>)}
             </fieldset>
             <fieldset>
               <legend>Relation confidence</legend>
@@ -504,16 +554,16 @@ function TopologyWorkspace({
                 {selectedEntity.kind === 'device' && onWake && (selectedEntity.raw as Device).macAddress ? <button type="button" className="secondary-button" onClick={() => onWake(selectedEntity.raw as Device)}><Power aria-hidden="true" />Wake</button> : null}
               </div>
               <div className="topology-inspector__relations">
-                <div><strong>Connected relations</strong><span>{selectedLinks.length}</span></div>
-                {selectedLinks.length === 0 ? <p>No explicit relation connects this entity.</p> : <ul>{selectedLinks.map((link) => {
+                <div><strong>Topology links</strong><span>{selectedLinks.length}</span></div>
+                {selectedLinks.length === 0 ? <p>No available evidence connects this entity.</p> : <ul>{selectedLinks.map((link) => {
                   const peerId = link.source === selectedEntity.id ? link.target : link.source
                   const peer = model.entities.find((entity) => entity.id === peerId)
-                  return <li key={link.id}><button type="button" onClick={() => setSelectedId(peerId)}><span>{link.label}</span><strong>{peer?.label ?? peerId}</strong><small>{link.confidence}</small></button></li>
+                  return <li key={link.id}><button type="button" onClick={() => setSelectedId(peerId)} title={link.evidence.detail}><span>{layerLabel(link.layer)} / {link.label}</span><strong>{peer?.label ?? peerId}</strong><small>{link.confidence}</small><em>{link.evidence.automatic ? 'Automatic' : 'Stored'} / {link.evidence.source}</em></button></li>
                 })}</ul>}
               </div>
             </>
           ) : (
-            <div className="topology-inspector__empty"><Network aria-hidden="true" /><strong>Select an entity</strong><span>Inspect its network facts and highlight every direct relation.</span></div>
+            <div className="topology-inspector__empty"><Network aria-hidden="true" /><strong>Select an entity</strong><span>Inspect network facts, paths, and the evidence behind every link.</span></div>
           )}
         </aside>
       </div>

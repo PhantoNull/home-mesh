@@ -48,6 +48,11 @@
   color: #e1bd61;
 }
 
+.topology-workspace__stats .topology-workspace__automatic,
+.topology-workspace__stats .topology-workspace__automatic strong {
+  color: #b5a6ee;
+}
+
 .topology-workspace__view-actions {
   gap: 5px;
 }
@@ -270,6 +275,27 @@
 
 .topology-filter-dot--configured {
   background: #68a9c5;
+}
+
+.topology-link-key {
+  width: 18px;
+  height: 3px;
+  flex: 0 0 18px;
+  border-radius: 2px;
+  background: #88928c;
+}
+
+.topology-link-key--physical {
+  height: 4px;
+  background: #70b7d2;
+}
+
+.topology-link-key--logical {
+  background: #9c8ed8;
+}
+
+.topology-link-key--reachability {
+  background: #5fc394;
 }
 
 .topology-filter-reset {
@@ -505,8 +531,10 @@
 }
 
 .topology-entity--segment {
-  border-color: rgba(215, 180, 91, 0.44);
+  border-width: 2px;
+  border-color: rgba(215, 180, 91, 0.58);
   background: #242116;
+  box-shadow: inset 0 0 0 1px rgba(215, 180, 91, 0.06), 0 7px 18px rgba(0, 0, 0, 0.26);
 }
 
 .topology-entity--node {
@@ -650,6 +678,18 @@
 
 .topology-flow-edge--inferred path {
   stroke-dasharray: 8 6;
+}
+
+.topology-flow-edge--automatic path {
+  stroke-dasharray: 7 5;
+}
+
+.topology-flow-edge--physical path {
+  stroke-linecap: round;
+}
+
+.topology-flow-edge--membership path {
+  opacity: 0.86;
 }
 
 .topology-flow-edge--active path {
@@ -876,6 +916,17 @@
   font-size: 0.6rem;
 }
 
+.topology-inspector__relations li em {
+  grid-column: 1 / -1;
+  min-width: 0;
+  overflow: hidden;
+  color: #737f77;
+  font-size: 0.58rem;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .topology-inspector__empty,
 .topology-empty {
   display: grid;
@@ -962,7 +1013,7 @@
   }
 
   .topology-filters {
-    max-height: 185px;
+    max-height: 245px;
     overflow: auto;
   }
 
